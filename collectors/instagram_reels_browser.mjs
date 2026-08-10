@@ -8,7 +8,6 @@ import { fileURLToPath } from "node:url";
 import {
   FollowerEnricher,
   csvObjects,
-  loadDotEnvFile,
   parseInstagramJson,
 } from "./instagram_follower_enricher.mjs";
 
@@ -1284,8 +1283,6 @@ async function appendRecord(csvPath, record) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const projectDir = path.dirname(fileURLToPath(import.meta.url));
-  loadDotEnvFile(path.join(projectDir, ".env"));
   await fsp.mkdir(options.dataDir, { recursive: true });
   const csvPath = path.join(options.dataDir, "reels_web.csv");
   const { chromium } = loadPlaywright();

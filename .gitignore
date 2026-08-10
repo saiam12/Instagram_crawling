@@ -1,6 +1,5 @@
 .env
 .env.*
-!.env.example
 data/
 data_web/
 data_new_test/
@@ -9,6 +8,7 @@ backups/
 .diagnostics/
 .xlsx_verify*/
 .pytest_cache/
+tests/
 __pycache__/
 *.pyc
 targets_new_test.csv

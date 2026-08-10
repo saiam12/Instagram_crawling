@@ -1,300 +1,187 @@
-# Instagram random-sample time-series collector
+# Instagram Reels 웹 수집기
 
-This project repeatedly collects public Instagram Professional-account data
-through Meta's official Graph API and stores every observation as CSV. It does
-not automate the Instagram website or bypass private-account access.
+로그인된 Instagram 웹 화면을 순회해 공개 릴스와 작성자 팔로워 수를 수집하고, CSV와 XLSX로 저장하는 Windows용 도구입니다.
 
-## Important target limitation
+- Meta Graph API, 액세스 토큰, API 키를 사용하지 않습니다.
+- Instagram 비밀번호를 파일에 저장하지 않습니다.
+- 최초 로그인 후에는 로컬 브라우저 프로필을 재사용합니다.
 
-Meta's API cannot return a globally random Instagram account. Random sampling
-therefore works from a candidate pool that you register or import. Candidates
-must be visible Business/Creator accounts; personal and private accounts cannot
-be collected with Business Discovery.
+## 실행 전 준비
 
-## 1. Configure Meta credentials
+1. PowerShell을 열고 프로젝트 폴더로 이동합니다.
 
-Copy `.env.example` to `.env` and enter the long-lived access token plus the ID
-of your authorized Instagram Professional account:
+   ```powershell
+   cd C:\instagram_data_set
+   ```
 
-```powershell
-cd C:\instagram_data_set
-Copy-Item .\.env.example .\.env
-notepad .\.env
-```
+2. 처음 한 번은 `-Background` 없이 실행합니다. 열린 Edge 또는 Chrome 창에서 Instagram에 직접 로그인하고, 릴스 화면이 보이면 PowerShell로 돌아와 Enter를 누릅니다.
+
+3. 로그인 후에는 브라우저 프로필이 `.instagram_browser_profile`에 저장됩니다. 이 폴더에는 로그인 세션이 있으므로 절대 공유하거나 GitHub에 올리면 안 됩니다.
+
+## 프로젝트 구조
 
 ```text
-INSTAGRAM_ACCESS_TOKEN=YOUR_LONG_LIVED_ACCESS_TOKEN
-INSTAGRAM_IG_USER_ID=YOUR_AUTHORIZED_PROFESSIONAL_ACCOUNT_ID
-INSTAGRAM_API_VERSION=v26.0
+instagram_data_set/
+├── collectors/  # Instagram 웹 화면 순회와 팔로워 수 수집
+├── exporters/   # CSV를 XLSX로 정리하고 재수집 URL을 읽는 도구
+├── scripts/     # PowerShell 실행 명령
+├── tests/       # 개발용 자동 테스트 (GitHub에는 올리지 않음)
+├── data_web/    # 실제 수집 결과 (GitHub에는 올리지 않음)
+└── README.md
 ```
 
-Never share or commit `.env`.
+## 수집 결과 파일
 
-## 2. Prepare the random candidate pool
+모든 수집 결과는 `data_web` 폴더에 저장됩니다. 이 폴더는 `.gitignore`로 제외되어 GitHub에 올라가지 않습니다.
 
-Create a CSV containing a `username` column. See `target_pool.example.csv`.
+| 파일 | 용도 |
+|---|---|
+| `reels_web.csv` | 릴스별 기본 정보와 반복 수집 시계열 데이터 |
+| `users.csv` | 릴스 작성자별 최신 팔로워 수와 조회 상태 |
+| `follower_lookups.csv` | 팔로워 수 조회 이력과 오류 기록 |
+| `instagram_data.xlsx` | 위 CSV를 시트별로 모아 보기 좋게 정리한 Excel 파일 |
 
-```csv
-username
-nasa
-natgeo
-instagram
-```
+### `reels_web.csv` 열
 
-Import it and check the registered pool:
+| 열 | 설명 |
+|---|---|
+| `url` | 표준화된 릴스 URL |
+| `collected_at` | 최초 수집 시각(UTC 원본, XLSX에서는 한국 시간으로 표시) |
+| `user_id` | 릴스 응답에서 얻은 Instagram 사용자 ID |
+| `username` | 작성자 사용자명 |
+| `title` | 해시태그를 제외한 캡션 앞 300자. 길면 `...` 처리 |
+| `hashtags` | 전체 캡션에서 추출한 해시태그 |
+| `audio_name` | 사용 음원명 또는 원본 오디오 정보 |
+| `location_name` | 화면 또는 릴스 정보에 위치가 있는 경우의 위치명 |
+| `ad` | 명시적 광고·협찬 표시가 감지되면 `true`, 아니면 `false` |
+| `uploaded_at` | 릴스 업로드 시각 |
+| `days_since_upload` | 수집 시점 기준 업로드 경과 시간. XLSX에서 `+20hours`, `+12day`처럼 표시 |
+| `like_count` | 좋아요 수 |
+| `comment_count` | 댓글 수 |
+| `repost_count` | 리포스트 수 |
+| `follower_count` | 해당 작성자의 팔로워 수 |
+| `reaction_rate` | `like_count / follower_count`. XLSX에서는 백분율 표시 |
+| `follower_count_collected_at` | 팔로워 수를 조회한 시각 |
+| `follower_lookup_status` | 팔로워 조회 상태 (`success`, `web_error` 등) |
+
+같은 릴스를 다시 수집하면 행을 추가하지 않습니다. 대신 `2nd collect_*`, `3rd collect_*`처럼 수집 차수별 열이 추가됩니다. 재수집 열에는 좋아요·댓글·리포스트·팔로워 수와 반응률만 저장됩니다.
+
+XLSX에서는 재수집 수치가 이전 실제 수치와 비교되어 `21(+4)`처럼 표시됩니다. 재수집 시각은 최초 수집 기준 경과 시간과 함께 `2026-08-10 14:00:00 (+2Hour)`처럼 표시됩니다.
+
+### `users.csv` 열
+
+| 열 | 설명 |
+|---|---|
+| `user_id` | Instagram 사용자 ID |
+| `username` | 사용자명 |
+| `first_seen_at`, `last_seen_at` | 해당 사용자를 처음·마지막으로 릴스에서 확인한 시각 |
+| `follower_count` | 최신 팔로워 수 |
+| `follower_count_collected_at` | 최신 팔로워 수 수집 시각 |
+| `lookup_status` | 최신 팔로워 조회 상태 |
+| `last_lookup_at` | 마지막 조회 시각 |
+| `last_error` | 마지막 조회 오류 메시지 |
+
+### `follower_lookups.csv` 열
+
+| 열 | 설명 |
+|---|---|
+| `collected_at` | 팔로워 수 조회 시각 |
+| `user_id`, `username` | 조회한 사용자 |
+| `follower_count` | 조회 성공 시 팔로워 수 |
+| `error` | 실패 시 오류 메시지 |
+
+## 명령어
+
+### 1. 릴스 신규 수집
+
+브라우저를 보면서 릴스 50개를 수집합니다.
 
 ```powershell
-python .\instagram_collector.py target import .\target_pool.csv
-python .\instagram_collector.py target list
+.\scripts\start_reels_web.ps1 -MaxItems 50 -IntervalSeconds 2 -FollowerIntervalSeconds 8
 ```
 
-You can also add candidates one at a time:
+| 옵션 | 기본값 | 설명 |
+|---|---:|---|
+| `-MaxItems` | `50` | 수집할 최대 릴스 수 |
+| `-IntervalSeconds` | `5` | 릴스 정보가 누락되거나 수집에 실패한 뒤 다음 릴스로 넘어가기 전 대기 시간 |
+| `-FollowerIntervalSeconds` | `8` | 팔로워 수가 누락·실패한 뒤 다음 계정 조회 전 대기 시간 |
+| `-FollowerCacheHours` | `1` | 이 시간 안에 조회한 사용자는 팔로워 수를 다시 조회하지 않음 |
+| `-Manual` | 없음 | 자동 이동 대신 Enter를 누를 때마다 현재 릴스 수집 |
+| `-Background` | 없음 | 로그인 세션이 저장된 뒤 브라우저 창을 보이지 않게 실행 |
+| `-HashtagQuery` | 없음 | 해시태그 OR 조건 지정 |
+| `-StartUrl` | 릴스 피드 | 시작할 Instagram 릴스 URL |
+| `-DataDir` | `data_web` | 결과를 저장할 폴더 |
+
+릴스의 URL·작성자·업로드 시각·좋아요·댓글·리포스트가 모두 수집되면 다음 릴스는 0.5초 뒤에 진행됩니다. 팔로워 수를 성공적으로 가져온 경우도 다음 계정 조회까지 0.5초만 대기합니다.
+
+### 2. 백그라운드 릴스 수집
+
+처음 로그인한 뒤에는 창을 띄우지 않고 실행할 수 있습니다.
 
 ```powershell
-python .\instagram_collector.py target add nasa
+.\scripts\start_reels_web.ps1 -MaxItems 50 -IntervalSeconds 2 -FollowerIntervalSeconds 8 -Background
 ```
 
-## 3. Create a random test experiment
+로그인 세션이 만료되었거나 `-Background` 실행이 실패하면, `-Background` 없이 다시 실행해 로그인 상태를 갱신하세요.
 
-This randomly selects 10 enabled candidates and creates collection jobs at
-baseline, 1 hour, 4 hours, 12 hours, and 24 hours after experiment creation:
+### 3. 해시태그 OR 조건 수집
+
+`맛집` 또는 `서울맛집`을 포함하는 해시태그가 하나라도 있는 릴스만 저장합니다. 부분 일치도 포함하므로 `#강남맛집`, `#서울맛집추천`도 조건에 맞습니다.
 
 ```powershell
-python .\instagram_collector.py experiment start --sample-size 10 --schedule test
+.\scripts\start_reels_web.ps1 -HashtagQuery '"맛집" OR "서울맛집"' -MaxItems 50 -IntervalSeconds 2 -Background
 ```
 
-The exact random seed and selected usernames are saved in
-`data\experiments.csv`, so the sample is reproducible and auditable.
+### 4. 기존 릴스 재수집
 
-The future production preset is already available:
+`instagram_data.xlsx`의 `reels_web` 시트에 저장된 URL을 다시 순회합니다. 기본 정보는 중복 저장하지 않고 반응 수치의 변화를 새 수집 차수 열에 기록합니다.
 
 ```powershell
-python .\instagram_collector.py experiment start --sample-size 100 --schedule production
+.\scripts\refresh_reels_xlsx.ps1 -IntervalSeconds 2 -FollowerIntervalSeconds 8 -Background
 ```
 
-Its milestones are baseline, 6 hours, 12 hours, 1 day, 3 days, 1 week, and 2
-weeks. A custom schedule is also supported:
+| 옵션 | 기본값 | 설명 |
+|---|---:|---|
+| `-IntervalSeconds` | `2` | 정보가 누락·실패한 릴스의 다음 진행 대기 시간 |
+| `-FollowerIntervalSeconds` | `8` | 팔로워 수 누락·실패 시 다음 사용자 조회 대기 시간 |
+| `-FollowerCacheHours` | `1` | 팔로워 수 캐시 유지 시간 |
+| `-Manual` | 없음 | Enter를 누를 때마다 다음 URL 재수집 |
+| `-Background` | 없음 | 브라우저 창 없이 실행 |
+| `-DataDir` | `data_web` | 결과 폴더 |
+
+실행 전에는 `instagram_data.xlsx`를 Excel에서 닫아야 합니다.
+
+### 5. 팔로워 수만 다시 수집
+
+릴스는 수집하지 않고 저장된 사용자 목록의 팔로워 수만 조회합니다.
 
 ```powershell
-python .\instagram_collector.py experiment start --sample-size 10 --offsets-hours 0,2,8,24
+.\scripts\update_followers.ps1 -IntervalSeconds 8 -CacheHours 1
 ```
 
-## 4. Run collection in the background
+| 옵션 | 기본값 | 설명 |
+|---|---:|---|
+| `-IntervalSeconds` | `8` | 팔로워 수 누락·실패 시 다음 사용자 조회 대기 시간 |
+| `-CacheHours` | `1` | 이 시간 안에 조회한 사용자는 건너뜀 |
+| `-Force` | 없음 | 캐시와 관계없이 모든 사용자를 다시 조회 |
+| `-DataDir` | `data_web` | 결과 폴더 |
 
-Start a hidden background collector. It checks once per minute and collects
-only milestones that are due:
+모든 사용자를 다시 조회하려면 다음처럼 실행합니다.
 
 ```powershell
-.\start_background.ps1
+.\scripts\update_followers.ps1 -IntervalSeconds 8 -CacheHours 0 -Force
 ```
 
-Check status or stop it:
+## Excel 파일이 열려 있을 때
 
-```powershell
-.\status_background.ps1
-python .\instagram_collector.py experiment status
-.\stop_background.ps1
-```
+CSV는 먼저 저장됩니다. 다만 `instagram_data.xlsx`가 Excel에서 열려 있으면 XLSX 갱신이 실패하거나 `instagram_data_updated.xlsx`로 별도 저장될 수 있습니다. Excel을 닫고 같은 명령을 다시 실행하면 최신 CSV 내용으로 XLSX를 다시 만들 수 있습니다.
 
-Background logs are stored in:
+## GitHub에 올리면 안 되는 파일
 
-- `data\background_collector.log`
-- `data\background_collector.error.log`
-- `data\background_collector.pid`
+`.gitignore`는 아래 항목을 제외하도록 설정되어 있습니다.
 
-The hidden process survives closing the PowerShell window but stops when
-Windows restarts or the user signs out. Run `start_background.ps1` again after
-that; all pending jobs are stored in CSV and resume automatically.
-
-To run only one experiment in the background:
-
-```powershell
-.\start_background.ps1 -ExperimentId exp_YYYYMMDDTHHMMSSZ_12345678
-```
-
-## Manual collection commands
-
-Run all milestones currently due once, without a background process:
-
-```powershell
-python .\instagram_collector.py experiment run-due
-```
-
-Collect every enabled target immediately without an experiment:
-
-```powershell
-python .\instagram_collector.py collect
-```
-
-## Foreground Reels web collection
-
-This optional mode opens a visible Edge/Chrome window. Sign in manually, open
-the Reels feed, and return to the PowerShell window. The collector records each
-real Reel URL as the visible feed advances; it does not guess shortcodes or
-store an Instagram password.
-
-Collect 50 unique URLs. `IntervalSeconds` is the fallback delay when required
-Reel data is missing; a complete Reel advances after 0.5 seconds:
-
-```powershell
-.\start_reels_web.ps1 -MaxItems 50 -IntervalSeconds 5
-```
-
-Run the same automatic collection without showing a browser window. Sign in
-once with the visible command first so the saved browser profile can be reused:
-
-```powershell
-.\start_reels_web.ps1 -MaxItems 50 -IntervalSeconds 2 -Background
-```
-
-Collect only Reels whose caption hashtags partially match either side of an
-OR query:
-
-```powershell
-.\start_reels_web.ps1 -HashtagQuery '"맛집" OR "서울맛집"' -MaxItems 50 -IntervalSeconds 2 -Background
-```
-
-The collector gathers Reel links from both hashtag pages, interleaves the two
-candidate lists, and stores a Reel only when an actual hashtag token contains
-at least one query term. For example, this query accepts `#맛집`, `#강남맛집`,
-`#서울맛집`, and `#서울맛집추천`, but it does not match ordinary caption text
-that is not part of a hashtag.
-
-To scroll in the browser yourself and confirm each capture with Enter:
-
-```powershell
-.\start_reels_web.ps1 -MaxItems 50 -Manual
-```
-
-Refresh every Reel already listed in the workbook without showing a browser:
-
-```powershell
-.\refresh_reels_xlsx.ps1 -IntervalSeconds 2 -Background
-```
-
-Output is saved to `data_web\reels_web.csv` and synchronized to
-`data_web\instagram_data.xlsx`. The collector stores URL, the Instagram web
-`user_id`, username, Reel title
-(the visible caption), hashtags, audio name, upload time, likes, comments, and
-reposts. When Instagram exposes them, it also stores the location name,
-latitude, and longitude. The `ad` field is `true` when the page shows an exact
-`광고`/`후원됨`/`Sponsored`/`Paid partnership` label or the Reel response contains
-an explicit ad, sponsor, paid-partnership, or ad-ID signal; otherwise it is
-`false`. The same Reel row also contains `follower_count`, its collection time,
-and the follower lookup status. Before reading a caption it clicks the visible
-`더 보기`/`More` control.
-Hashtags are extracted from the full expanded caption, while the stored title
-excludes hashtag tokens, is limited to 300 characters, and receives `...` when
-truncated. It also keeps
-the collection time. Likes, comments, and reposts are stored only as parsed
-numbers; the abbreviated UI text is not retained. Instagram UI changes can
-make some best-effort fields blank; the URL is the stable primary field.
-
-For upload time, the collector first uses a visible HTML `time` element. When
-the Reels fullscreen UI omits it, the collector reuses the matching `taken_at`
-value from the Reel JSON response that the page already downloaded. This does
-not make an extra API request and does not require an API token.
-
-The same matching Reel response supplies the account username, full caption,
-audio metadata, and exact integer engagement counts. Music is stored as
-`artist · title`; original audio falls back to the original-audio title and
-creator username. DOM count labels are used only when response metadata is
-unavailable.
-
-The `user_id` is taken from the same Reel JSON response, so it does not add a
-profile visit or another request. Each newly seen user is also upserted into
-`data_web\users.csv`. Follower counts do not use a Meta access token or the
-Graph API. A separate headless browser in the same Node process copies the
-saved login session and visits newly seen public profiles one at a time while
-Reel scrolling continues. When Reel collection ends, the visible Reel browser
-closes but the headless follower queue stays alive. The terminal prints each
-result as `[Follower completed/queued] @username -> follower_count`. After a
-successful follower count, the next lookup starts after 0.5 seconds. Failed or
-incomplete lookups keep the configured follower interval (eight seconds by
-default), and results cached within one hour are reused. Login, challenge, and
-temporary-access-limit pages stop the
-follower queue instead of attempting to bypass them. Lookup history is appended
-to `data_web\follower_lookups.csv` with source `instagram_web`.
-
-To enrich pending users again after Reel collection has finished:
-
-```powershell
-.\update_followers.ps1 -IntervalSeconds 8 -CacheHours 1
-```
-
-This command reuses the saved Instagram login and runs the profile browser in
-the background. Use `-Force` only when every saved user must be retried
-regardless of the one-hour cache. Successful follower results are merged into
-the matching rows of `reels_web.csv`; `users.csv` and `follower_lookups.csv`
-remain available as supporting history worksheets in `instagram_data.xlsx`.
-Each initial and repeated Reel snapshot stores `reaction_rate` as
-`like_count / follower_count`. It remains blank until a positive follower count
-is available and is displayed as a percentage in XLSX.
-If Instagram requests login or an account check, the remaining users are left
-deferred for a later retry. After the follower queue finishes, the command
-automatically synchronizes the CSV files to XLSX. If `instagram_data.xlsx` is
-open in Excel, the latest Reel and follower data is written to
-`instagram_data_updated.xlsx` in the same folder instead of being skipped.
-
-To revisit every Reel already listed in the XLSX workbook and append a fresh
-engagement snapshot:
-
-```powershell
-.\refresh_reels_xlsx.ps1 -IntervalSeconds 2
-```
-
-Close `instagram_data.xlsx` before running this command. It reads URLs from the
-`reels_web` sheet in row order and visits each unique URL once in the visible
-browser. A Reel keeps one row. Each repeat collection adds a right-side column
-group such as `2nd collect_collected_at`, `2nd collect_like_count`, and
-`2nd collect_comment_count`. The collection-time cell includes elapsed time
-from the initial collection, for example
-`2026-08-04 01:00:00 (+2Hour)`. In XLSX, `days_since_upload` displays elapsed
-time below one day as whole hours such as `+20hours`, and truncates longer
-values to whole days such as `+12day`. The CSV keeps the original decimal value
-for calculations. Repeat groups contain only collection time,
-upload age, likes, comments, reposts, and followers. Metric values identical
-to the previous snapshot remain blank. Changed metrics display the current
-value and the change from the most recent actual value, such as `21(+4)` and
-then `29(+8)`. Raw CSV values remain numeric for later comparisons. The final
-step synchronizes all CSV data back into the same `instagram_data.xlsx`
-workbook.
-
-CSV timestamps remain ISO UTC so they are unambiguous. During XLSX
-synchronization, every date/time column is displayed in Korea Standard Time
-(UTC+9), including `follower_lookups.collected_at`.
-
-If an older compatible `reels_web.csv` schema exists, elapsed-time snapshot
-columns such as `+2Hour_*` are migrated in order to `2nd collect_*`,
-`3rd collect_*`, and so on without losing their engagement values. An
-incompatible unknown schema is preserved as a timestamped
-`reels_web_legacy_*.csv` file before the new schema is created.
-When the same Reel appears again, it updates that Reel's horizontal time-series
-columns instead of adding another row.
-
-## CSV outputs
-
-All output is appended or safely updated under `data`:
-
-- `experiments.csv`: random seed, selected targets, preset, experiment status.
-- `experiment_jobs.csv`: every scheduled milestone and its completion/delay.
-- `account_timeseries.csv`: follower/following/media counts per milestone.
-- `media_timeseries.csv`: post like/comment counts per milestone.
-- `posts.csv`: one current metadata row per post.
-- `api_usage.csv`: rate-limit header observations.
-- `runs.csv`: every API collection run and result.
-
-The time-series files include `experiment_id`, `milestone`, and
-`scheduled_for`, allowing baseline/1h/4h/12h/24h comparisons even when a run is
-slightly delayed.
-
-## API safety
-
-The collector saves each completed response and stops before the next request
-when `X-Business-Use-Case-Usage` or `X-App-Usage` reaches 90 percent. HTTP 429
-and Instagram rate-limit errors also stop collection without deleting saved
-history. To change the threshold for the background process:
-
-```powershell
-.\start_background.ps1 -UsageThreshold 80
-```
+- 실제 수집 결과와 백업: `data/`, `data_web/`, `data_new_test/`, `backups/`
+- Instagram 로그인 세션: `.instagram_browser_profile/`
+- 개인 환경파일: `.env`, `.env.*`
+- 개인 테스트 대상 목록: `targets_new_test.csv`
+- 테스트·캐시·검사 산출물: `tests/`, `__pycache__/`, `.pytest_cache/`, `.diagnostics/`, `.xlsx_verify*/`

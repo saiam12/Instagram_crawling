@@ -9,8 +9,6 @@ const USER_FIELDS = [
   "last_seen_at",
   "follower_count",
   "follower_count_collected_at",
-  "follower_source",
-  "api_user_id",
   "lookup_status",
   "last_lookup_at",
   "last_error",
@@ -20,14 +18,9 @@ const FOLLOWER_LOOKUP_FIELDS = [
   "collected_at",
   "user_id",
   "username",
-  "api_user_id",
   "follower_count",
-  "source",
-  "lookup_status",
   "error",
 ];
-
-const RATE_LIMIT_CODES = new Set([4, 17, 32, 613, 80001, 80002]);
 
 function csvValue(value) {
   const text = String(value ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
@@ -103,22 +96,16 @@ async function appendCsv(destination, row, fields) {
   await fsp.appendFile(destination, `${lines.join("\r\n")}\r\n`, "utf8");
 }
 
-function loadDotEnvFile(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) return;
-  const lines = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/);
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#") || !line.includes("=")) continue;
-    const separator = line.indexOf("=");
-    const key = line.slice(0, separator).trim().replace(/^export\s+/, "");
-    let value = line.slice(separator + 1).trim();
-    if (value.length >= 2 && value[0] === value.at(-1) && ['"', "'"].includes(value[0])) {
-      value = value.slice(1, -1);
-    }
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && process.env[key] === undefined) {
-      process.env[key] = value;
-    }
-  }
+async function normalizeCsvSchema(destination, fields) {
+  if (!fs.existsSync(destination)) return;
+  const text = await fsp.readFile(destination, "utf8");
+  const rows = parseCsv(text.replace(/^\uFEFF/, ""));
+  const headers = rows[0] ?? [];
+  if (headers.join("\u0000") === fields.join("\u0000")) return;
+  const normalized = csvObjects(text).map((row) => Object.fromEntries(
+    fields.map((field) => [field, row[field] ?? ""]),
+  ));
+  await atomicWriteCsv(destination, normalized, fields);
 }
 
 function parseInstagramJson(rawText) {
@@ -129,146 +116,26 @@ function parseInstagramJson(rawText) {
   return JSON.parse(protectedIntegers);
 }
 
-function normalizeApiVersion(value) {
-  const version = String(value || "v26.0").trim();
-  return version.startsWith("v") ? version : `v${version}`;
-}
-
-function usagePercentFromHeaders(headers) {
-  let maximum = 0;
-  const visit = (value) => {
-    if (Array.isArray(value)) {
-      value.forEach(visit);
-    } else if (value && typeof value === "object") {
-      for (const [key, child] of Object.entries(value)) {
-        if (["call_count", "total_cputime", "total_time"].includes(key)) {
-          const number = Number(child);
-          if (Number.isFinite(number)) maximum = Math.max(maximum, number);
-        } else {
-          visit(child);
-        }
-      }
-    }
-  };
-  for (const name of ["x-business-use-case-usage", "x-app-usage"]) {
-    const raw = headers?.get?.(name);
-    if (!raw) continue;
-    try {
-      visit(JSON.parse(raw));
-    } catch {
-      // A malformed optional usage header does not invalidate a successful result.
-    }
-  }
-  return maximum;
-}
-
-function classifyGraphError(payload, httpStatus) {
-  const error = payload?.error ?? {};
-  const code = Number(error.code ?? httpStatus ?? 0);
-  const message = String(error.message ?? `Graph API request failed (${httpStatus || "unknown"}).`);
-  if (httpStatus === 429 || RATE_LIMIT_CODES.has(code)) return { status: "rate_limited", message };
-  if (code === 190) return { status: "auth_error", message };
-  if ([10, 100].includes(code)) {
-    return { status: "not_professional_or_unavailable", message };
-  }
-  return { status: "api_error", message };
-}
-
-async function requestFollowerCount({
-  username,
-  accessToken,
-  ownerIgUserId,
-  apiVersion = "v26.0",
-  fetchImpl = globalThis.fetch,
-  timeoutMilliseconds = 30_000,
-}) {
-  const url = new URL(
-    `https://graph.facebook.com/${normalizeApiVersion(apiVersion)}/${encodeURIComponent(ownerIgUserId)}`,
-  );
-  url.searchParams.set(
-    "fields",
-    `business_discovery.username(${username}){id,username,followers_count}`,
-  );
-  url.searchParams.set("access_token", accessToken);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMilliseconds);
-  try {
-    const response = await fetchImpl(url, {
-      method: "GET",
-      headers: { "User-Agent": "instagram-reels-follower-enricher/1.0" },
-      signal: controller.signal,
-    });
-    const rawBody = await response.text();
-    let payload = {};
-    try {
-      payload = parseInstagramJson(rawBody);
-    } catch {
-      return {
-        status: "api_error",
-        error: "Graph API returned invalid JSON.",
-        usagePercent: usagePercentFromHeaders(response.headers),
-      };
-    }
-    const usagePercent = usagePercentFromHeaders(response.headers);
-    if (!response.ok || payload.error) {
-      const classified = classifyGraphError(payload, response.status);
-      return { status: classified.status, error: classified.message, usagePercent };
-    }
-    const account = payload.business_discovery;
-    const followerCount = Number(account?.followers_count);
-    if (!account || !Number.isFinite(followerCount)) {
-      return {
-        status: "not_professional_or_unavailable",
-        error: "Business Discovery did not return followers_count.",
-        usagePercent,
-      };
-    }
-    return {
-      status: "success",
-      followerCount: Math.round(followerCount),
-      apiUserId: String(account.id ?? ""),
-      apiUsername: String(account.username ?? username),
-      error: "",
-      usagePercent,
-    };
-  } catch (error) {
-    return {
-      status: error?.name === "AbortError" ? "timeout" : "network_error",
-      error: error?.name === "AbortError" ? "Graph API request timed out." : String(error?.message ?? error),
-      usagePercent: 0,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 class FollowerEnricher {
   constructor({
     dataDir,
-    accessToken = process.env.INSTAGRAM_ACCESS_TOKEN ?? "",
-    ownerIgUserId = process.env.INSTAGRAM_IG_USER_ID ?? "",
-    apiVersion = process.env.INSTAGRAM_API_VERSION ?? "v26.0",
-    concurrency = 3,
+    concurrency = 1,
     cacheHours = 1,
-    usageThreshold = 90,
-    fetchImpl = globalThis.fetch,
-    lookupImpl = null,
-    source = "",
+    lookupImpl,
+    source = "instagram_web",
     onProgress = null,
     now = () => new Date(),
   }) {
     this.dataDir = path.resolve(dataDir);
     this.usersPath = path.join(this.dataDir, "users.csv");
     this.lookupsPath = path.join(this.dataDir, "follower_lookups.csv");
-    this.accessToken = String(accessToken).trim();
-    this.ownerIgUserId = String(ownerIgUserId).trim();
-    this.apiVersion = normalizeApiVersion(apiVersion);
-    this.concurrency = Math.max(1, Math.min(10, Math.trunc(Number(concurrency) || 3)));
+    if (typeof lookupImpl !== "function") {
+      throw new TypeError("FollowerEnricher requires a web lookup function.");
+    }
+    this.concurrency = Math.max(1, Math.min(10, Math.trunc(Number(concurrency) || 1)));
     this.cacheHours = Math.max(0, Number(cacheHours) || 0);
-    this.usageThreshold = Math.max(1, Math.min(100, Number(usageThreshold) || 90));
-    this.fetchImpl = fetchImpl;
     this.lookupImpl = lookupImpl;
-    this.source = lookupImpl ? (source || "instagram_web") : "graph_api";
+    this.source = source;
     this.onProgress = onProgress;
     this.now = now;
     this.users = new Map();
@@ -295,12 +162,10 @@ class FollowerEnricher {
     this.ready = this._load();
   }
 
-  get configured() {
-    return Boolean(this.lookupImpl || (this.accessToken && this.ownerIgUserId));
-  }
-
   async _load() {
     await fsp.mkdir(this.dataDir, { recursive: true });
+    await normalizeCsvSchema(this.usersPath, USER_FIELDS);
+    await normalizeCsvSchema(this.lookupsPath, FOLLOWER_LOOKUP_FIELDS);
     if (!fs.existsSync(this.usersPath)) return;
     const rows = csvObjects(await fsp.readFile(this.usersPath, "utf8"));
     for (const source of rows) {
@@ -386,7 +251,7 @@ class FollowerEnricher {
   }
 
   _enqueue(row, force = false) {
-    if (!this.configured || this.stopped || !row.username || this.queued.has(row._key)) return false;
+    if (this.stopped || !row.username || this.queued.has(row._key)) return false;
     if (!force && this._isFresh(row)) return false;
     row.lookup_status = "queued";
     row.last_error = "";
@@ -404,10 +269,6 @@ class FollowerEnricher {
     if (!normalizedId && !normalizedUsername) return null;
     const timestamp = seenAt || this.now().toISOString();
     const row = this._findOrCreate(normalizedId, normalizedUsername, timestamp);
-    if (!this.configured && !row.follower_count) {
-      row.lookup_status = "api_not_configured";
-      row.last_error = "Set INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_IG_USER_ID in .env.";
-    }
     this._enqueue(row, false);
     this._markUsersDirty();
     return row;
@@ -415,16 +276,6 @@ class FollowerEnricher {
 
   async enqueueAll({ force = false } = {}) {
     await this.ready;
-    if (!this.configured) {
-      for (const row of this.users.values()) {
-        if (!row.follower_count) {
-          row.lookup_status = "api_not_configured";
-          row.last_error = "Set INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_IG_USER_ID in .env.";
-        }
-      }
-      this._markUsersDirty();
-      return 0;
-    }
     let count = 0;
     for (const row of this.users.values()) {
       if (this._enqueue(row, force)) count += 1;
@@ -450,15 +301,7 @@ class FollowerEnricher {
   async _lookupOne(row) {
     let result;
     try {
-      result = this.lookupImpl
-        ? await this.lookupImpl({ username: row.username, userId: row.user_id })
-        : await requestFollowerCount({
-          username: row.username,
-          accessToken: this.accessToken,
-          ownerIgUserId: this.ownerIgUserId,
-          apiVersion: this.apiVersion,
-          fetchImpl: this.fetchImpl,
-        });
+      result = await this.lookupImpl({ username: row.username, userId: row.user_id });
     } catch (error) {
       result = {
         status: "web_error",
@@ -474,8 +317,6 @@ class FollowerEnricher {
     if (result.status === "success") {
       row.follower_count = result.followerCount;
       row.follower_count_collected_at = collectedAt;
-      row.follower_source = source;
-      if (result.apiUserId) row.api_user_id = result.apiUserId;
       this.stats.success += 1;
     } else if (["not_professional_or_unavailable", "profile_unavailable"].includes(result.status)) {
       this.stats.unavailable += 1;
@@ -486,10 +327,7 @@ class FollowerEnricher {
       collected_at: collectedAt,
       user_id: row.user_id,
       username: row.username,
-      api_user_id: result.apiUserId ?? row.api_user_id,
       follower_count: result.status === "success" ? result.followerCount : "",
-      source,
-      lookup_status: result.status,
       error: row.last_error,
     });
     this.stats.completed += 1;
@@ -508,14 +346,10 @@ class FollowerEnricher {
       }
     }
     this._markUsersDirty();
-    if (
-      Number(result.usagePercent || 0) >= this.usageThreshold
-      || ["rate_limited", "auth_error", "login_required", "challenge_required"].includes(result.status)
-    ) {
+    if (["rate_limited", "login_required", "challenge_required"].includes(result.status)) {
       if (!this.stats.stopStatus) {
         this.stats.stopStatus = result.status;
-        this.stats.stopError = row.last_error
-          || `API usage reached ${result.usagePercent}%.`;
+        this.stats.stopError = row.last_error || "Follower lookup stopped.";
       }
       this.stopped = true;
       const deferredStatus = `deferred_${result.status}`;
@@ -540,7 +374,7 @@ class FollowerEnricher {
     await this._flushUsers();
     await this.writeChain;
     await this.lookupWriteChain;
-    return { ...this.stats, configured: this.configured, stopped: this.stopped };
+    return { ...this.stats, stopped: this.stopped };
   }
 }
 
@@ -549,8 +383,5 @@ export {
   FollowerEnricher,
   USER_FIELDS,
   csvObjects,
-  loadDotEnvFile,
   parseInstagramJson,
-  requestFollowerCount,
-  usagePercentFromHeaders,
 };

@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 if ($Manual -and $Background) {
     throw "-Manual and -Background cannot be used together."
 }
-$projectRoot = $PSScriptRoot
+$projectRoot = Split-Path -Parent $PSScriptRoot
 if (-not $DataDir) {
     $DataDir = Join-Path $projectRoot "data_web"
 }
@@ -31,8 +31,8 @@ try {
     throw "Close instagram_data.xlsx in Excel before running the refresh command."
 }
 
-$crawlerScript = Join-Path $projectRoot "instagram_reels_browser.mjs"
-$collectorScript = Join-Path $projectRoot "instagram_collector.py"
+$crawlerScript = Join-Path $projectRoot "collectors\instagram_reels_browser.mjs"
+$collectorScript = Join-Path $projectRoot "exporters\instagram_collector.py"
 $profileDir = Join-Path $projectRoot ".instagram_browser_profile"
 $bundledRoot = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies"
 $bundledNode = Join-Path $bundledRoot "node\bin\node.exe"
