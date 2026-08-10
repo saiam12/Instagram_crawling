@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+data/
+data_web/
+data_new_test/
+backups/
+.instagram_browser_profile/
+.diagnostics/
+.xlsx_verify*/
+.pytest_cache/
+__pycache__/
+*.pyc
+targets_new_test.csv
