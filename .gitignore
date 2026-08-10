@@ -12,3 +12,5 @@ tests/
 __pycache__/
 *.pyc
 targets_new_test.csv
+skill.md
+AGENTS.md
