@@ -48,6 +48,7 @@ const RECOLLECT_FIELDS = [
 ];
 
 const FAST_SUCCESS_INTERVAL_SECONDS = 0.5;
+const RECOLLECT_COOLDOWN_MILLISECONDS = 60 * 60 * 1_000;
 
 const CAPTION_MORE_TEXT_PATTERN = /^(?:(?:…|\.\.\.)\s*)?(?:더\s*보기|more)$/i;
 const PROFILE_INFO_TEXT_PATTERN = /(?:계정\s*정보|프로필|about\s+this\s+account|account\s+(?:info|information)|view\s+profile|profile)/i;
@@ -151,14 +152,17 @@ function parseArgs(argv) {
     else if (value === "--urls-file") options.urlsFile = path.resolve(argv[++index]);
     else throw new Error(`Unknown argument: ${value}`);
   }
-  if (!Number.isInteger(options.maxItems) || options.maxItems < 1) {
-    throw new Error("--max-items must be a positive integer.");
+  if (!Number.isInteger(options.maxItems) || options.maxItems < 0) {
+    throw new Error("--max-items must be a non-negative integer.");
   }
   if (!Number.isFinite(options.intervalSeconds) || options.intervalSeconds < 1) {
     throw new Error("--interval-seconds must be at least 1.");
   }
   if (options.manual && options.background) {
     throw new Error("--manual cannot be combined with --background.");
+  }
+  if (options.maxItems === 0 && options.hashtags.length) {
+    throw new Error("--max-items 0 is only supported for the Reels feed, not hashtag collection.");
   }
   if (!Number.isFinite(options.followerCacheHours) || options.followerCacheHours < 0) {
     throw new Error("--follower-cache-hours must be 0 or greater.");
@@ -811,7 +815,18 @@ function addSnapshotColumns(fields, label) {
   }
 }
 
-function integrateCollectedRecord(rows, fields, record) {
+function latestCollectionTimestamp(row, fields) {
+  const timestamps = [row.collected_at];
+  for (const label of snapshotLabels(fields)) {
+    timestamps.push(row[`${label}_collected_at`]);
+  }
+  return timestamps.reduce((latest, value) => {
+    const timestamp = new Date(value).getTime();
+    return Number.isFinite(timestamp) && timestamp > latest ? timestamp : latest;
+  }, Number.NEGATIVE_INFINITY);
+}
+
+function integrateCollectedRecord(rows, fields, record, { enforceCooldown = true } = {}) {
   const existing = rows.find((row) => row.url === record.url);
   if (!existing) {
     const initial = Object.fromEntries(CSV_FIELDS.map((field) => [field, record[field] ?? ""]));
@@ -819,6 +834,23 @@ function integrateCollectedRecord(rows, fields, record) {
     populateReactionRates(initial, fields);
     rows.push(initial);
     return { addedRow: true, label: "Initial" };
+  }
+
+  const recordTimestamp = new Date(record.collected_at).getTime();
+  const previousTimestamp = latestCollectionTimestamp(existing, fields);
+  if (
+    enforceCooldown
+    && Number.isFinite(recordTimestamp)
+    && Number.isFinite(previousTimestamp)
+    && recordTimestamp >= previousTimestamp
+    && recordTimestamp - previousTimestamp < RECOLLECT_COOLDOWN_MILLISECONDS
+  ) {
+    return {
+      addedRow: false,
+      skipped: true,
+      label: "Cooldown",
+      secondsSincePreviousCollection: Math.floor((recordTimestamp - previousTimestamp) / 1_000),
+    };
   }
 
   for (const field of ["user_id", "username"]) {
@@ -854,7 +886,7 @@ function integrateCollectedRecord(rows, fields, record) {
 function collapseLongRows(rows) {
   const collapsed = [];
   const fields = [...CSV_FIELDS];
-  for (const row of rows) integrateCollectedRecord(collapsed, fields, row);
+  for (const row of rows) integrateCollectedRecord(collapsed, fields, row, { enforceCooldown: false });
   return { rows: collapsed, fields };
 }
 
@@ -1277,12 +1309,28 @@ async function appendRecord(csvPath, record) {
     rows = csvObjects(existing);
   }
   const result = integrateCollectedRecord(rows, fields, record);
-  await writeCsvRecords(csvPath, rows, fields);
+  if (!result.skipped) await writeCsvRecords(csvPath, rows, fields);
   return result;
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  let stopRequested = false;
+  let interruptCount = 0;
+  const handleInterrupt = () => {
+    interruptCount += 1;
+    if (interruptCount === 1) {
+      stopRequested = true;
+      console.warn(
+        "Stop requested: no new Reels will be collected. Queued follower lookups will finish, then CSV/XLSX will be saved. Press Ctrl+C again to force exit.",
+      );
+      return;
+    }
+    console.warn("Force exit requested. Pending follower lookups may not be saved.");
+    process.exit(130);
+  };
+  process.on("SIGINT", handleInterrupt);
+  try {
   await fsp.mkdir(options.dataDir, { recursive: true });
   const csvPath = path.join(options.dataDir, "reels_web.csv");
   const { chromium } = loadPlaywright();
@@ -1433,6 +1481,7 @@ async function main() {
     return {
       ...record,
       snapshotLabel: stored.label,
+      cooldownSkipped: Boolean(stored.skipped),
       collectionComplete: hasCompleteReelCoreData(collectedRecord),
     };
   };
@@ -1460,6 +1509,10 @@ async function main() {
           console.log(`[${index + 1}/${directUrls.length}] Hashtag mismatch skipped: ${url}`);
           continue;
         }
+        if (record?.cooldownSkipped) {
+          console.log(`[${index + 1}/${directUrls.length}] 1시간 이내 중복 건너뜀: ${record.url}`);
+          continue;
+        }
         if (record) {
           captured += 1;
           console.log(
@@ -1483,7 +1536,7 @@ async function main() {
     let captured = 0;
     let noNewItemCount = 0;
     let lastReelsUrl = page.url();
-    while (captured < options.maxItems) {
+    while (!stopRequested && (options.maxItems === 0 || captured < options.maxItems)) {
       if (options.manual) {
         await prompt.question("현재 릴스를 저장하려면 Enter를 누르세요: ");
       } else {
@@ -1496,17 +1549,20 @@ async function main() {
         await page.waitForTimeout(500);
       }
       const record = await captureCurrentReel();
-      if (record) {
+      if (record?.cooldownSkipped) {
+        noNewItemCount = 0;
+        console.log(`1시간 이내 중복 건너뜀: ${record.url}`);
+      } else if (record) {
         lastReelsUrl = record.url;
         captured += 1;
         noNewItemCount = 0;
-        console.log(`[${captured}/${options.maxItems}] ${record.url}`);
+        console.log(`[${captured}/${options.maxItems === 0 ? "unlimited" : options.maxItems}] ${record.url}`);
       } else {
         noNewItemCount += 1;
         console.log("새 릴스 URL을 찾지 못했습니다. 화면이 릴스에 있는지 확인하세요.");
       }
 
-      if (!options.manual && captured < options.maxItems) {
+      if (!options.manual && !stopRequested && (options.maxItems === 0 || captured < options.maxItems)) {
         await page.keyboard.press("ArrowDown");
         if (noNewItemCount >= 3) {
           await page.mouse.wheel(0, 900);
@@ -1534,6 +1590,9 @@ async function main() {
   console.log(`Follower data merged into reels_web.csv: ${merged}`);
   await followerRuntime.browser.close();
   console.log(`저장 완료: ${csvPath}`);
+  } finally {
+    process.off("SIGINT", handleInterrupt);
+  }
 }
 
 export {

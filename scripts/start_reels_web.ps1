@@ -1,5 +1,6 @@
 [CmdletBinding()]
 param(
+    [ValidateRange(0, 2147483647)]
     [int]$MaxItems = 50,
     [double]$IntervalSeconds = 5,
     [ValidateRange(1, 3600)]
