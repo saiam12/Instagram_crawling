@@ -20,6 +20,9 @@ from xml.sax.saxutils import escape as xml_escape
 
 BASE_DIR = Path(__file__).resolve().parent
 XLSX_FILENAME = "instagram_data.xlsx"
+XLSX_INVALID_XML_CHARACTER_PATTERN = re.compile(
+    r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]"
+)
 XLSX_NUMERIC_FIELDS = {"follower_count", "like_count", "comment_count", "repost_count"}
 XLSX_PERCENT_FIELDS = {"reaction_rate"}
 XLSX_DELTA_FIELDS = {"like_count", "comment_count", "repost_count", "follower_count"}
@@ -166,8 +169,9 @@ def _xlsx_column_name(index: int) -> str:
 
 
 def _xlsx_text(value: str) -> str:
-    escaped = xml_escape(value, {'"': "&quot;"})
-    preserve = ' xml:space="preserve"' if value[:1].isspace() or value[-1:].isspace() else ""
+    sanitized = XLSX_INVALID_XML_CHARACTER_PATTERN.sub("", value)
+    escaped = xml_escape(sanitized, {'"': "&quot;"})
+    preserve = ' xml:space="preserve"' if sanitized[:1].isspace() or sanitized[-1:].isspace() else ""
     return f"<is><t{preserve}>{escaped}</t></is>"
 
 
@@ -216,7 +220,10 @@ def _xlsx_days_since_upload(value: str) -> str:
     if not re.fullmatch(r"(?:0|[1-9]\d*)(?:\.\d+)?", candidate):
         return value
     elapsed_days = float(candidate)
-    return f"+{int(elapsed_days * 24)}hours" if elapsed_days < 1 else f"+{int(elapsed_days)}day"
+    if elapsed_days < 1:
+        decimal_days = candidate.rstrip("0").rstrip(".") if "." in candidate else candidate
+        return f"{decimal_days}day"
+    return f"{int(elapsed_days)}day"
 
 
 def _xlsx_cell(reference: str, value: str, field_name: str, is_header: bool) -> str:

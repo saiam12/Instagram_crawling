@@ -2,10 +2,7 @@
 param(
     [string]$DataDir = "",
     [ValidateRange(1, 3600)]
-    [double]$IntervalSeconds = 8,
-    [ValidateRange(0, 8760)]
-    [double]$CacheHours = 1,
-    [switch]$Force
+    [double]$IntervalSeconds = 8
 )
 
 $ErrorActionPreference = "Stop"
@@ -75,12 +72,8 @@ $arguments = @(
     "--background",
     "--data-dir", $DataDir,
     "--profile-dir", $profileDir,
-    "--follower-interval-seconds", $IntervalSeconds,
-    "--follower-cache-hours", $CacheHours
+    "--follower-interval-seconds", $IntervalSeconds
 )
-if ($Force) {
-    $arguments += "--force-followers"
-}
 
 & $nodeExecutable @arguments
 $followerExitCode = $LASTEXITCODE

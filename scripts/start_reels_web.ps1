@@ -5,8 +5,15 @@ param(
     [double]$IntervalSeconds = 5,
     [ValidateRange(1, 3600)]
     [double]$FollowerIntervalSeconds = 8,
-    [ValidateRange(0, 8760)]
-    [double]$FollowerCacheHours = 1,
+    [ValidateRange(0, 36500)]
+    [double]$MaxUploadAgeDays = 0,
+    [ValidateRange(0, 1000000)]
+    [int]$PageRecycleItems = 200,
+    [ValidateRange(1, 1000000)]
+    [int]$CheckpointItems = 100,
+    [ValidateRange(0.5, 30)]
+    [double]$TransitionTimeoutSeconds = 3,
+    [switch]$FollowersAfterReels,
     [switch]$Manual,
     [switch]$Background,
     [string]$HashtagQuery = "",
@@ -62,7 +69,10 @@ $arguments = @(
     "--max-items", $MaxItems,
     "--interval-seconds", $IntervalSeconds,
     "--follower-interval-seconds", $FollowerIntervalSeconds,
-    "--follower-cache-hours", $FollowerCacheHours,
+    "--max-upload-age-days", $MaxUploadAgeDays,
+    "--page-recycle-items", $PageRecycleItems,
+    "--checkpoint-items", $CheckpointItems,
+    "--transition-timeout-seconds", $TransitionTimeoutSeconds,
     "--data-dir", $DataDir,
     "--profile-dir", $profileDir
 )
@@ -71,6 +81,9 @@ if ($Manual) {
 }
 if ($Background) {
     $arguments += "--background"
+}
+if ($FollowersAfterReels) {
+    $arguments += "--followers-after-reels"
 }
 if ($HashtagQuery) {
     $arguments += @("--hashtag-query", $HashtagQuery)

@@ -22,6 +22,10 @@ const FOLLOWER_LOOKUP_FIELDS = [
   "error",
 ];
 
+const USER_FLUSH_CHANGE_COUNT = 500;
+const MAX_CONSECUTIVE_WEB_ERRORS = 5;
+const FOLLOWER_CACHE_HOURS = 6;
+
 function csvValue(value) {
   const text = String(value ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
   return `"${text.replace(/"/g, '""')}"`;
@@ -120,7 +124,6 @@ class FollowerEnricher {
   constructor({
     dataDir,
     concurrency = 1,
-    cacheHours = 1,
     lookupImpl,
     source = "instagram_web",
     onProgress = null,
@@ -133,7 +136,6 @@ class FollowerEnricher {
       throw new TypeError("FollowerEnricher requires a web lookup function.");
     }
     this.concurrency = Math.max(1, Math.min(10, Math.trunc(Number(concurrency) || 1)));
-    this.cacheHours = Math.max(0, Number(cacheHours) || 0);
     this.lookupImpl = lookupImpl;
     this.source = source;
     this.onProgress = onProgress;
@@ -150,6 +152,7 @@ class FollowerEnricher {
     this.usersDirtyChanges = 0;
     this.usersFlushTimer = null;
     this.drainWaiters = [];
+    this.consecutiveWebErrors = 0;
     this.stats = {
       queued: 0,
       success: 0,
@@ -223,7 +226,7 @@ class FollowerEnricher {
 
   _markUsersDirty() {
     this.usersDirtyChanges += 1;
-    if (this.usersDirtyChanges >= 100) {
+    if (this.usersDirtyChanges >= USER_FLUSH_CHANGE_COUNT) {
       void this._flushUsers().catch(() => {});
     } else if (!this.usersFlushTimer) {
       this.usersFlushTimer = setTimeout(() => {
@@ -244,15 +247,15 @@ class FollowerEnricher {
 
   _isFresh(row) {
     const raw = row.last_lookup_at;
-    if (!raw || this.cacheHours === 0) return false;
+    if (!raw) return false;
     const timestamp = new Date(raw).getTime();
     if (!Number.isFinite(timestamp)) return false;
-    return this.now().getTime() - timestamp < this.cacheHours * 3_600_000;
+    return this.now().getTime() - timestamp < FOLLOWER_CACHE_HOURS * 3_600_000;
   }
 
-  _enqueue(row, force = false) {
+  _enqueue(row) {
     if (this.stopped || !row.username || this.queued.has(row._key)) return false;
-    if (!force && this._isFresh(row)) return false;
+    if (this._isFresh(row)) return false;
     row.lookup_status = "queued";
     row.last_error = "";
     this.queue.push(row);
@@ -262,26 +265,33 @@ class FollowerEnricher {
     return true;
   }
 
-  async trackUser({ userId = "", username = "", seenAt = "" }) {
+  async trackUser({ userId = "", username = "", seenAt = "", enqueue = true }) {
     await this.ready;
     const normalizedId = String(userId ?? "").trim();
     const normalizedUsername = String(username ?? "").trim().replace(/^@/, "");
     if (!normalizedId && !normalizedUsername) return null;
     const timestamp = seenAt || this.now().toISOString();
     const row = this._findOrCreate(normalizedId, normalizedUsername, timestamp);
-    this._enqueue(row, false);
+    if (enqueue) this._enqueue(row);
     this._markUsersDirty();
     return row;
   }
 
-  async enqueueAll({ force = false } = {}) {
+  async enqueueAll() {
     await this.ready;
     let count = 0;
     for (const row of this.users.values()) {
-      if (this._enqueue(row, force)) count += 1;
+      if (this._enqueue(row)) count += 1;
     }
     this._markUsersDirty();
     return count;
+  }
+
+  setLookupImpl(lookupImpl) {
+    if (typeof lookupImpl !== "function") {
+      throw new TypeError("FollowerEnricher requires a web lookup function.");
+    }
+    this.lookupImpl = lookupImpl;
   }
 
   _pump() {
@@ -323,6 +333,9 @@ class FollowerEnricher {
     } else {
       this.stats.failed += 1;
     }
+    this.consecutiveWebErrors = result.status === "web_error"
+      ? this.consecutiveWebErrors + 1
+      : 0;
     await this._scheduleLookupWrite({
       collected_at: collectedAt,
       user_id: row.user_id,
@@ -346,13 +359,19 @@ class FollowerEnricher {
       }
     }
     this._markUsersDirty();
-    if (["rate_limited", "login_required", "challenge_required"].includes(result.status)) {
+    const repeatedWebError = this.consecutiveWebErrors >= MAX_CONSECUTIVE_WEB_ERRORS;
+    if (
+      ["rate_limited", "login_required", "challenge_required"].includes(result.status)
+      || repeatedWebError
+    ) {
       if (!this.stats.stopStatus) {
-        this.stats.stopStatus = result.status;
-        this.stats.stopError = row.last_error || "Follower lookup stopped.";
+        this.stats.stopStatus = repeatedWebError ? "repeated_web_error" : result.status;
+        this.stats.stopError = repeatedWebError
+          ? `${MAX_CONSECUTIVE_WEB_ERRORS} consecutive follower web errors.`
+          : row.last_error || "Follower lookup stopped.";
       }
       this.stopped = true;
-      const deferredStatus = `deferred_${result.status}`;
+      const deferredStatus = `deferred_${this.stats.stopStatus}`;
       for (const pending of this.queue.splice(0)) {
         pending.lookup_status = deferredStatus;
         this.queued.delete(pending._key);
@@ -379,6 +398,7 @@ class FollowerEnricher {
 }
 
 export {
+  FOLLOWER_CACHE_HOURS,
   FOLLOWER_LOOKUP_FIELDS,
   FollowerEnricher,
   USER_FIELDS,

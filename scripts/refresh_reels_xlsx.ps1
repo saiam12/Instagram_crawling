@@ -4,8 +4,8 @@ param(
     [double]$IntervalSeconds = 2,
     [ValidateRange(1, 3600)]
     [double]$FollowerIntervalSeconds = 8,
-    [ValidateRange(0, 8760)]
-    [double]$FollowerCacheHours = 1,
+    [ValidateRange(0, 36500)]
+    [double]$MaxUploadAgeDays = 0,
     [switch]$Manual,
     [switch]$Background,
     [string]$DataDir = ""
@@ -83,7 +83,7 @@ try {
         "--urls-file", $queuePath,
         "--interval-seconds", $IntervalSeconds,
         "--follower-interval-seconds", $FollowerIntervalSeconds,
-        "--follower-cache-hours", $FollowerCacheHours,
+        "--max-upload-age-days", $MaxUploadAgeDays,
         "--data-dir", $DataDir,
         "--profile-dir", $profileDir
     )

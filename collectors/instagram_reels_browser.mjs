@@ -47,8 +47,19 @@ const RECOLLECT_FIELDS = [
   "reaction_rate",
 ];
 
-const FAST_SUCCESS_INTERVAL_SECONDS = 0.5;
-const RECOLLECT_COOLDOWN_MILLISECONDS = 60 * 60 * 1_000;
+const REEL_SUCCESS_INTERVAL_SECONDS = 0.5;
+const FOLLOWER_SUCCESS_INTERVAL_SECONDS = 0.3;
+const FOLLOWER_PROFILE_SETTLE_MILLISECONDS = 700;
+const FOLLOWER_PAGE_RECYCLE_LOOKUP_COUNT = 500;
+const REEL_STORE_FLUSH_RECORD_COUNT = 100;
+const REEL_PAGE_RECYCLE_ITEM_COUNT = 200;
+const REEL_TRANSITION_TIMEOUT_SECONDS = 3;
+const REEL_TRANSITION_POLL_MILLISECONDS = 100;
+const REEL_TRANSITION_SETTLE_MILLISECONDS = 200;
+const REEL_UNPRODUCTIVE_RECYCLE_THRESHOLD = 8;
+const REEL_MAX_CONSECUTIVE_RECOVERY_FAILURES = 6;
+const REEL_STATUS_WRITE_INTERVAL_MILLISECONDS = 60_000;
+const RECOLLECT_COOLDOWN_MILLISECONDS = 6 * 60 * 60 * 1_000;
 
 const CAPTION_MORE_TEXT_PATTERN = /^(?:(?:…|\.\.\.)\s*)?(?:더\s*보기|more)$/i;
 const PROFILE_INFO_TEXT_PATTERN = /(?:계정\s*정보|프로필|about\s+this\s+account|account\s+(?:info|information)|view\s+profile|profile)/i;
@@ -127,9 +138,12 @@ function parseArgs(argv) {
     manual: false,
     background: false,
     followersOnly: false,
-    forceFollowers: false,
-    followerCacheHours: 1,
     followerIntervalSeconds: 8,
+    maxUploadAgeDays: 0,
+    followersAfterReels: false,
+    pageRecycleItems: REEL_PAGE_RECYCLE_ITEM_COUNT,
+    checkpointItems: REEL_STORE_FLUSH_RECORD_COUNT,
+    transitionTimeoutSeconds: REEL_TRANSITION_TIMEOUT_SECONDS,
     hashtags: [],
     urlsFile: "",
     dataDir: path.resolve("data_web"),
@@ -140,14 +154,17 @@ function parseArgs(argv) {
     if (value === "--manual") options.manual = true;
     else if (value === "--background") options.background = true;
     else if (value === "--followers-only") options.followersOnly = true;
-    else if (value === "--force-followers") options.forceFollowers = true;
     else if (value === "--start-url") options.startUrl = argv[++index];
     else if (value === "--max-items") options.maxItems = Number(argv[++index]);
     else if (value === "--interval-seconds") options.intervalSeconds = Number(argv[++index]);
     else if (value === "--data-dir") options.dataDir = path.resolve(argv[++index]);
     else if (value === "--profile-dir") options.profileDir = path.resolve(argv[++index]);
-    else if (value === "--follower-cache-hours") options.followerCacheHours = Number(argv[++index]);
     else if (value === "--follower-interval-seconds") options.followerIntervalSeconds = Number(argv[++index]);
+    else if (value === "--max-upload-age-days") options.maxUploadAgeDays = Number(argv[++index]);
+    else if (value === "--followers-after-reels") options.followersAfterReels = true;
+    else if (value === "--page-recycle-items") options.pageRecycleItems = Number(argv[++index]);
+    else if (value === "--checkpoint-items") options.checkpointItems = Number(argv[++index]);
+    else if (value === "--transition-timeout-seconds") options.transitionTimeoutSeconds = Number(argv[++index]);
     else if (value === "--hashtag-query") options.hashtags = parseHashtagQuery(argv[++index]);
     else if (value === "--urls-file") options.urlsFile = path.resolve(argv[++index]);
     else throw new Error(`Unknown argument: ${value}`);
@@ -164,16 +181,41 @@ function parseArgs(argv) {
   if (options.maxItems === 0 && options.hashtags.length) {
     throw new Error("--max-items 0 is only supported for the Reels feed, not hashtag collection.");
   }
-  if (!Number.isFinite(options.followerCacheHours) || options.followerCacheHours < 0) {
-    throw new Error("--follower-cache-hours must be 0 or greater.");
-  }
   if (!Number.isFinite(options.followerIntervalSeconds) || options.followerIntervalSeconds < 1) {
     throw new Error("--follower-interval-seconds must be at least 1.");
+  }
+  if (!Number.isFinite(options.maxUploadAgeDays) || options.maxUploadAgeDays < 0) {
+    throw new Error("--max-upload-age-days must be 0 or greater.");
+  }
+  if (!Number.isInteger(options.pageRecycleItems) || options.pageRecycleItems < 0) {
+    throw new Error("--page-recycle-items must be a non-negative integer.");
+  }
+  if (!Number.isInteger(options.checkpointItems) || options.checkpointItems < 1) {
+    throw new Error("--checkpoint-items must be a positive integer.");
+  }
+  if (
+    !Number.isFinite(options.transitionTimeoutSeconds)
+    || options.transitionTimeoutSeconds < 0.5
+    || options.transitionTimeoutSeconds > 30
+  ) {
+    throw new Error("--transition-timeout-seconds must be between 0.5 and 30.");
   }
   if (!/^https:\/\/(?:www\.)?instagram\.com\//i.test(options.startUrl)) {
     throw new Error("--start-url must be an https://www.instagram.com/ URL.");
   }
   return options;
+}
+
+function createBackgroundStopInputListener(requestStop) {
+  let bufferedInput = "";
+  return (chunk) => {
+    bufferedInput += String(chunk ?? "");
+    const lastNewline = bufferedInput.lastIndexOf("\n");
+    if (lastNewline < 0) return;
+    const submittedLines = bufferedInput.slice(0, lastNewline).split(/\r?\n/);
+    bufferedInput = bufferedInput.slice(lastNewline + 1);
+    if (submittedLines.some((line) => line.trim())) requestStop();
+  };
 }
 
 async function loadReelUrls(filePath) {
@@ -363,7 +405,7 @@ async function requestWebFollowerCount({ page, username }) {
     if (response?.status?.() === 429) {
       return { status: "rate_limited", error: "Instagram returned HTTP 429.", source: "instagram_web" };
     }
-    await page.waitForTimeout(1_500);
+    await page.waitForTimeout(FOLLOWER_PROFILE_SETTLE_MILLISECONDS);
     const currentUrl = page.url();
     if (/\/accounts\/login/i.test(currentUrl)) {
       return { status: "login_required", error: "Instagram login is required.", source: "instagram_web" };
@@ -451,12 +493,63 @@ async function requestWebFollowerCount({ page, username }) {
 }
 
 function createSequentialWebFollowerLookup(page, intervalSeconds = 8) {
+  const context = typeof page.context === "function" ? page.context() : null;
+  let activePage = page;
+  let completedSinceRecycle = 0;
   let waitBeforeNextLookupMilliseconds = 0;
+  const pageIsClosed = () => (
+    typeof activePage?.isClosed === "function" && activePage.isClosed()
+  );
+  const replacePage = async () => {
+    if (!context) throw new Error("Follower browser context is unavailable.");
+    const previousPage = activePage;
+    activePage = await context.newPage();
+    await previousPage?.close().catch(() => {});
+  };
   return async ({ username }) => {
     if (waitBeforeNextLookupMilliseconds) {
-      await page.waitForTimeout(waitBeforeNextLookupMilliseconds);
+      if (!pageIsClosed() && typeof activePage?.waitForTimeout === "function") {
+        await activePage.waitForTimeout(waitBeforeNextLookupMilliseconds);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, waitBeforeNextLookupMilliseconds));
+      }
     }
-    const result = await requestWebFollowerCount({ page, username });
+    if (pageIsClosed()) {
+      try {
+        await replacePage();
+      } catch (error) {
+        return {
+          status: "web_error",
+          error: `Follower page recovery failed: ${String(error?.message ?? error).slice(0, 400)}`,
+          source: "instagram_web",
+        };
+      }
+    }
+    let result = await requestWebFollowerCount({ page: activePage, username });
+    if (result.status === "web_error") {
+      try {
+        await replacePage();
+        result = await requestWebFollowerCount({ page: activePage, username });
+      } catch (error) {
+        result = {
+          status: "web_error",
+          error: `Follower page retry failed: ${String(error?.message ?? error).slice(0, 400)}`,
+          source: "instagram_web",
+        };
+      }
+    }
+    completedSinceRecycle += 1;
+    if (
+      completedSinceRecycle >= FOLLOWER_PAGE_RECYCLE_LOOKUP_COUNT
+      && !["rate_limited", "login_required", "challenge_required"].includes(result.status)
+    ) {
+      try {
+        await replacePage();
+        completedSinceRecycle = 0;
+      } catch {
+        // A failed preventative recycle is retried before the next lookup.
+      }
+    }
     waitBeforeNextLookupMilliseconds = followerLookupDelaySeconds(result, intervalSeconds) * 1_000;
     return result;
   };
@@ -464,7 +557,7 @@ function createSequentialWebFollowerLookup(page, intervalSeconds = 8) {
 
 function followerLookupDelaySeconds(result, fallbackSeconds) {
   return result?.status === "success" && parseMetricCount(result.followerCount) !== ""
-    ? FAST_SUCCESS_INTERVAL_SECONDS
+    ? FOLLOWER_SUCCESS_INTERVAL_SECONDS
     : fallbackSeconds;
 }
 
@@ -751,6 +844,14 @@ function daysSinceUpload(uploadedTimestamp, collectedTimestamp) {
   return Math.round(Math.max(0, (collected - uploaded) / 86_400_000) * 100) / 100;
 }
 
+function isWithinUploadAgeDays(record, maxUploadAgeDays) {
+  if (!(maxUploadAgeDays > 0)) return true;
+  const uploaded = new Date(record?.uploaded_at).getTime();
+  const collected = new Date(record?.collected_at).getTime();
+  if (!Number.isFinite(uploaded) || !Number.isFinite(collected)) return false;
+  return Math.max(0, collected - uploaded) <= maxUploadAgeDays * 86_400_000;
+}
+
 function collectionLabel(collectionNumber) {
   const remainder100 = collectionNumber % 100;
   const remainder10 = collectionNumber % 10;
@@ -826,21 +927,12 @@ function latestCollectionTimestamp(row, fields) {
   }, Number.NEGATIVE_INFINITY);
 }
 
-function integrateCollectedRecord(rows, fields, record, { enforceCooldown = true } = {}) {
-  const existing = rows.find((row) => row.url === record.url);
-  if (!existing) {
-    const initial = Object.fromEntries(CSV_FIELDS.map((field) => [field, record[field] ?? ""]));
-    initial.days_since_upload = daysSinceUpload(initial.uploaded_at, initial.collected_at);
-    populateReactionRates(initial, fields);
-    rows.push(initial);
-    return { addedRow: true, label: "Initial" };
-  }
-
+function collectedRecordCooldown(existing, fields, record) {
+  if (!existing) return null;
   const recordTimestamp = new Date(record.collected_at).getTime();
   const previousTimestamp = latestCollectionTimestamp(existing, fields);
   if (
-    enforceCooldown
-    && Number.isFinite(recordTimestamp)
+    Number.isFinite(recordTimestamp)
     && Number.isFinite(previousTimestamp)
     && recordTimestamp >= previousTimestamp
     && recordTimestamp - previousTimestamp < RECOLLECT_COOLDOWN_MILLISECONDS
@@ -852,6 +944,27 @@ function integrateCollectedRecord(rows, fields, record, { enforceCooldown = true
       secondsSincePreviousCollection: Math.floor((recordTimestamp - previousTimestamp) / 1_000),
     };
   }
+  return null;
+}
+
+function integrateCollectedRecord(
+  rows,
+  fields,
+  record,
+  { enforceCooldown = true, rowByUrl = null } = {},
+) {
+  const existing = rowByUrl?.get(record.url) ?? rows.find((row) => row.url === record.url);
+  if (!existing) {
+    const initial = Object.fromEntries(CSV_FIELDS.map((field) => [field, record[field] ?? ""]));
+    initial.days_since_upload = daysSinceUpload(initial.uploaded_at, initial.collected_at);
+    populateReactionRates(initial, fields);
+    rows.push(initial);
+    rowByUrl?.set(record.url, initial);
+    return { addedRow: true, label: "Initial" };
+  }
+
+  const cooldown = enforceCooldown ? collectedRecordCooldown(existing, fields, record) : null;
+  if (cooldown) return cooldown;
 
   for (const field of ["user_id", "username"]) {
     if (!existing[field] && record[field]) existing[field] = record[field];
@@ -961,6 +1074,121 @@ async function writeCsvRecords(csvPath, rows, fields = CSV_FIELDS) {
   );
   await fsp.writeFile(temporaryPath, `${lines.join("\r\n")}\r\n`, "utf8");
   await fsp.rename(temporaryPath, csvPath);
+}
+
+async function writeJsonAtomic(destination, value) {
+  await fsp.mkdir(path.dirname(destination), { recursive: true });
+  const temporaryPath = path.join(
+    path.dirname(destination),
+    `.${path.basename(destination)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  await fsp.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await fsp.rename(temporaryPath, destination);
+}
+
+function createCollectorStatusReporter(dataDir, options) {
+  const destination = path.join(dataDir, "collector_status.json");
+  let status = {
+    state: "starting",
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    target_items: options.maxItems,
+    captured: 0,
+    duplicates: 0,
+    missing: 0,
+    filtered: 0,
+    cooldown_skipped: 0,
+    page_recycles: 0,
+    recovery_failures: 0,
+    last_reel_url: "",
+    last_error: "",
+  };
+  let lastWriteAt = 0;
+  let writeChain = Promise.resolve();
+
+  const persist = ({ force = false } = {}) => {
+    const now = Date.now();
+    if (!force && now - lastWriteAt < REEL_STATUS_WRITE_INTERVAL_MILLISECONDS) {
+      return writeChain;
+    }
+    lastWriteAt = now;
+    status.updated_at = new Date(now).toISOString();
+    const snapshot = { ...status };
+    writeChain = writeChain.catch(() => {}).then(() => writeJsonAtomic(destination, snapshot));
+    return writeChain;
+  };
+
+  return {
+    destination,
+    snapshot() {
+      return { ...status };
+    },
+    update(patch, options = {}) {
+      status = { ...status, ...patch };
+      return persist(options);
+    },
+    async finish(state, patch = {}) {
+      status = {
+        ...status,
+        ...patch,
+        state,
+        finished_at: new Date().toISOString(),
+      };
+      await persist({ force: true });
+      await writeChain;
+    },
+  };
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+async function acquireCollectorLock(dataDir) {
+  const lockPath = path.join(dataDir, "collector.lock.json");
+  const lock = {
+    pid: process.pid,
+    started_at: new Date().toISOString(),
+    data_dir: path.resolve(dataDir),
+  };
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await fsp.writeFile(lockPath, `${JSON.stringify(lock, null, 2)}\n`, {
+        encoding: "utf8",
+        flag: "wx",
+      });
+      return async () => {
+        try {
+          const current = JSON.parse(await fsp.readFile(lockPath, "utf8"));
+          if (current?.pid === process.pid) await fsp.rm(lockPath, { force: true });
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let existing = null;
+      try {
+        existing = JSON.parse(await fsp.readFile(lockPath, "utf8"));
+      } catch {
+        // A malformed lock is stale and can be replaced.
+      }
+      if (existing?.pid && processIsAlive(Number(existing.pid))) {
+        throw new Error(
+          `Another collector is already using this data directory (PID ${existing.pid}).`,
+        );
+      }
+      await fsp.rm(lockPath, { force: true });
+    }
+  }
+  throw new Error(`Could not acquire collector lock: ${lockPath}`);
 }
 
 async function mergeFollowerDataIntoReels(csvPath, usersPath) {
@@ -1299,95 +1527,90 @@ async function extractVisibleReel(page) {
   return normalized ? { ...browserData, ...normalized } : null;
 }
 
-async function appendRecord(csvPath, record) {
-  await prepareCsv(csvPath);
-  let fields = [...CSV_FIELDS];
-  let rows = [];
-  if (fs.existsSync(csvPath) && (await fsp.stat(csvPath)).size > 0) {
-    const existing = await fsp.readFile(csvPath, "utf8");
-    fields = parseCsvHeader(existing);
-    rows = csvObjects(existing);
-  }
-  const result = integrateCollectedRecord(rows, fields, record);
-  if (!result.skipped) await writeCsvRecords(csvPath, rows, fields);
-  return result;
+async function readActiveReelIdentity(page) {
+  const browserData = await page.evaluate(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight;
+    };
+    const activeHref = [...document.querySelectorAll('a[href*="/reel/"], a[href*="/reels/"]')]
+      .filter(visible)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return {
+          href: element.href,
+          distance: Math.abs(rect.top + rect.height / 2 - innerHeight / 2),
+        };
+      })
+      .sort((left, right) => left.distance - right.distance)[0]?.href ?? "";
+    return { currentUrl: location.href, activeHref };
+  });
+  const active = normalizeReelUrl(browserData.activeHref);
+  const current = normalizeReelUrl(browserData.currentUrl);
+  return active ?? current;
 }
 
-async function main() {
-  const options = parseArgs(process.argv.slice(2));
-  let stopRequested = false;
-  let interruptCount = 0;
-  const handleInterrupt = () => {
-    interruptCount += 1;
-    if (interruptCount === 1) {
-      stopRequested = true;
-      console.warn(
-        "Stop requested: no new Reels will be collected. Queued follower lookups will finish, then CSV/XLSX will be saved. Press Ctrl+C again to force exit.",
-      );
-      return;
+async function waitForActiveReelChange(page, previousShortcode, timeoutMilliseconds) {
+  const deadline = Date.now() + timeoutMilliseconds;
+  let latest = null;
+  while (Date.now() < deadline) {
+    latest = await readActiveReelIdentity(page).catch(() => null);
+    if (latest?.shortcode && latest.shortcode !== previousShortcode) {
+      await page.waitForTimeout(REEL_TRANSITION_SETTLE_MILLISECONDS);
+      return { changed: true, ...latest };
     }
-    console.warn("Force exit requested. Pending follower lookups may not be saved.");
-    process.exit(130);
-  };
-  process.on("SIGINT", handleInterrupt);
-  try {
-  await fsp.mkdir(options.dataDir, { recursive: true });
-  const csvPath = path.join(options.dataDir, "reels_web.csv");
-  const { chromium } = loadPlaywright();
-  const refreshUrls = !options.followersOnly && options.urlsFile
-    ? await loadReelUrls(options.urlsFile)
-    : [];
-  const startUrl = refreshUrls[0]
-    ?? (options.hashtags[0] ? hashtagPageUrl(options.hashtags[0]) : options.startUrl);
-  await fsp.mkdir(options.profileDir, { recursive: true });
-  if (!options.followersOnly) await prepareCsv(csvPath);
-  // Deduplicate only inside this run. A later run may revisit the same URL and
-  // append a new engagement snapshot for time-series analysis.
-  const seen = new Set();
-  const executablePath = process.env.INSTAGRAM_BROWSER_EXECUTABLE;
-  if (!executablePath || !fs.existsSync(executablePath)) {
-    throw new Error("A supported Chrome or Edge executable was not found.");
+    await page.waitForTimeout(REEL_TRANSITION_POLL_MILLISECONDS);
   }
+  return { changed: false, ...(latest ?? {}) };
+}
 
-  const context = await chromium.launchPersistentContext(options.profileDir, {
-    executablePath,
-    headless: options.background,
-    viewport: options.background ? { width: 1440, height: 1000 } : null,
-    args: options.background ? [] : ["--start-maximized"],
-  });
-  // Always create the collection page after response listeners are ready.
-  // Reusing Edge's restored tab can show a cached Reel without emitting the
-  // matching metadata response, which makes caption/audio fields unavailable.
-  const restoredPages = context.pages();
-  const page = options.followersOnly ? null : await context.newPage();
-  let followerRuntime = null;
-  let followerEnricher = null;
-  const startFollowerEnricher = async () => {
-    followerRuntime = await createBackgroundFollowerRuntime({
-      chromium,
-      sourceContext: context,
-      executablePath,
-    });
-    followerEnricher = new FollowerEnricher({
-      dataDir: options.dataDir,
-      concurrency: 1,
-      cacheHours: options.followerCacheHours,
-      lookupImpl: createSequentialWebFollowerLookup(
-        followerRuntime.page,
-        options.followerIntervalSeconds,
-      ),
-      source: "instagram_web",
-      onProgress: ({ completed, queued, username, status, followerCount, error }) => {
-        const outcome = status === "success"
-          ? Number(followerCount).toLocaleString("en-US")
-          : `${status}${error ? ` (${error})` : ""}`;
-        console.log(`[Follower ${completed}/${queued}] @${username} -> ${outcome}`);
-      },
-    });
-    return followerEnricher;
-  };
-  const reelMetadata = new Map();
-  page?.on("response", async (response) => {
+async function advanceToNextReel(page, previousShortcode, timeoutMilliseconds) {
+  const previous = previousShortcode || (await readActiveReelIdentity(page).catch(() => null))?.shortcode || "";
+  await page.keyboard.press("ArrowDown");
+  let transition = await waitForActiveReelChange(page, previous, timeoutMilliseconds);
+  if (transition.changed) return transition;
+  await page.mouse.wheel(0, 900);
+  transition = await waitForActiveReelChange(page, previous, Math.max(500, timeoutMilliseconds / 2));
+  return transition;
+}
+
+function crawlerAccessError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function assertInstagramPageAccess(page, response = null, { allowLogin = false } = {}) {
+  if (response?.status?.() === 429) {
+    throw crawlerAccessError("rate_limited", "Instagram returned HTTP 429.");
+  }
+  const currentUrl = page.url();
+  if (!allowLogin && /\/accounts\/login/i.test(currentUrl)) {
+    throw crawlerAccessError("login_required", "Instagram login is required.");
+  }
+  if (!allowLogin && /\/(?:challenge|checkpoint)\//i.test(currentUrl)) {
+    throw crawlerAccessError("challenge_required", "Instagram requested an account check.");
+  }
+}
+
+async function navigateWithRetries(page, url, { attempts = 3, allowLogin = false } = {}) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      assertInstagramPageAccess(page, response, { allowLogin });
+      return response;
+    } catch (error) {
+      if (["rate_limited", "login_required", "challenge_required"].includes(error?.code)) throw error;
+      lastError = error;
+      if (attempt < attempts) await page.waitForTimeout(attempt * 1_000);
+    }
+  }
+  throw lastError ?? new Error(`Failed to open ${url}`);
+}
+
+function attachReelMetadataCollector(page, reelMetadata) {
+  page.on("response", async (response) => {
     try {
       const responseUrl = new URL(response.url());
       const contentType = response.headers()["content-type"] ?? "";
@@ -1397,18 +1620,578 @@ async function main() {
       // Some response bodies are unavailable after navigation; they are optional fallbacks.
     }
   });
-  await Promise.all(restoredPages.map((restoredPage) => restoredPage.close().catch(() => {})));
-  if (options.followersOnly) {
-    await startFollowerEnricher();
-    await context.close();
-    const queued = await followerEnricher.enqueueAll({ force: options.forceFollowers });
-    console.log(`Follower web lookups queued: ${queued}`);
-    const stats = await followerEnricher.drain();
+}
+
+async function createCollectionPage(context, url, reelMetadata, { allowLogin = false } = {}) {
+  const page = await context.newPage();
+  attachReelMetadataCollector(page, reelMetadata);
+  try {
+    await navigateWithRetries(page, url, { allowLogin });
+    await page.waitForTimeout(500);
+    return page;
+  } catch (error) {
+    await page.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function recycleCollectionPage({ context, page, url, reelMetadata }) {
+  await page?.close().catch(() => {});
+  reelMetadata.clear();
+  return createCollectionPage(context, url, reelMetadata);
+}
+
+async function createReelStore(csvPath, { flushRecordCount = REEL_STORE_FLUSH_RECORD_COUNT } = {}) {
+  await prepareCsv(csvPath);
+  let fields = [...CSV_FIELDS];
+  let rows = [];
+  if (fs.existsSync(csvPath) && (await fsp.stat(csvPath)).size > 0) {
+    const existing = await fsp.readFile(csvPath, "utf8");
+    fields = parseCsvHeader(existing);
+    rows = csvObjects(existing);
+  }
+  const rowByUrl = new Map(rows.filter((row) => row.url).map((row) => [row.url, row]));
+  const journalPath = `${csvPath}.pending.jsonl`;
+  let dirty = false;
+  let pendingRecordCount = 0;
+
+  if (fs.existsSync(journalPath) && (await fsp.stat(journalPath)).size > 0) {
+    const journalText = await fsp.readFile(journalPath, "utf8");
+    const invalidLines = [];
+    let recovered = 0;
+    for (const line of journalText.split(/\r?\n/).filter(Boolean)) {
+      try {
+        const record = JSON.parse(line);
+        const result = integrateCollectedRecord(rows, fields, record, { rowByUrl });
+        if (!result.skipped) recovered += 1;
+      } catch {
+        invalidLines.push(line);
+      }
+    }
+    if (recovered) {
+      await writeCsvRecords(csvPath, rows, fields);
+      console.log(`비정상 종료 전 임시 저장 릴스 복구 완료: ${recovered}개`);
+    }
+    if (invalidLines.length) {
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+      const corruptPath = `${journalPath}.corrupt_${stamp}`;
+      await fsp.rename(journalPath, corruptPath);
+      console.warn(`손상된 임시 저장 줄 ${invalidLines.length}개를 보관했습니다: ${corruptPath}`);
+    } else {
+      await fsp.rm(journalPath, { force: true });
+    }
+  }
+
+  const flush = async ({ force = false } = {}) => {
+    if (!dirty || (!force && pendingRecordCount < flushRecordCount)) {
+      return false;
+    }
+    const savedRecordCount = pendingRecordCount;
+    await writeCsvRecords(csvPath, rows, fields);
+    await fsp.rm(journalPath, { force: true });
+    dirty = false;
+    pendingRecordCount = 0;
     console.log(
-      `Follower web lookups finished: success=${stats.success} unavailable=${stats.unavailable} failed=${stats.failed}`,
+      force
+        ? `남은 릴스 저장 완료: ${savedRecordCount}개`
+        : `릴스 ${flushRecordCount}개 체크포인트 저장 완료: ${savedRecordCount}개`,
     );
-    if (stats.stopStatus) {
-      console.error(`Follower web lookup stopped (${stats.stopStatus}): ${stats.stopError}`);
+    return true;
+  };
+
+  return {
+    async append(record) {
+      const cooldown = collectedRecordCooldown(rowByUrl.get(record.url), fields, record);
+      if (cooldown) return cooldown;
+      await fsp.appendFile(journalPath, `${JSON.stringify(record)}\n`, "utf8");
+      const result = integrateCollectedRecord(rows, fields, record, {
+        enforceCooldown: false,
+        rowByUrl,
+      });
+      dirty = true;
+      pendingRecordCount += 1;
+      await flush();
+      return result;
+    },
+    async flush() {
+      return flush({ force: true });
+    },
+    stats() {
+      return { rows: rows.length, pending: pendingRecordCount, journalPath };
+    },
+  };
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  let stopRequested = false;
+  let interruptCount = 0;
+  let statusReporter = null;
+  let reelStore = null;
+  let context = null;
+  let followerRuntime = null;
+  let prompt = null;
+  let releaseCollectorLock = null;
+  const requestGracefulStop = (source) => {
+    if (stopRequested) return false;
+    stopRequested = true;
+    console.warn(
+      `${source}: no new Reels will be collected. Queued follower lookups will finish, then CSV/XLSX will be saved.`,
+    );
+    return true;
+  };
+  const handleInterrupt = () => {
+    interruptCount += 1;
+    if (interruptCount === 1) {
+      requestGracefulStop("Stop requested");
+      console.warn("Press Ctrl+C again to force exit.");
+      return;
+    }
+    console.warn("Force exit requested. Pending follower lookups may not be saved.");
+    process.exit(130);
+  };
+  const backgroundStopInputListener = options.background && process.stdin.isTTY
+    ? createBackgroundStopInputListener(() => requestGracefulStop("Input received"))
+    : null;
+  process.on("SIGINT", handleInterrupt);
+  if (backgroundStopInputListener) {
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", backgroundStopInputListener);
+    console.log("To stop Reels collection and finish queued followers, type any text then press Enter (for example: q).");
+  }
+  try {
+    await fsp.mkdir(options.dataDir, { recursive: true });
+    releaseCollectorLock = await acquireCollectorLock(options.dataDir);
+    statusReporter = createCollectorStatusReporter(options.dataDir, options);
+    const updateStatus = async (patch, reporterOptions = {}) => {
+      try {
+        await statusReporter.update(patch, reporterOptions);
+      } catch (error) {
+        console.warn(`상태 파일 저장 실패: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    await updateStatus({ state: options.followersOnly ? "followers" : "collecting" }, { force: true });
+
+    const csvPath = path.join(options.dataDir, "reels_web.csv");
+    const { chromium } = loadPlaywright();
+    const refreshUrls = !options.followersOnly && options.urlsFile
+      ? await loadReelUrls(options.urlsFile)
+      : [];
+    const startUrl = refreshUrls[0]
+      ?? (options.hashtags[0] ? hashtagPageUrl(options.hashtags[0]) : options.startUrl);
+    await fsp.mkdir(options.profileDir, { recursive: true });
+    reelStore = options.followersOnly
+      ? null
+      : await createReelStore(csvPath, { flushRecordCount: options.checkpointItems });
+    const seen = new Set();
+    const deferredFollowerUsers = new Map();
+    const executablePath = process.env.INSTAGRAM_BROWSER_EXECUTABLE;
+    if (!executablePath || !fs.existsSync(executablePath)) {
+      throw new Error("A supported Chrome or Edge executable was not found.");
+    }
+
+    context = await chromium.launchPersistentContext(options.profileDir, {
+      executablePath,
+      headless: options.background,
+      viewport: options.background ? { width: 1440, height: 1000 } : null,
+      args: options.background ? [] : ["--start-maximized"],
+    });
+    const restoredPages = context.pages();
+    await Promise.all(restoredPages.map((restoredPage) => restoredPage.close().catch(() => {})));
+
+    let followerEnricher = null;
+    const ensureFollowerRuntime = async () => {
+      if (followerRuntime) return createSequentialWebFollowerLookup(
+        followerRuntime.page,
+        options.followerIntervalSeconds,
+      );
+      followerRuntime = await createBackgroundFollowerRuntime({
+        chromium,
+        sourceContext: context,
+        executablePath,
+      });
+      const lookupImpl = createSequentialWebFollowerLookup(
+        followerRuntime.page,
+        options.followerIntervalSeconds,
+      );
+      followerEnricher?.setLookupImpl(lookupImpl);
+      return lookupImpl;
+    };
+    const startFollowerEnricher = async ({ deferRuntime = false } = {}) => {
+      const lookupImpl = deferRuntime
+        ? async () => { throw new Error("Follower lookup runtime has not started yet."); }
+        : await ensureFollowerRuntime();
+      followerEnricher = new FollowerEnricher({
+        dataDir: options.dataDir,
+        concurrency: 1,
+        lookupImpl,
+        source: "instagram_web",
+        onProgress: ({ completed, queued, username, status, followerCount, error }) => {
+          const outcome = status === "success"
+            ? Number(followerCount).toLocaleString("en-US")
+            : `${status}${error ? ` (${error})` : ""}`;
+          console.log(`[Follower ${completed}/${queued}] @${username} -> ${outcome}`);
+          void statusReporter.update({
+            follower_completed: completed,
+            follower_queued: queued,
+            follower_last_status: status,
+            follower_last_username: username,
+          }).catch(() => {});
+        },
+      });
+      return followerEnricher;
+    };
+
+    if (options.followersOnly) {
+      await startFollowerEnricher();
+      await context.close();
+      context = null;
+      const queued = await followerEnricher.enqueueAll();
+      console.log(`Follower web lookups queued: ${queued}`);
+      const stats = await followerEnricher.drain();
+      console.log(
+        `Follower web lookups finished: success=${stats.success} unavailable=${stats.unavailable} failed=${stats.failed}`,
+      );
+      if (stats.stopStatus) {
+        console.error(`Follower web lookup stopped (${stats.stopStatus}): ${stats.stopError}`);
+        process.exitCode = 2;
+      }
+      const merged = await mergeFollowerDataIntoReels(
+        csvPath,
+        path.join(options.dataDir, "users.csv"),
+      );
+      console.log(`Follower data merged into reels_web.csv: ${merged}`);
+      await followerRuntime.browser.close();
+      followerRuntime = null;
+      await statusReporter.finish(stats.stopStatus ? "completed_with_errors" : "completed", {
+        follower_success: stats.success,
+        follower_failed: stats.failed,
+      });
+      return;
+    }
+
+    const reelMetadata = new Map();
+    let page = await createCollectionPage(context, startUrl, reelMetadata, {
+      allowLogin: !options.background,
+    });
+    if (options.background) {
+      const expectedSurface = options.hashtags.length
+        ? isInstagramHashtagSurface(page.url())
+        : isInstagramReelsSurface(page.url());
+      if (!expectedSurface) {
+        throw crawlerAccessError(
+          "login_required",
+          "Background mode needs a saved Instagram login. Run without --background, sign in once, and retry.",
+        );
+      }
+      console.log("Background mode started with the saved Instagram browser profile.");
+    } else {
+      prompt = readline.createInterface({ input: process.stdin, output: process.stdout });
+      console.log("브라우저에서 Instagram에 로그인하고 릴스 화면을 연 뒤 이 창으로 돌아오세요.");
+      await prompt.question("준비가 끝났으면 Enter를 누르세요: ");
+      assertInstagramPageAccess(page);
+      const expectedSurface = options.hashtags.length
+        ? isInstagramHashtagSurface(page.url())
+        : isInstagramReelsSurface(page.url());
+      if (!expectedSurface) await navigateWithRetries(page, startUrl);
+    }
+    await startFollowerEnricher({ deferRuntime: options.followersAfterReels });
+
+    let captured = 0;
+    let duplicateCount = 0;
+    let missingCount = 0;
+    let filteredCount = 0;
+    let cooldownSkippedCount = 0;
+    let pageRecycleCount = 0;
+    let transitionStallCount = 0;
+    let recoveryFailureCount = 0;
+    let nextDelaySeconds = options.intervalSeconds;
+
+    const progressPatch = (lastReelUrl = "") => ({
+      captured,
+      duplicates: duplicateCount,
+      missing: missingCount,
+      filtered: filteredCount,
+      cooldown_skipped: cooldownSkippedCount,
+      page_recycles: pageRecycleCount,
+      transition_stalls: transitionStallCount,
+      recovery_failures: recoveryFailureCount,
+      ...(lastReelUrl ? { last_reel_url: lastReelUrl } : {}),
+    });
+
+    const captureCurrentReel = async () => {
+      nextDelaySeconds = options.intervalSeconds;
+      await expandVisibleCaption(page);
+      const record = await extractVisibleReel(page);
+      if (!record) return null;
+      if (seen.has(record.shortcode)) {
+        nextDelaySeconds = REEL_SUCCESS_INTERVAL_SECONDS;
+        return { ...record, duplicateInRun: true };
+      }
+      let responseMetadata = await waitForReelMetadata(record.shortcode, reelMetadata);
+      if (!responseMetadata.userId || !responseMetadata.username) {
+        const embeddedJson = await page.locator('script[type="application/json"]').allTextContents()
+          .catch(() => []);
+        for (const raw of embeddedJson) {
+          try {
+            collectReelMetadata(parseInstagramJson(raw), reelMetadata);
+          } catch {
+            // Embedded JSON is an optional fallback for cached Reels.
+          }
+        }
+        responseMetadata = reelMetadata.get(record.shortcode) ?? responseMetadata;
+      }
+      const collectedRecord = buildCollectedRecord(record, responseMetadata);
+      reelMetadata.delete(record.shortcode);
+      nextDelaySeconds = hasCompleteReelCoreData(collectedRecord)
+        ? REEL_SUCCESS_INTERVAL_SECONDS
+        : options.intervalSeconds;
+      if (!hasAnyHashtag(collectedRecord.hashtags, options.hashtags)) {
+        seen.add(record.shortcode);
+        return { ...record, filteredOut: true };
+      }
+      if (!isWithinUploadAgeDays(collectedRecord, options.maxUploadAgeDays)) {
+        seen.add(record.shortcode);
+        return {
+          ...record,
+          uploadAgeFilteredOut: true,
+          uploadAgeDays: collectedRecord.days_since_upload,
+        };
+      }
+      const followerPayload = {
+        userId: collectedRecord.user_id,
+        username: collectedRecord.username,
+        seenAt: collectedRecord.collected_at,
+      };
+      const userState = await followerEnricher.trackUser({
+        ...followerPayload,
+        enqueue: !options.followersAfterReels,
+      });
+      if (options.followersAfterReels && followerPayload.username) {
+        const key = followerPayload.userId || followerPayload.username.toLowerCase();
+        deferredFollowerUsers.set(key, followerPayload);
+      }
+      if (userState) {
+        collectedRecord.follower_count = userState.follower_count ?? "";
+        collectedRecord.follower_count_collected_at = userState.follower_count_collected_at ?? "";
+        collectedRecord.follower_lookup_status = userState.lookup_status ?? "";
+      }
+      const stored = await reelStore.append(collectedRecord);
+      seen.add(record.shortcode);
+      return {
+        ...record,
+        snapshotLabel: stored.label,
+        cooldownSkipped: Boolean(stored.skipped),
+        collectionComplete: hasCompleteReelCoreData(collectedRecord),
+      };
+    };
+
+    const hashtagUrls = options.hashtags.length
+      ? await collectHashtagReelUrls(page, options.hashtags, options.maxItems)
+      : [];
+    const directUrls = refreshUrls.length ? refreshUrls : hashtagUrls;
+    if (refreshUrls.length || options.hashtags.length) {
+      for (let index = 0; index < directUrls.length; index += 1) {
+        if (options.hashtags.length && captured >= options.maxItems) break;
+        const url = directUrls[index];
+        try {
+          if (index > 0 || !isInstagramReelsSurface(page.url())) {
+            await navigateWithRetries(page, url);
+          }
+          if (options.manual) {
+            await prompt.question("현재 릴스를 다시 수집하려면 Enter를 누르세요: ");
+          } else {
+            await page.waitForTimeout(nextDelaySeconds * 1000);
+          }
+          const record = await captureCurrentReel();
+          if (record?.duplicateInRun) {
+            duplicateCount += 1;
+            console.log(`[${index + 1}/${directUrls.length}] 실행 중 중복 건너뜀: ${record.url}`);
+          } else if (record?.filteredOut) {
+            filteredCount += 1;
+            console.log(`[${index + 1}/${directUrls.length}] Hashtag mismatch skipped: ${url}`);
+          } else if (record?.uploadAgeFilteredOut) {
+            filteredCount += 1;
+            const age = record.uploadAgeDays === "" ? "unknown" : `${record.uploadAgeDays}day`;
+            console.log(
+              `[${index + 1}/${directUrls.length}] Upload age skipped (${age}, max ${options.maxUploadAgeDays}day): ${url}`,
+            );
+          } else if (record?.cooldownSkipped) {
+            cooldownSkippedCount += 1;
+            console.log(`[${index + 1}/${directUrls.length}] 6시간 이내 중복 건너뜀: ${record.url}`);
+          } else if (record) {
+            captured += 1;
+            console.log(`[${index + 1}/${directUrls.length}] 수집 (${record.snapshotLabel}): ${record.url}`);
+          } else {
+            missingCount += 1;
+            console.warn(`[${index + 1}/${directUrls.length}] 수집 실패: ${url}`);
+          }
+          await updateStatus(progressPatch(record?.url));
+        } catch (error) {
+          if (["rate_limited", "login_required", "challenge_required"].includes(error?.code)) throw error;
+          missingCount += 1;
+          console.warn(
+            `[${index + 1}/${directUrls.length}] 수집 실패: ${url} (${error instanceof Error ? error.message : String(error)})`,
+          );
+          await updateStatus({ ...progressPatch(url), last_error: String(error?.message ?? error) });
+        }
+      }
+      if (options.hashtags.length) {
+        console.log(`Hashtag OR collection finished: matched=${captured}, requested=${options.maxItems}`);
+      }
+    } else {
+      let itemsSinceRecycle = 0;
+      let viewsSinceRecycle = 0;
+      let consecutiveUnproductive = 0;
+      let consecutiveRecoveryFailures = 0;
+      let lastReelsUrl = page.url();
+      const transitionTimeoutMilliseconds = options.transitionTimeoutSeconds * 1_000;
+
+      const recyclePage = async (reason) => {
+        console.warn(`수집 탭 재생성 (${reason}): 진행=${captured}, 중복=${duplicateCount}, 누락=${missingCount}`);
+        page = await recycleCollectionPage({
+          context,
+          page,
+          url: options.startUrl,
+          reelMetadata,
+        });
+        pageRecycleCount += 1;
+        itemsSinceRecycle = 0;
+        viewsSinceRecycle = 0;
+        consecutiveUnproductive = 0;
+        lastReelsUrl = page.url();
+        await updateStatus({ ...progressPatch(), state: "collecting", recycle_reason: reason }, { force: true });
+      };
+
+      while (!stopRequested && (options.maxItems === 0 || captured < options.maxItems)) {
+        let record = null;
+        try {
+          if (options.manual) {
+            await prompt.question("현재 릴스를 저장하려면 Enter를 누르세요: ");
+          } else {
+            await page.waitForTimeout(nextDelaySeconds * 1000);
+          }
+
+          if (!isInstagramReelsSurface(page.url())) {
+            assertInstagramPageAccess(page);
+            console.warn("릴스 화면을 벗어나 마지막 릴스로 복귀합니다.");
+            await navigateWithRetries(page, lastReelsUrl || options.startUrl);
+            await page.waitForTimeout(500);
+          }
+          record = await captureCurrentReel();
+          viewsSinceRecycle += 1;
+          if (record?.uploadAgeFilteredOut) {
+            filteredCount += 1;
+            consecutiveUnproductive = 0;
+            const age = record.uploadAgeDays === "" ? "unknown" : `${record.uploadAgeDays}day`;
+            console.log(`Upload age skipped (${age}, max ${options.maxUploadAgeDays}day): ${record.url}`);
+          } else if (record?.cooldownSkipped) {
+            cooldownSkippedCount += 1;
+            consecutiveUnproductive = 0;
+            console.log(`6시간 이내 저장 중복 건너뜀: ${record.url}`);
+          } else if (record?.duplicateInRun) {
+            duplicateCount += 1;
+            consecutiveUnproductive = 0;
+            console.log(`실행 중 재노출 릴스 건너뜀 (누적 ${duplicateCount}): ${record.url}`);
+          } else if (record) {
+            lastReelsUrl = record.url;
+            captured += 1;
+            itemsSinceRecycle += 1;
+            consecutiveUnproductive = 0;
+            console.log(`[${captured}/${options.maxItems === 0 ? "unlimited" : options.maxItems}] ${record.url}`);
+          } else {
+            missingCount += 1;
+            consecutiveUnproductive += 1;
+            console.warn(`현재 화면에서 릴스 URL 추출 실패 (${consecutiveUnproductive}/${REEL_UNPRODUCTIVE_RECYCLE_THRESHOLD})`);
+          }
+          if (record?.url) lastReelsUrl = record.url;
+          consecutiveRecoveryFailures = 0;
+          await updateStatus({ ...progressPatch(record?.url), last_error: "" });
+
+          const reachedTarget = options.maxItems !== 0 && captured >= options.maxItems;
+          if (stopRequested || reachedTarget) break;
+          if (
+            options.pageRecycleItems > 0
+            && itemsSinceRecycle >= options.pageRecycleItems
+          ) {
+            await recyclePage(`${itemsSinceRecycle} items`);
+            continue;
+          }
+          if (
+            options.pageRecycleItems > 0
+            && viewsSinceRecycle >= options.pageRecycleItems * 4
+          ) {
+            await recyclePage(`${viewsSinceRecycle} viewed Reels`);
+            continue;
+          }
+          if (consecutiveUnproductive >= REEL_UNPRODUCTIVE_RECYCLE_THRESHOLD) {
+            await recyclePage(`${consecutiveUnproductive} unproductive views`);
+            continue;
+          }
+          if (!options.manual) {
+            const transition = await advanceToNextReel(
+              page,
+              record?.shortcode ?? "",
+              transitionTimeoutMilliseconds,
+            );
+            if (!transition.changed) {
+              transitionStallCount += 1;
+              consecutiveUnproductive += 1;
+              console.warn(`다음 릴스 전환 지연 (${consecutiveUnproductive}/${REEL_UNPRODUCTIVE_RECYCLE_THRESHOLD})`);
+              if (consecutiveUnproductive >= REEL_UNPRODUCTIVE_RECYCLE_THRESHOLD) {
+                await recyclePage(`${consecutiveUnproductive} transition stalls`);
+              }
+            }
+          }
+        } catch (error) {
+          if (["rate_limited", "login_required", "challenge_required"].includes(error?.code)) throw error;
+          recoveryFailureCount += 1;
+          consecutiveRecoveryFailures += 1;
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(
+            `일시적 수집 오류 자동 복구 (${consecutiveRecoveryFailures}/${REEL_MAX_CONSECUTIVE_RECOVERY_FAILURES}): ${message}`,
+          );
+          await reelStore.flush();
+          await updateStatus({
+            ...progressPatch(record?.url),
+            state: "recovering",
+            last_error: message.slice(0, 500),
+          }, { force: true });
+          if (consecutiveRecoveryFailures >= REEL_MAX_CONSECUTIVE_RECOVERY_FAILURES) {
+            throw new Error(`Repeated collection recovery failure: ${message}`);
+          }
+          await new Promise((resolve) => setTimeout(
+            resolve,
+            Math.min(5_000, 500 * (2 ** (consecutiveRecoveryFailures - 1))),
+          ));
+          await recyclePage(`transient error ${consecutiveRecoveryFailures}`);
+        }
+      }
+    }
+
+    await reelStore.flush();
+    prompt?.close();
+    prompt = null;
+    if (options.followersAfterReels && deferredFollowerUsers.size) {
+      console.log(`릴스 수집 완료. 팔로워 조회 ${deferredFollowerUsers.size}개를 순차 처리합니다.`);
+      await updateStatus({ ...progressPatch(), state: "followers" }, { force: true });
+      await ensureFollowerRuntime();
+      for (const user of deferredFollowerUsers.values()) {
+        await followerEnricher.trackUser({ ...user, enqueue: true });
+      }
+    } else {
+      console.log("릴스 수집을 멈췄습니다. 남은 팔로워 조회를 마친 뒤 브라우저를 닫습니다.");
+    }
+    await context.close();
+    context = null;
+    const followerStats = await followerEnricher.drain();
+    console.log(
+      `Follower web: success=${followerStats.success} unavailable=${followerStats.unavailable} failed=${followerStats.failed}`,
+    );
+    if (followerStats.stopStatus) {
+      console.error(
+        `Follower web lookup stopped (${followerStats.stopStatus}): ${followerStats.stopError}`,
+      );
       process.exitCode = 2;
     }
     const merged = await mergeFollowerDataIntoReels(
@@ -1416,188 +2199,46 @@ async function main() {
       path.join(options.dataDir, "users.csv"),
     );
     console.log(`Follower data merged into reels_web.csv: ${merged}`);
-    await followerRuntime.browser.close();
-    return;
-  }
-  await page.goto(startUrl, { waitUntil: "domcontentloaded" });
-  let prompt = null;
-  if (options.background) {
-    const expectedSurface = options.hashtags.length
-      ? isInstagramHashtagSurface(page.url())
-      : isInstagramReelsSurface(page.url());
-    if (!expectedSurface) {
-      await context.close();
-      throw new Error(
-        "Background mode needs a saved Instagram login. Run without --background, sign in once, and retry.",
-      );
-    }
-    console.log("Background mode started with the saved Instagram browser profile.");
-  } else {
-    prompt = readline.createInterface({ input: process.stdin, output: process.stdout });
-    console.log("브라우저에서 Instagram에 로그인하고 릴스 화면을 연 뒤 이 창으로 돌아오세요.");
-    await prompt.question("준비가 끝났으면 Enter를 누르세요: ");
-  }
-  await startFollowerEnricher();
-
-  let nextDelaySeconds = options.intervalSeconds;
-  const captureCurrentReel = async () => {
-    nextDelaySeconds = options.intervalSeconds;
-    await expandVisibleCaption(page);
-    const record = await extractVisibleReel(page);
-    if (!record || seen.has(record.shortcode)) return null;
-    let responseMetadata = await waitForReelMetadata(record.shortcode, reelMetadata);
-    if (!responseMetadata.userId || !responseMetadata.username) {
-      const embeddedJson = await page.locator('script[type="application/json"]').allTextContents()
-        .catch(() => []);
-      for (const raw of embeddedJson) {
-        try {
-          collectReelMetadata(parseInstagramJson(raw), reelMetadata);
-        } catch {
-          // Embedded JSON is an optional fallback for cached Reels.
-        }
-      }
-      responseMetadata = reelMetadata.get(record.shortcode) ?? responseMetadata;
-    }
-    const collectedRecord = buildCollectedRecord(record, responseMetadata);
-    nextDelaySeconds = hasCompleteReelCoreData(collectedRecord)
-      ? FAST_SUCCESS_INTERVAL_SECONDS
-      : options.intervalSeconds;
-    if (!hasAnyHashtag(collectedRecord.hashtags, options.hashtags)) {
-      seen.add(record.shortcode);
-      return { ...record, filteredOut: true };
-    }
-    const userState = await followerEnricher.trackUser({
-      userId: collectedRecord.user_id,
-      username: collectedRecord.username,
-      seenAt: collectedRecord.collected_at,
-    });
-    if (userState) {
-      collectedRecord.follower_count = userState.follower_count ?? "";
-      collectedRecord.follower_count_collected_at = userState.follower_count_collected_at ?? "";
-      collectedRecord.follower_lookup_status = userState.lookup_status ?? "";
-    }
-    const stored = await appendRecord(csvPath, collectedRecord);
-    seen.add(record.shortcode);
-    return {
-      ...record,
-      snapshotLabel: stored.label,
-      cooldownSkipped: Boolean(stored.skipped),
-      collectionComplete: hasCompleteReelCoreData(collectedRecord),
-    };
-  };
-
-  const hashtagUrls = options.hashtags.length
-    ? await collectHashtagReelUrls(page, options.hashtags, options.maxItems)
-    : [];
-  const directUrls = refreshUrls.length ? refreshUrls : hashtagUrls;
-  if (refreshUrls.length || options.hashtags.length) {
-    let captured = 0;
-    for (let index = 0; index < directUrls.length; index += 1) {
-      if (options.hashtags.length && captured >= options.maxItems) break;
-      const url = directUrls[index];
-      try {
-        if (index > 0 || !isInstagramReelsSurface(page.url())) {
-          await page.goto(url, { waitUntil: "domcontentloaded" });
-        }
-        if (options.manual) {
-          await prompt.question("현재 릴스를 다시 수집하려면 Enter를 누르세요: ");
-        } else {
-          await page.waitForTimeout(nextDelaySeconds * 1000);
-        }
-        const record = await captureCurrentReel();
-        if (record?.filteredOut) {
-          console.log(`[${index + 1}/${directUrls.length}] Hashtag mismatch skipped: ${url}`);
-          continue;
-        }
-        if (record?.cooldownSkipped) {
-          console.log(`[${index + 1}/${directUrls.length}] 1시간 이내 중복 건너뜀: ${record.url}`);
-          continue;
-        }
-        if (record) {
-          captured += 1;
-          console.log(
-            `[${index + 1}/${directUrls.length}] 수집 (${record.snapshotLabel}): ${record.url}`,
-          );
-        } else {
-          console.warn(`[${index + 1}/${directUrls.length}] 수집 실패: ${url}`);
-        }
-      } catch (error) {
-        console.warn(
-          `[${index + 1}/${directUrls.length}] 수집 실패: ${url} (${error instanceof Error ? error.message : String(error)})`,
-        );
-      }
-    }
-    if (options.hashtags.length) {
-      console.log(
-        `Hashtag OR collection finished: matched=${captured}, requested=${options.maxItems}`,
-      );
-    }
-  } else {
-    let captured = 0;
-    let noNewItemCount = 0;
-    let lastReelsUrl = page.url();
-    while (!stopRequested && (options.maxItems === 0 || captured < options.maxItems)) {
-      if (options.manual) {
-        await prompt.question("현재 릴스를 저장하려면 Enter를 누르세요: ");
-      } else {
-        await page.waitForTimeout(nextDelaySeconds * 1000);
-      }
-
-      if (!isInstagramReelsSurface(page.url())) {
-        console.warn("릴스 화면을 벗어나 마지막 릴스로 복귀합니다.");
-        await page.goto(lastReelsUrl, { waitUntil: "domcontentloaded" });
-        await page.waitForTimeout(500);
-      }
-      const record = await captureCurrentReel();
-      if (record?.cooldownSkipped) {
-        noNewItemCount = 0;
-        console.log(`1시간 이내 중복 건너뜀: ${record.url}`);
-      } else if (record) {
-        lastReelsUrl = record.url;
-        captured += 1;
-        noNewItemCount = 0;
-        console.log(`[${captured}/${options.maxItems === 0 ? "unlimited" : options.maxItems}] ${record.url}`);
-      } else {
-        noNewItemCount += 1;
-        console.log("새 릴스 URL을 찾지 못했습니다. 화면이 릴스에 있는지 확인하세요.");
-      }
-
-      if (!options.manual && !stopRequested && (options.maxItems === 0 || captured < options.maxItems)) {
-        await page.keyboard.press("ArrowDown");
-        if (noNewItemCount >= 3) {
-          await page.mouse.wheel(0, 900);
-          noNewItemCount = 0;
-        }
-      }
-    }
-  }
-  prompt?.close();
-  await context.close();
-  console.log("릴스 수집 창을 닫았습니다. 남은 팔로워 조회를 백그라운드에서 처리합니다.");
-  const followerStats = await followerEnricher.drain();
-  console.log(
-    `Follower web: success=${followerStats.success} unavailable=${followerStats.unavailable} failed=${followerStats.failed}`,
-  );
-  if (followerStats.stopStatus) {
-    console.error(
-      `Follower web lookup stopped (${followerStats.stopStatus}): ${followerStats.stopError}`,
+    await followerRuntime?.browser?.close();
+    followerRuntime = null;
+    console.log(`저장 완료: ${csvPath}`);
+    await statusReporter.finish(
+      followerStats.stopStatus
+        ? "completed_with_errors"
+        : stopRequested ? "stopped" : "completed",
+      {
+        ...progressPatch(),
+        follower_success: followerStats.success,
+        follower_failed: followerStats.failed,
+        follower_unavailable: followerStats.unavailable,
+      },
     );
-  }
-  const merged = await mergeFollowerDataIntoReels(
-    csvPath,
-    path.join(options.dataDir, "users.csv"),
-  );
-  console.log(`Follower data merged into reels_web.csv: ${merged}`);
-  await followerRuntime.browser.close();
-  console.log(`저장 완료: ${csvPath}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await reelStore?.flush().catch(() => {});
+    if (statusReporter) {
+      await statusReporter.finish("failed", {
+        last_error: message.slice(0, 500),
+        failure_code: error?.code ?? "collector_error",
+      }).catch(() => {});
+    }
+    throw error;
   } finally {
+    prompt?.close();
+    await context?.close().catch(() => {});
+    await followerRuntime?.browser?.close().catch(() => {});
+    await releaseCollectorLock?.().catch(() => {});
     process.off("SIGINT", handleInterrupt);
+    if (backgroundStopInputListener) process.stdin.off("data", backgroundStopInputListener);
   }
 }
 
 export {
   CSV_FIELDS,
-  appendRecord,
+  acquireCollectorLock,
+  advanceToNextReel,
+  createBackgroundStopInputListener,
+  createReelStore,
   buildCollectedRecord,
   calculateReactionRate,
   captionWithoutHashtags,
@@ -1617,6 +2258,7 @@ export {
   isCaptionMoreText,
   isInstagramHashtagSurface,
   isInstagramReelsSurface,
+  isWithinUploadAgeDays,
   isProfileInfoText,
   loadReelUrls,
   followerCountFromInstagramData,
@@ -1631,6 +2273,7 @@ export {
   prepareCsv,
   requestWebFollowerCount,
   truncateCaption,
+  waitForActiveReelChange,
 };
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
