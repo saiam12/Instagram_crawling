@@ -78,6 +78,31 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 `[METRIC]` 디버그 줄은 콘솔에 출력하지 않습니다. 원본 필드 검증은 수집 내부에서 유지합니다.
 `collection_label` 열은 만들지 않습니다. 같은 `data_web` 폴더에서 여러 수집기를 동시에 실행하면 파일 잠금 오류가 발생하도록 보호되어 있습니다.
 
+## 패션·뷰티 승인 수집
+
+다음 명령은 패션과 뷰티를 서로 분리된 데이터 세트로 함께 수집합니다.
+
+```powershell
+./collector.ps1 fashion
+```
+
+기본 실행 시간은 16시간입니다. 처음 8시간 동안 30분 창마다 패션과 뷰티를 번갈아 탐색하고,
+각 활성 창에서 신규 50개를 목표로 하되 절대 500개를 넘지 않습니다. 최초 수집 후보에는 업로드 후
+30일 이내 필터를 적용합니다. 각 Reel은 최초 수집과 `+30분`, `+1시간`, `+2시간`, `+4시간`,
+`+8시간` 재수집을 합쳐 최대 여섯 개 스냅샷을 남깁니다. 나머지 8시간에는 신규 탐색 없이 기한이 된
+재수집을 마무리합니다. 옵션을 모두 명시한 같은 실행은 다음과 같습니다.
+
+```powershell
+./collector.ps1 fashion --duration-hours 16 --discovery-hours 8 --new-items-per-window 50 --max-new-items-per-window 500 --max-upload-age-days 30 --discovery-interval-minutes 30
+```
+
+`--fashion-hashtag-query`와 `--beauty-hashtag-query`로 각 도메인의 내장 키워드를 바꿀 수 있습니다.
+두 데이터 세트는 `data_web\fashion_reels.xlsx`, `data_web\fashion_users.xlsx`,
+`data_web\beauty_reels.xlsx`, `data_web\beauty_users.xlsx`와 같은 도메인별 CSV·JSON·XLSX 및
+상태 파일로 게시되며, 기존 기본 `reels.*`와 `users.*`는 건드리지 않습니다. 도메인별 공개 출력의
+재수집 경과 시간은 `hours_since_previous`로 표시됩니다. Ctrl+C를 한 번 누르면 실행을 중단하고
+마지막 체크포인트까지 저장된 출력을 보존합니다.
+
 ## 공개 출력 동기화
 
 `reels.xlsx`가 열려 있어 생성된 `reels_updated.xlsx`가 남아 있으면 아래 명령으로 내부 원본 이력과 비교합니다. 누락된 릴스·수집 시점·빈 값만 보완한 뒤 `reels.csv`·`reels.json`·`reels.xlsx`와 사용자 공개 파일을 다시 만들고, 성공한 경우에만 `reels_updated.xlsx`를 삭제합니다.
@@ -124,6 +149,7 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 .\collector.ps1 --max-items 50 --background
 .\collector.ps1 refresh --background
 .\collector.ps1 followers
+./collector.ps1 fashion
 ```
 
 ## 해시태그 직접 수집 예시

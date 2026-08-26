@@ -244,8 +244,8 @@ def _xlsx_project_user_rows(
                     collected_at,
                 ]
             )
-            previous_follower_count = follower_count
-            if collected_at:
+            if re.fullmatch(r"-?\d+", follower_count.strip()) and collected_at:
+                previous_follower_count = follower_count
                 previous_collected_at = collected_at
     return projected
 

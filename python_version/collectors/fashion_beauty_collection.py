@@ -17,8 +17,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal, Sequence
 
 from .fashion_beauty_scheduler import (
-    BEAUTY_KEYWORDS,
-    FASHION_KEYWORDS,
     DatasetConfig,
     DueJob,
     RunConfig,
@@ -74,8 +72,8 @@ def utc_now() -> datetime:
 def datasets(config: RunConfig) -> tuple[DatasetConfig, DatasetConfig]:
     base = config.data_root / ".datasets"
     return (
-        DatasetConfig("fashion", base / "fashion", FASHION_KEYWORDS),
-        DatasetConfig("beauty", base / "beauty", BEAUTY_KEYWORDS),
+        DatasetConfig("fashion", base / "fashion", config.fashion_keywords),
+        DatasetConfig("beauty", base / "beauty", config.beauty_keywords),
     )
 
 
@@ -482,7 +480,11 @@ def current_status(
     collector_failures: int = 0,
 ) -> dict[str, Any]:
     rows = read_history(dataset)
-    active_name = window_dataset(started_at, now) if now < discovery_ends_at else None
+    active_name = (
+        window_dataset(started_at, now, config.discovery_interval_minutes)
+        if now < discovery_ends_at
+        else None
+    )
     window_start = _active_window_start(started_at, now, config.discovery_interval_minutes)
     window_end = window_start + timedelta(minutes=config.discovery_interval_minutes)
     current_count = initial_count_in_window(rows, window_start, window_end)
@@ -612,7 +614,10 @@ async def run_fashion_beauty_collection(
                     ),
                 )
             elif now < discovery_ends_at:
-                selected = dataset_by_name(config, window_dataset(started_at, now))
+                selected = dataset_by_name(
+                    config,
+                    window_dataset(started_at, now, config.discovery_interval_minutes),
+                )
                 window_start = _active_window_start(started_at, now, config.discovery_interval_minutes)
                 decision = decide_next_work(
                     config,

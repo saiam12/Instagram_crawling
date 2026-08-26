@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the `collector.ps1 fashion` command that alternates fashion and beauty discovery, schedules six snapshots per Reel, and publishes isolated domain-specific exports.
+**Goal:** Build the `collector.ps1 fashion` command that alternates fashion and beauty discovery, schedules six snapshots per Reel, stores video duration and user profile biographies, and publishes isolated domain-specific exports.
 
 **Architecture:** A pure scheduler module owns time calculations, keyword rotation, upload-age eligibility, and 30-minute window caps. An asynchronous supervisor serially calls the existing generic collector with a separate fashion or beauty workspace, then atomically publishes each workspace’s generated files under `fashion_*` or `beauty_*`; the default collector paths remain unchanged.
 
@@ -19,6 +19,8 @@
 - Accept new candidates only when their upload age at initial capture is no more than 30 days; do not apply that limit to recollections.
 - Keep raw histories independent in `data_web/.datasets/fashion/.collector` and `data_web/.datasets/beauty/.collector`.
 - Publish `fashion_reels.csv/json/xlsx`, `fashion_users.csv/xlsx`, `fashion_collector_status.json`, and corresponding `beauty_*` files in `data_web` without changing `reels.*` or `users.*`.
+- Store Reel `video_duration_seconds` when the source response provides it, while allowing missing values without failing collection.
+- Store `biography` on every follower User history row and show `days_since_previous` in baseline User public exports; transform Fashion/Beauty public Reel and User interval values to `hours_since_previous` with `+0.5hour`-style values while preserving baseline Reel day values.
 - Keep existing Reel pacing at least 2 seconds and follower pacing/caching at 8 seconds; add no third-party packages.
 
 ---
@@ -281,13 +283,52 @@ Run: `& .\.venv\Scripts\python.exe -m unittest collectors.test_fashion_beauty_co
 
 Expected: priority, 500-cap, separate-output, and base-output-isolation tests pass without launching Playwright.
 
-### Task 4: Add the `fashion` command and final verification
+### Task 4: Add video duration, profile biography, and collection-interval output fields
+
+**Files:**
+- Modify: `python_version/collectors/instagram_reels_browser.py`
+- Modify: `python_version/collectors/instagram_follower_enricher.py`
+- Modify: `python_version/exporters/instagram_collector.py`
+- Modify: `python_version/collectors/fashion_beauty_collection.py`
+- Modify: `python_version/collectors/test_instagram_reels_browser.py`
+- Modify: `python_version/exporters/test_instagram_collector.py`
+- Modify: `python_version/collectors/test_fashion_beauty_collection.py`
+
+**Required behavior:**
+
+- Add the numeric-or-empty `video_duration_seconds` Reel field to parsing, raw history, CSV/JSON/XLSX exports, refresh/reconciliation projection, and tests. Preserve a valid Reel when this value is absent.
+- Preserve the profile response `biography` in every follower User history row and regression-test that a follower lookup writes it with the matching count and timestamp.
+- Add `days_since_previous` to baseline User public CSV/XLSX rows, calculated from the prior successful user snapshot. Initial rows are blank. Use existing day formatting for baseline data.
+- At Fashion/Beauty public publication time, calculate each Reel/User row's elapsed value from `collected_at`, emit `hours_since_previous` instead of `days_since_previous`, and format exact half-hours as `+0.5hour` and whole hours as `+4hour`. Keep domain raw histories and baseline public files unchanged.
+- Keep the standard collector's Reel interval field in days and avoid changing Instagram request pacing or adding packages.
+
+- [ ] **Step 1: Add failing field and interval tests**
+
+Cover a source payload with a numeric video duration, a source payload without duration, a follower history row with biography, baseline User row elapsed-day calculation, and Fashion/Beauty Reel/User publication with hour-format elapsed values.
+
+- [ ] **Step 2: Run focused tests and confirm failures**
+
+Run the relevant `collectors.test_instagram_reels_browser`, `exporters.test_instagram_collector`, and `collectors.test_fashion_beauty_collection` selectors before production changes and record the missing field/projection failures.
+
+- [ ] **Step 3: Implement end-to-end field propagation and domain formatting**
+
+Use established CSV/XLSX projection helpers. Do not make new browser requests solely for video duration or biography. Use the existing media/profile payloads and preserve missing data as blanks. Make public Fashion/Beauty transformation atomic with the existing publication path.
+
+- [ ] **Step 4: Run focused suites and verify public-output isolation**
+
+Run all three touched test modules. Verify one temporary Fashion and one Beauty fixture have `hours_since_previous` in their public Reel/User output, while baseline fixture files retain their existing names and values.
+
+### Task 5: Add the `fashion` command and final verification
 
 **Files:**
 - Modify: `python_version/scripts/instagram_reels_python.py`
 - Modify: `python_version/collector.ps1`
 - Modify: `python_version/README.md`
+- Modify: `python_version/collectors/fashion_beauty_scheduler.py`
+- Modify: `python_version/collectors/fashion_beauty_collection.py`
+- Modify: `python_version/exporters/instagram_collector.py`
 - Modify: `python_version/collectors/test_fashion_beauty_collection.py`
+- Modify: `python_version/exporters/test_instagram_collector.py`
 
 **Interfaces:**
 
@@ -310,7 +351,13 @@ class CommandTests(unittest.TestCase):
     def test_discovery_must_end_eight_hours_before_run_end(self) -> None:
         with self.assertRaises(SystemExit):
             parse_fashion_command(["--duration-hours", "16", "--discovery-hours", "9"])
+
+    def test_custom_discovery_interval_changes_the_active_domain(self) -> None:
+        config = parse_fashion_command(["--discovery-interval-minutes", "15"])
+        self.assertEqual(window_dataset(started_at, started_at + timedelta(minutes=15), config.discovery_interval_minutes), "beauty")
 ```
+
+Add a baseline User projection test where a timestamp-only/failed history row does not become the previous successful snapshot for `days_since_previous`.
 
 - [ ] **Step 2: Run command tests and confirm they fail**
 
@@ -328,6 +375,8 @@ if command == "fashion":
 
 Accept `--duration-hours`, `--discovery-hours`, `--new-items-per-window`, `--max-new-items-per-window`, `--max-upload-age-days`, `--discovery-interval-minutes`, `--fashion-hashtag-query`, and `--beauty-hashtag-query`. Reject non-finite or non-positive values; reject a cap above 500, a target above the cap, an upload age below zero, or discovery later than `duration_hours - 8`. Add the exact start command to PowerShell examples and explain the two data sets, alternating windows, 30-day initial filter, six snapshots, 50 target/500 cap, output file names, and Ctrl+C graceful stop behavior.
 
+Extend `window_dataset` with a backwards-compatible interval argument and pass `RunConfig.discovery_interval_minutes` through the supervisor's active-window calculations, so a validated non-default interval changes both the domain alternation and keyword-window grouping consistently. In baseline User projection, treat a snapshot as prior only when both its follower count and collection timestamp are present; a timestamp-only failed or legacy row must not produce `days_since_previous` for the next successful row.
+
 - [ ] **Step 4: Run full tests, help output, and spreadsheet verification**
 
 Run:
@@ -344,7 +393,7 @@ Expected: all tests pass and help lists `fashion`. Create temporary fixture expo
 Run:
 
 ```powershell
-git add -- python_version/collectors/fashion_beauty_scheduler.py python_version/collectors/fashion_beauty_collection.py python_version/collectors/test_fashion_beauty_collection.py python_version/collectors/instagram_reels_browser.py python_version/collectors/test_instagram_reels_browser.py python_version/scripts/instagram_reels_python.py python_version/collector.ps1 python_version/README.md
+git add -- python_version/collectors/fashion_beauty_scheduler.py python_version/collectors/fashion_beauty_collection.py python_version/collectors/test_fashion_beauty_collection.py python_version/collectors/instagram_reels_browser.py python_version/collectors/test_instagram_reels_browser.py python_version/exporters/instagram_collector.py python_version/exporters/test_instagram_collector.py python_version/scripts/instagram_reels_python.py python_version/collector.ps1 python_version/README.md
 git commit -m "feat: add fashion and beauty collection scheduler"
 ```
 

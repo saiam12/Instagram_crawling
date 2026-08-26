@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -58,6 +59,8 @@ class RunConfig:
     new_items_per_window: int = 50
     max_new_items_per_window: int = 500
     max_upload_age_days: float = 30
+    fashion_keywords: Sequence[str] = FASHION_KEYWORDS
+    beauty_keywords: Sequence[str] = BEAUTY_KEYWORDS
 
 
 @dataclass(frozen=True)
@@ -149,23 +152,30 @@ def due_jobs(dataset: DatasetConfig, rows: list[dict[str, Any]], now: datetime) 
     return sorted(result, key=lambda job: (job.due_at, job.dataset, job.url))
 
 
-def window_dataset(started_at: datetime, now: datetime) -> Literal["fashion", "beauty"]:
+def window_dataset(
+    started_at: datetime,
+    now: datetime,
+    interval_minutes: float = 30,
+) -> Literal["fashion", "beauty"]:
     started = _parse_timestamp(started_at)
     current = _parse_timestamp(now)
     if started is None or current is None:
         raise ValueError("started_at and now must be valid timestamps")
-    index = int((current - started).total_seconds() // (30 * 60))
+    interval_seconds = float(interval_minutes) * 60
+    if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+        raise ValueError("interval_minutes must be finite and greater than zero")
+    index = int((current - started).total_seconds() // interval_seconds)
     return "fashion" if index % 2 == 0 else "beauty"
 
 
-def keyword_group(keywords: Sequence[str], active_window_number: int) -> tuple[str, str, str, str, str, str]:
-    if not keywords or len(keywords) % 6:
-        raise ValueError("keywords must contain a positive multiple of six entries")
+def keyword_group(keywords: Sequence[str], active_window_number: int) -> tuple[str, ...]:
+    if not keywords:
+        raise ValueError("keywords must contain at least one entry")
     if active_window_number < 1:
         raise ValueError("active_window_number must be one-based")
-    group_count = len(keywords) // 6
+    group_count = math.ceil(len(keywords) / 6)
     start = ((int(active_window_number) - 1) % group_count) * 6
-    return tuple(keywords[start : start + 6])  # type: ignore[return-value]
+    return tuple(keywords[start : start + 6])
 
 
 def initial_count_in_window(rows: list[dict[str, Any]], start: datetime, end: datetime) -> int:

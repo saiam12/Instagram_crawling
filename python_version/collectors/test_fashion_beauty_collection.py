@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 from xml.etree import ElementTree
 
 from exporters.instagram_collector import write_xlsx_workbook
+from scripts.instagram_reels_python import main as launcher_main, parse_fashion_command
 
 from .fashion_beauty_collection import (
     SupervisorLock,
@@ -47,6 +48,67 @@ def read_xlsx_rows(path: Path) -> list[list[str]]:
         ["".join(node.text or "" for node in cell.findall(f".//{namespace}t")) for cell in row.findall(f"{namespace}c")]
         for row in worksheet.findall(f".//{namespace}row")
     ]
+
+
+class CommandTests(unittest.TestCase):
+    def test_fashion_defaults_match_approved_operation(self) -> None:
+        config = parse_fashion_command([])
+
+        self.assertEqual(config.duration_hours, 16)
+        self.assertEqual(config.discovery_hours, 8)
+        self.assertEqual(config.new_items_per_window, 50)
+        self.assertEqual(config.max_new_items_per_window, 500)
+        self.assertEqual(config.max_upload_age_days, 30)
+
+    def test_discovery_must_end_eight_hours_before_run_end(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_fashion_command(["--duration-hours", "16", "--discovery-hours", "9"])
+
+    def test_custom_discovery_interval_changes_the_active_domain(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = parse_fashion_command(["--discovery-interval-minutes", "15"])
+
+        self.assertEqual(
+            window_dataset(
+                started_at,
+                started_at + timedelta(minutes=15),
+                config.discovery_interval_minutes,
+            ),
+            "beauty",
+        )
+
+    def test_custom_hashtag_query_replaces_the_domain_keywords(self) -> None:
+        config = parse_fashion_command([
+            "--fashion-hashtag-query",
+            "runway OR streetwear",
+        ])
+
+        self.assertEqual(keyword_group(config.fashion_keywords, 1), ("runway", "streetwear"))
+        self.assertEqual(config.beauty_keywords, BEAUTY_KEYWORDS)
+
+    def test_fashion_rejects_unsafe_numeric_options(self) -> None:
+        invalid_arguments = (
+            ["--duration-hours", "nan"],
+            ["--discovery-hours", "0"],
+            ["--discovery-interval-minutes", "inf"],
+            ["--new-items-per-window", "0"],
+            ["--max-new-items-per-window", "501"],
+            ["--new-items-per-window", "51", "--max-new-items-per-window", "50"],
+            ["--max-upload-age-days", "-1"],
+        )
+
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                parse_fashion_command(arguments)
+
+    def test_fashion_launcher_dispatches_without_running_the_real_collector(self) -> None:
+        with patch(
+            "scripts.instagram_reels_python.run_fashion_beauty_collection",
+            new=AsyncMock(return_value=0),
+        ):
+            result = launcher_main(["fashion"])
+
+        self.assertEqual(result, 0)
 
 
 class SchedulerTests(unittest.TestCase):

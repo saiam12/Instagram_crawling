@@ -164,6 +164,36 @@ class XlsxCollectionTimingTests(unittest.TestCase):
             "2", "", "3", "late_count", "", "1100", "", "2026-01-02T00:00:00Z"
         ])
 
+    def test_user_elapsed_days_uses_previous_successful_snapshot_only(self) -> None:
+        rows = [[
+            "user_id",
+            "username",
+            "biography",
+            "follower_count",
+            "collected_at",
+            "2nd collect_follower_count",
+            "2nd collect_collected_at",
+            "3rd collect_follower_count",
+            "3rd collect_collected_at",
+        ], [
+            "4",
+            "failed_middle_snapshot",
+            "",
+            "1000",
+            "2026-01-01T00:00:00Z",
+            "",
+            "2026-01-02T00:00:00Z",
+            "1100",
+            "2026-01-03T00:00:00Z",
+        ]]
+
+        projected = _xlsx_project_rows("users", rows)
+
+        self.assertEqual(projected[3], [
+            "3", "+2day", "4", "failed_middle_snapshot", "", "1100", "100",
+            "2026-01-03T00:00:00Z",
+        ])
+
     def test_retired_reel_fields_are_not_exported(self) -> None:
         rows = [[
             "url",

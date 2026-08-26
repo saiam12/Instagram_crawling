@@ -6,6 +6,7 @@ Runs the Python Instagram collector with this project's virtual environment.
 .\collector.ps1 --max-items 50 --followers-after-reels
 .\collector.ps1 refresh --background
 .\collector.ps1 reconcile
+./collector.ps1 fashion
 #>
 
 [CmdletBinding()]
