@@ -6,6 +6,7 @@ data_new_test/
 backups/
 .instagram_browser_profile/
 .diagnostics/
+.codex_work/
 .xlsx_verify*/
 .pytest_cache/
 tests/
@@ -14,3 +15,6 @@ __pycache__/
 targets_new_test.csv
 skill.md
 AGENTS.md
+.codex_tmp/*
+default_version
+outputs/

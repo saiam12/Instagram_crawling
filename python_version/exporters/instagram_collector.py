@@ -18,21 +18,24 @@ from xml.etree import ElementTree
 from xml.sax.saxutils import escape as xml_escape
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 XLSX_FILENAME = "instagram_data.xlsx"
 XLSX_INVALID_XML_CHARACTER_PATTERN = re.compile(
     r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]"
 )
-XLSX_NUMERIC_FIELDS = {"follower_count", "like_count", "comment_count", "repost_count"}
-XLSX_PERCENT_FIELDS = {"reaction_rate"}
-XLSX_DELTA_FIELDS = {"like_count", "comment_count", "repost_count", "follower_count"}
-XLSX_DATE_FIELDS = {"collected_at", "uploaded_at", "follower_count_collected_at"}
+XLSX_NUMERIC_FIELDS = {"collection_number", "view_count", "follower_count", "follower_count_change", "like_count", "comment_count", "repost_count"}
+XLSX_PERCENT_FIELDS: set[str] = set()
+XLSX_DELTA_FIELDS = {"view_count", "like_count", "comment_count", "repost_count", "follower_count"}
+XLSX_DATE_FIELDS = {"collected_at", "uploaded_at"}
 XLSX_TEXT_IDENTIFIER_FIELDS = {"user_id"}
 XLSX_USERS_FIELDS = [
+    "collection_number",
     "user_id",
     "username",
-    "follower_count_collected_at",
+    "biography",
     "follower_count",
+    "follower_count_change",
+    "collected_at",
 ]
 XLSX_REELS_WEB_FIELDS = [
     "url",
@@ -45,23 +48,43 @@ XLSX_REELS_WEB_FIELDS = [
     "ad",
     "uploaded_at",
     "days_since_upload",
+    "view_count",
     "like_count",
     "comment_count",
     "repost_count",
     "follower_count",
-    "reaction_rate",
-    "follower_count_collected_at",
 ]
-XLSX_REELS_WEB_HIDDEN_FIELDS = {"location_name", "follower_lookup_status"}
-XLSX_FOLLOWER_LOOKUP_FIELDS = [
+XLSX_REELS_WEB_HIDDEN_FIELDS = {"location_name"}
+XLSX_REELS_COLUMNS_FIELDS = [
+    "collection_number",
     "collected_at",
+    "url",
     "user_id",
     "username",
+    "title",
+    "hashtags",
+    "audio_name",
+    "location_name",
+    "ad",
+    "uploaded_at",
+    "days_since_upload",
+    "view_count",
+    "like_count",
+    "comment_count",
+    "repost_count",
     "follower_count",
-    "error",
 ]
-
-
+XLSX_REELS_ROW_FIELDS = [
+    "collection_number",
+    "days_since_previous",
+    *XLSX_REELS_COLUMNS_FIELDS[1:],
+]
+XLSX_REELS_ROW_DROPPED_FIELDS = {
+    "collection_label",
+    "reaction_rate",
+    "follower_count_collected_at",
+    "follower_lookup_status",
+}
 class DataStore:
     """Small compatibility wrapper for the existing XLSX sync commands."""
 
@@ -111,19 +134,32 @@ def _xlsx_project_rows(stem: str, rows: list[list[str]]) -> list[list[str]]:
         return rows
     indexes = {header: index for index, header in enumerate(rows[0])}
     if stem.casefold() == "users":
-        fields = XLSX_USERS_FIELDS
-    elif stem.casefold() == "follower_lookups":
-        fields = XLSX_FOLLOWER_LOOKUP_FIELDS
-    elif stem.casefold() != "reels_web":
+        return _xlsx_project_user_rows(rows, indexes)
+    elif stem.casefold() not in {"reels", "new_reels", "reels_web", "reels_columns", "reels_rows"}:
         return rows
+    elif stem.casefold() in {"new_reels", "reels_rows"}:
+        extra_fields = [
+            field for field in rows[0]
+            if field not in XLSX_REELS_ROW_FIELDS
+            and _xlsx_base_field_name(field) not in XLSX_REELS_ROW_DROPPED_FIELDS
+        ]
+        fields = [*XLSX_REELS_ROW_FIELDS, *extra_fields]
+    elif stem.casefold() in {"reels", "reels_columns"}:
+        extra_fields = [
+            field for field in rows[0]
+            if field not in XLSX_REELS_COLUMNS_FIELDS
+            and _xlsx_base_field_name(field) not in XLSX_REELS_ROW_DROPPED_FIELDS
+        ]
+        fields = _xlsx_add_elapsed_fields([*XLSX_REELS_COLUMNS_FIELDS, *extra_fields])
     else:
         extra_fields = [
             field
             for field in rows[0]
             if field not in XLSX_REELS_WEB_FIELDS
             and _xlsx_base_field_name(field) not in XLSX_REELS_WEB_HIDDEN_FIELDS
+            and _xlsx_base_field_name(field) not in XLSX_REELS_ROW_DROPPED_FIELDS
         ]
-        fields = [*XLSX_REELS_WEB_FIELDS, *extra_fields]
+        fields = _xlsx_add_elapsed_fields([*XLSX_REELS_WEB_FIELDS, *extra_fields])
 
     projected = [fields]
     for row in rows[1:]:
@@ -131,9 +167,74 @@ def _xlsx_project_rows(stem: str, rows: list[list[str]]) -> list[list[str]]:
             field: row[indexes[field]] if field in indexes and indexes[field] < len(row) else ""
             for field in fields
         }
-        if stem.casefold() == "reels_web":
+        if stem.casefold() in {"reels", "new_reels", "reels_web", "reels_columns", "reels_rows"}:
             _format_reel_row(values, fields)
         projected.append([values[field] for field in fields])
+    return projected
+
+
+def _xlsx_project_user_rows(
+    rows: list[list[str]], indexes: dict[str, int]
+) -> list[list[str]]:
+    """Flatten a user's follower-count columns into collection-history rows."""
+    snapshot_indexes: dict[int, dict[str, int]] = {1: {}}
+    for field, index in indexes.items():
+        if field in {"follower_count", "collected_at"}:
+            snapshot_indexes[1][field] = index
+            continue
+        match = re.fullmatch(
+            r"(\d+)(?:st|nd|rd|th) collect_(follower_count|collected_at)",
+            field,
+        )
+        if match:
+            snapshot_indexes.setdefault(int(match.group(1)), {})[match.group(2)] = index
+
+    def source_value(row: list[str], field: str) -> str:
+        index = indexes.get(field)
+        return row[index] if index is not None and index < len(row) else ""
+
+    projected = [list(XLSX_USERS_FIELDS)]
+    for row in rows[1:]:
+        identity = [
+            source_value(row, "user_id"),
+            source_value(row, "username"),
+            source_value(row, "biography"),
+        ]
+        previous_follower_count = ""
+        for collection_number in sorted(snapshot_indexes):
+            snapshot = snapshot_indexes[collection_number]
+            follower_index = snapshot.get("follower_count")
+            collected_at_index = snapshot.get("collected_at")
+            follower_count = (
+                row[follower_index]
+                if follower_index is not None and follower_index < len(row)
+                else ""
+            )
+            collected_at = (
+                row[collected_at_index]
+                if collected_at_index is not None and collected_at_index < len(row)
+                else ""
+            )
+            if collection_number != 1 and not (follower_count or collected_at):
+                continue
+            follower_count_change = ""
+            if (
+                re.fullmatch(r"-?\d+", follower_count.strip())
+                and re.fullmatch(r"-?\d+", previous_follower_count.strip())
+            ):
+                follower_count_change = str(
+                    int(follower_count) - int(previous_follower_count)
+                )
+            projected.append(
+                [
+                    str(collection_number),
+                    *identity,
+                    follower_count,
+                    follower_count_change,
+                    collected_at,
+                ]
+            )
+            previous_follower_count = follower_count
     return projected
 
 
@@ -147,12 +248,18 @@ def _format_reel_row(values: dict[str, str], fields: list[str]) -> None:
         values["username"] = title
         values["title"] = ""
     previous_counts = {field: values.get(field, "").strip() for field in XLSX_DELTA_FIELDS}
+    previous_collected_at = values.get("collected_at", "").strip()
     for field in fields:
         base_field = _xlsx_base_field_name(field)
         if base_field == "days_since_upload" and values.get(field, "").strip():
             values[field] = _xlsx_days_since_upload(values[field])
         elif field != "collected_at" and base_field == "collected_at" and values.get(field, "").strip():
-            values[field] = _xlsx_recollect_collected_at(values.get("collected_at", ""), values[field])
+            current = values[field].strip()
+            values[_xlsx_elapsed_field_name(field)] = _xlsx_elapsed_days(
+                previous_collected_at,
+                current,
+            )
+            previous_collected_at = current
         elif field != base_field and base_field in XLSX_DELTA_FIELDS:
             current = values.get(field, "").strip()
             if current:
@@ -180,28 +287,40 @@ def _xlsx_base_field_name(field_name: str) -> str:
     return match.group(1) if match else field_name
 
 
-def _xlsx_recollect_collected_at(initial_value: str, collected_value: str) -> str:
+def _xlsx_elapsed_field_name(collected_at_field: str) -> str:
+    match = re.match(
+        r"^(\d+(?:st|nd|rd|th) collect)_(?:follower_count_)?collected_at$",
+        collected_at_field,
+    )
+    return f"{match.group(1)}_days_since_previous" if match else ""
+
+
+def _xlsx_add_elapsed_fields(fields: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for field in fields:
+        expanded.append(field)
+        elapsed_field = _xlsx_elapsed_field_name(field)
+        if elapsed_field and elapsed_field not in expanded:
+            expanded.append(elapsed_field)
+    return expanded
+
+
+def _xlsx_elapsed_days(previous_value: str, collected_value: str) -> str:
     try:
-        initial = datetime.fromisoformat(initial_value.replace("Z", "+00:00"))
+        previous = datetime.fromisoformat(previous_value.replace("Z", "+00:00"))
         collected = datetime.fromisoformat(collected_value.replace("Z", "+00:00"))
     except ValueError:
-        return collected_value
-    if initial.tzinfo is None:
-        initial = initial.replace(tzinfo=timezone.utc)
+        return ""
+    if previous.tzinfo is None:
+        previous = previous.replace(tzinfo=timezone.utc)
     if collected.tzinfo is None:
         collected = collected.replace(tzinfo=timezone.utc)
-    elapsed_minutes = max(1, int(((collected - initial).total_seconds() / 60) + 0.5))
-    if elapsed_minutes < 60:
-        elapsed = f"+{elapsed_minutes}Minute"
-    else:
-        hours = max(1, int((elapsed_minutes / 60) + 0.5))
-        if hours < 24:
-            elapsed = f"+{hours}Hour"
-        else:
-            days = max(1, int((hours / 24) + 0.5))
-            elapsed = f"+{days}Day" if days < 7 else f"+{max(1, int((days / 7) + 0.5))}Weeks"
-    collected_kst = collected.astimezone(timezone(timedelta(hours=9)))
-    return f"{collected_kst:%Y-%m-%d %H:%M:%S} ({elapsed})"
+    elapsed_days = max(0.0, (collected - previous).total_seconds() / 86_400)
+    rounded_days = int((elapsed_days * 10) + 0.5) / 10
+    if elapsed_days > 0 and rounded_days == 0:
+        rounded_days = 0.1
+    displayed = f"{rounded_days:.1f}".rstrip("0").rstrip(".")
+    return f"+{displayed}day"
 
 
 def _xlsx_metric_with_delta(current_value: str, previous_value: str) -> str:
@@ -240,6 +359,8 @@ def _xlsx_cell(reference: str, value: str, field_name: str, is_header: bool) -> 
             pass
     if not is_header and base_field in XLSX_PERCENT_FIELDS and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
         return f'<c r="{reference}" s="5"><v>{value.strip()}</v></c>'
+    if not is_header and base_field == "follower_count_change" and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
+        return f'<c r="{reference}" s="6"><v>{value.strip()}</v></c>'
     if not is_header and base_field in XLSX_NUMERIC_FIELDS and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
         return f'<c r="{reference}" s="4"><v>{value.strip()}</v></c>'
     style = ' s="1"' if is_header else (' s="3"' if base_field in XLSX_TEXT_IDENTIFIER_FIELDS else "")
@@ -338,12 +459,12 @@ def write_xlsx_workbook(destination: Path, sheets: list[tuple[str, list[list[str
                 "xl/styles.xml",
                 '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                 '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-                '<numFmts count="3"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/><numFmt numFmtId="165" formatCode="@"/><numFmt numFmtId="168" formatCode="0.00%"/></numFmts>'
+                '<numFmts count="4"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/><numFmt numFmtId="165" formatCode="@"/><numFmt numFmtId="168" formatCode="0.00%"/><numFmt numFmtId="169" formatCode="+#,##0;-#,##0;0"/></numFmts>'
                 '<fonts count="2"><font><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Aptos"/></font></fonts>'
                 '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF0F766E"/><bgColor indexed="64"/></patternFill></fill></fills>'
                 '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
                 '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-                '<cellXfs count="6"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+                '<cellXfs count="7"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="169" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
                 '</styleSheet>',
             )
             for index, (_, rows) in enumerate(sheets, start=1):
@@ -361,9 +482,18 @@ def read_reel_urls_from_xlsx(workbook: Path) -> list[str]:
     package_rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
     with zipfile.ZipFile(workbook) as archive:
         workbook_xml = ElementTree.fromstring(archive.read("xl/workbook.xml"))
-        sheet = next((item for item in workbook_xml.findall(f".//{main_ns}sheet") if item.attrib.get("name", "").casefold() == "reels_web"), None)
+        preferred_sheet_names = {"reels": 0, "new_reels": 1, "reels_rows": 2, "reels_web": 3, "reels_columns": 4}
+        sheet = min(
+            (
+                item
+                for item in workbook_xml.findall(f".//{main_ns}sheet")
+                if item.attrib.get("name", "").casefold() in preferred_sheet_names
+            ),
+            key=lambda item: preferred_sheet_names[item.attrib.get("name", "").casefold()],
+            default=None,
+        )
         if sheet is None:
-            raise ValueError("The XLSX workbook does not contain a reels_web sheet.")
+            raise ValueError("The XLSX workbook does not contain a reels sheet.")
         relationship_id = sheet.attrib[f"{document_rel_ns}id"]
         relationships_xml = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
         target = next(item.attrib["Target"] for item in relationships_xml.findall(f"{package_rel_ns}Relationship") if item.attrib.get("Id") == relationship_id)

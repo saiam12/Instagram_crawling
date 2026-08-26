@@ -1,0 +1,7 @@
+.venv/
+.instagram_browser_profile/
+data_web/
+__pycache__/
+*.pyc
+.codex_tmp/*
+default_
