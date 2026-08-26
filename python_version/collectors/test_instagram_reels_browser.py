@@ -783,6 +783,13 @@ class CollectorUtilityTests(unittest.TestCase):
 
 
 class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_cooldown_skips_nearby_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = await LongReelStore.create(Path(directory) / "reels_rows.csv")
+            await store.append(reel_record(1, "2026-08-26T00:00:00Z"))
+            result = await store.append(reel_record(1, "2026-08-26T00:30:00Z"))
+            self.assertTrue(result.get("skipped"))
+
     async def test_disabled_cooldown_accepts_due_fashion_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = await LongReelStore.create(
