@@ -4,9 +4,13 @@ import csv
 import json
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from xml.etree import ElementTree
+
+from exporters.instagram_collector import write_xlsx_workbook
 
 from .fashion_beauty_collection import (
     SupervisorLock,
@@ -33,6 +37,16 @@ from .fashion_beauty_scheduler import (
 
 def isoformat_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def read_xlsx_rows(path: Path) -> list[list[str]]:
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(path) as workbook:
+        worksheet = ElementTree.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+    return [
+        ["".join(node.text or "" for node in cell.findall(f".//{namespace}t")) for cell in row.findall(f"{namespace}c")]
+        for row in worksheet.findall(f".//{namespace}row")
+    ]
 
 
 class SchedulerTests(unittest.TestCase):
@@ -489,6 +503,72 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         for name, content in source_files.items():
             self.assertEqual((self.data_root / f"fashion_{name}").read_bytes(), content)
         self.assertFalse(list(self.data_root.glob(".*.tmp")))
+
+    def test_publish_projects_fashion_and_beauty_intervals_to_hours_only(self) -> None:
+        base_files = {
+            "reels.csv": b"baseline reels csv",
+            "reels.json": b"baseline reels json",
+            "reels.xlsx": b"baseline reels xlsx",
+            "users.csv": b"baseline users csv",
+            "users.xlsx": b"baseline users xlsx",
+        }
+        for name, content in base_files.items():
+            (self.data_root / name).write_bytes(content)
+
+        reels_fields = [
+            "collection_number", "collected_at", "url",
+            "2nd collect_collected_at", "2nd collect_days_since_previous",
+        ]
+        reels_row = [
+            "2", "2026-08-26T00:00:00Z", "https://www.instagram.com/reels/hour-test/",
+            "2026-08-26T00:30:00Z", "+0.1day",
+        ]
+        users_fields = [
+            "collection_number", "days_since_previous", "user_id", "username",
+            "biography", "follower_count", "follower_count_change", "collected_at",
+        ]
+        users_rows = [
+            ["1", "", "42", "hour_user", "profile", "100", "", "2026-08-26T00:00:00Z"],
+            ["2", "+0.2day", "42", "hour_user", "profile", "110", "10", "2026-08-26T04:00:00Z"],
+        ]
+
+        for dataset_name, keywords in (("fashion", FASHION_KEYWORDS), ("beauty", BEAUTY_KEYWORDS)):
+            with self.subTest(dataset=dataset_name):
+                workspace = self.data_root / ".datasets" / dataset_name
+                workspace.mkdir(parents=True)
+                with (workspace / "reels.csv").open("w", newline="", encoding="utf-8-sig") as file:
+                    csv.writer(file).writerows([reels_fields, reels_row])
+                (workspace / "reels.json").write_text(
+                    json.dumps([dict(zip(reels_fields, reels_row))]), encoding="utf-8"
+                )
+                write_xlsx_workbook(workspace / "reels.xlsx", [("reels", [reels_fields, reels_row])])
+                with (workspace / "users.csv").open("w", newline="", encoding="utf-8-sig") as file:
+                    csv.writer(file).writerows([users_fields, *users_rows])
+                write_xlsx_workbook(workspace / "users.xlsx", [("users", [users_fields, *users_rows])])
+
+                publish_dataset_outputs(DatasetConfig(dataset_name, workspace, keywords))
+
+                with (self.data_root / f"{dataset_name}_reels.csv").open("r", newline="", encoding="utf-8-sig") as file:
+                    published_reels = list(csv.DictReader(file))
+                with (self.data_root / f"{dataset_name}_users.csv").open("r", newline="", encoding="utf-8-sig") as file:
+                    published_users = list(csv.DictReader(file))
+                published_json = json.loads((self.data_root / f"{dataset_name}_reels.json").read_text(encoding="utf-8"))
+                reel_xlsx = read_xlsx_rows(self.data_root / f"{dataset_name}_reels.xlsx")
+                user_xlsx = read_xlsx_rows(self.data_root / f"{dataset_name}_users.xlsx")
+
+                self.assertEqual(published_reels[0]["2nd collect_hours_since_previous"], "+0.5hour")
+                self.assertNotIn("2nd collect_days_since_previous", published_reels[0])
+                self.assertEqual(published_json[0]["2nd collect_hours_since_previous"], "+0.5hour")
+                self.assertEqual(published_users[0]["hours_since_previous"], "")
+                self.assertEqual(published_users[1]["hours_since_previous"], "+4hour")
+                self.assertNotIn("days_since_previous", published_users[1])
+                self.assertIn("2nd collect_hours_since_previous", reel_xlsx[0])
+                self.assertIn("+0.5hour", reel_xlsx[1])
+                self.assertIn("hours_since_previous", user_xlsx[0])
+                self.assertIn("+4hour", user_xlsx[2])
+
+        for name, content in base_files.items():
+            self.assertEqual((self.data_root / name).read_bytes(), content)
 
 
 if __name__ == "__main__":

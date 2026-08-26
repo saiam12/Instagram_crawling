@@ -66,6 +66,7 @@ def reel_record(index: int, collected_at: str | None = None) -> dict[str, object
         "location_name": "",
         "ad": "false",
         "uploaded_at": timestamp,
+        "video_duration_seconds": 12.5,
         "days_since_upload": 0,
         "view_count": index * 10,
         "like_count": index,
@@ -159,7 +160,7 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertIn("biography", worksheet_xml)
         self.assertIn("영상은 릴스탭 눌러주세요~", worksheet_xml)
         self.assertEqual(public_fields, [
-            "collection_number", "user_id", "username", "biography",
+            "collection_number", "days_since_previous", "user_id", "username", "biography",
             "follower_count", "follower_count_change", "collected_at",
         ])
         self.assertEqual(xlsx_header, public_fields)
@@ -309,6 +310,25 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(record["uploaded_at"], "2026-08-20T00:00:00.000Z")
         self.assertEqual(record["days_since_upload"], 5)
 
+    def test_reel_video_duration_is_numeric_when_present_and_blank_when_missing(self) -> None:
+        base_record = {
+            "url": "https://www.instagram.com/reels/duration/",
+            "title": "duration test",
+        }
+        present = build_collected_record(
+            base_record,
+            reels_browser.metadata_from_media({"video_duration": 12.75}),
+            "2026-01-01T00:00:00.000Z",
+        )
+        missing = build_collected_record(
+            base_record,
+            reels_browser.metadata_from_media({}),
+            "2026-01-01T00:00:00.000Z",
+        )
+
+        self.assertEqual(present["video_duration_seconds"], 12.75)
+        self.assertEqual(missing["video_duration_seconds"], "")
+
     def test_reel_media_detection_uses_instagram_clips_signals(self) -> None:
         self.assertTrue(media_is_reel({"product_type": "clips"}))
         self.assertTrue(media_is_reel({"is_clips_media": True}))
@@ -453,6 +473,7 @@ class CollectorUtilityTests(unittest.TestCase):
             "location_name": "new location",
             "ad": "false",
             "uploaded_at": "2026-01-02T00:00:00.000Z",
+            "video_duration_seconds": 13.25,
             "view_count": 1_100,
             "like_count": 111,
             "comment_count": 25,
@@ -470,6 +491,7 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(refreshed["location_name"], "original location")
         self.assertEqual(refreshed["ad"], "true")
         self.assertEqual(refreshed["uploaded_at"], "2025-12-20T00:00:00.000Z")
+        self.assertEqual(refreshed["video_duration_seconds"], 13.25)
         self.assertEqual(refreshed["days_since_upload"], 14)
         self.assertEqual(refreshed["view_count"], 1_100)
         self.assertEqual(refreshed["like_count"], 111)
@@ -2055,10 +2077,10 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             expected_fields = [
                 "collection_number", "collected_at", "url", "user_id", "username",
                 "title", "hashtags", "audio_name", "location_name", "ad",
-                "uploaded_at", "days_since_upload", "view_count", "like_count",
+                "uploaded_at", "video_duration_seconds", "days_since_upload", "view_count", "like_count",
                 "comment_count", "repost_count", "follower_count",
                 "2nd collect_collected_at", "2nd collect_days_since_previous",
-                "2nd collect_days_since_upload", "2nd collect_view_count",
+                "2nd collect_days_since_upload", "2nd collect_video_duration_seconds", "2nd collect_view_count",
                 "2nd collect_like_count", "2nd collect_comment_count",
                 "2nd collect_repost_count", "2nd collect_follower_count",
             ]
@@ -2069,9 +2091,13 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(list(json_rows[0]), expected_fields)
             self.assertEqual(read_xlsx_header(outputs["xlsx"]), expected_fields)
             self.assertEqual(csv_rows[0]["collection_number"], "2")
+            self.assertEqual(csv_rows[0]["video_duration_seconds"], "12.5")
+            self.assertEqual(csv_rows[0]["2nd collect_video_duration_seconds"], "12.5")
             self.assertEqual(csv_rows[0]["2nd collect_days_since_previous"], "+0.3day")
             self.assertEqual(csv_rows[0]["2nd collect_view_count"], "1,250(+250)")
             self.assertEqual(json_rows[0]["collection_number"], 2)
+            self.assertEqual(json_rows[0]["video_duration_seconds"], 12.5)
+            self.assertEqual(json_rows[0]["2nd collect_video_duration_seconds"], 12.5)
             self.assertEqual(json_rows[0]["2nd collect_days_since_previous"], "+0.3day")
             self.assertEqual(json_rows[0]["2nd collect_view_count"], "1,250(+250)")
             self.assertEqual(
@@ -2108,6 +2134,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["addedSnapshots"], 1)
             self.assertFalse(updated_path.exists())
             self.assertEqual(len(history_rows), 2)
+            self.assertEqual(history_rows[1]["video_duration_seconds"], "12.5")
             self.assertEqual(
                 read_reel_urls_from_xlsx(data_dir / "reels.xlsx"),
                 [
@@ -2117,6 +2144,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_follower_enricher_persists_profile_biography(self) -> None:
+        collected_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
         async def lookup(_payload: dict[str, str]) -> dict[str, object]:
             return {
                 "status": "success",
@@ -2126,13 +2155,15 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             }
 
         with tempfile.TemporaryDirectory() as directory:
-            enricher = FollowerEnricher(data_dir=directory, lookup_impl=lookup)
+            enricher = FollowerEnricher(data_dir=directory, lookup_impl=lookup, now=lambda: collected_at)
             await enricher.track_user(user_id="987654321", username="profile_user")
             await enricher.drain()
             fields, rows = read_csv_objects(user_history_path(directory))
 
         self.assertIn("biography", fields)
         self.assertEqual(rows[0].get("biography"), "🌟 영상은 릴스탭 눌러주세요🌟\n매일 신상 코디를 소개해요.")
+        self.assertEqual(rows[0].get("follower_count"), "37293")
+        self.assertEqual(rows[0].get("collected_at"), "2026-01-02T03:04:05.000Z")
 
     async def test_follower_cache_is_six_hours_and_creates_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

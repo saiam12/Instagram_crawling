@@ -23,13 +23,14 @@ XLSX_FILENAME = "instagram_data.xlsx"
 XLSX_INVALID_XML_CHARACTER_PATTERN = re.compile(
     r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]"
 )
-XLSX_NUMERIC_FIELDS = {"collection_number", "view_count", "follower_count", "follower_count_change", "like_count", "comment_count", "repost_count"}
+XLSX_NUMERIC_FIELDS = {"collection_number", "video_duration_seconds", "view_count", "follower_count", "follower_count_change", "like_count", "comment_count", "repost_count"}
 XLSX_PERCENT_FIELDS: set[str] = set()
 XLSX_DELTA_FIELDS = {"view_count", "like_count", "comment_count", "repost_count", "follower_count"}
 XLSX_DATE_FIELDS = {"collected_at", "uploaded_at"}
 XLSX_TEXT_IDENTIFIER_FIELDS = {"user_id"}
 XLSX_USERS_FIELDS = [
     "collection_number",
+    "days_since_previous",
     "user_id",
     "username",
     "biography",
@@ -47,6 +48,7 @@ XLSX_REELS_WEB_FIELDS = [
     "audio_name",
     "ad",
     "uploaded_at",
+    "video_duration_seconds",
     "days_since_upload",
     "view_count",
     "like_count",
@@ -67,6 +69,7 @@ XLSX_REELS_COLUMNS_FIELDS = [
     "location_name",
     "ad",
     "uploaded_at",
+    "video_duration_seconds",
     "days_since_upload",
     "view_count",
     "like_count",
@@ -201,6 +204,7 @@ def _xlsx_project_user_rows(
             source_value(row, "biography"),
         ]
         previous_follower_count = ""
+        previous_collected_at = ""
         for collection_number in sorted(snapshot_indexes):
             snapshot = snapshot_indexes[collection_number]
             follower_index = snapshot.get("follower_count")
@@ -217,6 +221,11 @@ def _xlsx_project_user_rows(
             )
             if collection_number != 1 and not (follower_count or collected_at):
                 continue
+            days_since_previous = (
+                _xlsx_elapsed_days(previous_collected_at, collected_at)
+                if previous_collected_at and collected_at
+                else ""
+            )
             follower_count_change = ""
             if (
                 re.fullmatch(r"-?\d+", follower_count.strip())
@@ -228,6 +237,7 @@ def _xlsx_project_user_rows(
             projected.append(
                 [
                     str(collection_number),
+                    days_since_previous,
                     *identity,
                     follower_count,
                     follower_count_change,
@@ -235,6 +245,8 @@ def _xlsx_project_user_rows(
                 ]
             )
             previous_follower_count = follower_count
+            if collected_at:
+                previous_collected_at = collected_at
     return projected
 
 

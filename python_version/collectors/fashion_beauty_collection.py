@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import math
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -33,6 +35,7 @@ from .instagram_reels_browser import (
     run_collector,
     wait_for_stop_or_timeout,
 )
+from exporters.instagram_collector import write_xlsx_workbook
 
 
 Invocation = Callable[..., Awaitable[int]]
@@ -144,16 +147,162 @@ def _atomic_copy(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _elapsed_hours(previous_value: Any, collected_value: Any) -> str:
+    try:
+        previous = datetime.fromisoformat(str(previous_value).strip().replace("Z", "+00:00"))
+        collected = datetime.fromisoformat(str(collected_value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if previous.tzinfo is None:
+        previous = previous.replace(tzinfo=timezone.utc)
+    if collected.tzinfo is None:
+        collected = collected.replace(tzinfo=timezone.utc)
+    elapsed = max(0.0, (collected - previous).total_seconds() / 3_600)
+    rounded = math.floor(elapsed * 10 + 0.5) / 10
+    if elapsed > 0 and rounded == 0:
+        rounded = 0.1
+    displayed = f"{rounded:.1f}".rstrip("0").rstrip(".")
+    return f"+{displayed}hour"
+
+
+def _hour_field_name(field: str) -> str:
+    return field.replace("days_since_previous", "hours_since_previous")
+
+
+def _project_hour_intervals(
+    kind: Literal["reels", "users"],
+    fields: list[str],
+    rows: list[dict[str, Any]],
+) -> tuple[list[str], list[dict[str, Any]], bool]:
+    transformed_fields = [_hour_field_name(field) for field in fields]
+    has_row_interval = "days_since_previous" in fields
+    snapshot_fields = {
+        match.group(1): field
+        for field in fields
+        if (match := re.fullmatch(r"(\d+(?:st|nd|rd|th) collect)_collected_at", field))
+    }
+    for label, collected_field in snapshot_fields.items():
+        source_elapsed = f"{label}_days_since_previous"
+        hour_field = f"{label}_hours_since_previous"
+        if source_elapsed not in fields and hour_field not in transformed_fields:
+            transformed_fields.insert(transformed_fields.index(collected_field) + 1, hour_field)
+    changed = transformed_fields != fields
+    if not changed:
+        return fields, rows, False
+
+    projected: list[dict[str, Any]] = []
+    previous_by_identity: dict[str, Any] = {}
+    for source in rows:
+        row = {_hour_field_name(field): source.get(field, "") for field in fields}
+        if has_row_interval:
+            identity = str(
+                source.get("url")
+                if kind == "reels"
+                else source.get("user_id") or source.get("username") or ""
+            )
+            previous = previous_by_identity.get(identity)
+            collected = source.get("collected_at", "")
+            row["hours_since_previous"] = (
+                _elapsed_hours(previous, collected) if previous and collected else ""
+            )
+            if collected:
+                previous_by_identity[identity] = collected
+        else:
+            previous = source.get("collected_at", "")
+            for label, collected_field in snapshot_fields.items():
+                collected = source.get(collected_field, "")
+                row[f"{label}_hours_since_previous"] = (
+                    _elapsed_hours(previous, collected) if previous and collected else ""
+                )
+                if collected:
+                    previous = collected
+        projected.append({field: row.get(field, "") for field in transformed_fields})
+    return transformed_fields, projected, True
+
+
+def _read_csv_projection(
+    source: Path, kind: Literal["reels", "users"]
+) -> tuple[list[str], list[dict[str, Any]], bool]:
+    with source.open("r", newline="", encoding="utf-8-sig") as file:
+        reader = csv.DictReader(file)
+        fields = list(reader.fieldnames or [])
+        rows = [dict(row) for row in reader]
+    return _project_hour_intervals(kind, fields, rows)
+
+
+def _atomic_write_csv(destination: Path, fields: list[str], rows: list[dict[str, Any]]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with temporary.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore", lineterminator="\r\n")
+            writer.writeheader()
+            writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_xlsx(destination: Path, sheet_name: str, fields: list[str], rows: list[dict[str, Any]]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        matrix = [fields, *[[str(row.get(field, "") or "") for field in fields] for row in rows]]
+        write_xlsx_workbook(temporary, [(sheet_name, matrix)])
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def publish_dataset_outputs(dataset: DatasetConfig) -> dict[str, Path]:
     """Atomically publish only domain-prefixed exports from one workspace."""
     public_root = _public_root(dataset)
     written: dict[str, Path] = {}
+    projections: dict[str, tuple[list[str], list[dict[str, Any]], bool]] = {}
     for kind, source_name in _PUBLIC_SOURCES.items():
         source = dataset.data_root / source_name
         if not source.exists():
             continue
         destination = public_root / f"{dataset.name}_{source_name}"
-        _atomic_copy(source, destination)
+        record_kind: Literal["reels", "users"] = "reels" if kind.startswith("reels") else "users"
+        if kind.endswith("_csv"):
+            projection = _read_csv_projection(source, record_kind)
+            projections[record_kind] = projection
+            fields, rows, changed = projection
+            if changed:
+                _atomic_write_csv(destination, fields, rows)
+            else:
+                _atomic_copy(source, destination)
+        elif kind == "reels_json":
+            try:
+                payload = json.loads(source.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, list) and all(isinstance(row, dict) for row in payload):
+                json_fields = list(dict.fromkeys(field for row in payload for field in row))
+                _fields, projected_rows, changed = _project_hour_intervals("reels", json_fields, payload)
+                if changed:
+                    _write_json_atomic(destination, projected_rows)
+                else:
+                    _atomic_copy(source, destination)
+            else:
+                _atomic_copy(source, destination)
+        elif kind.endswith("_xlsx") and record_kind in projections:
+            fields, rows, changed = projections[record_kind]
+            if changed:
+                _atomic_write_xlsx(destination, record_kind, fields, rows)
+            else:
+                _atomic_copy(source, destination)
+        else:
+            _atomic_copy(source, destination)
         written[kind] = destination
     return written
 

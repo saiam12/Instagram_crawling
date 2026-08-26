@@ -61,6 +61,7 @@ CSV_FIELDS = [
     "location_name",
     "ad",
     "uploaded_at",
+    "video_duration_seconds",
     "days_since_upload",
     "view_count",
     "like_count",
@@ -71,6 +72,7 @@ CSV_FIELDS = [
 RECOLLECT_FIELDS = [
     "collected_at",
     "days_since_upload",
+    "video_duration_seconds",
     "view_count",
     "like_count",
     "comment_count",
@@ -443,6 +445,12 @@ def exact_nonnegative_integer(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def exact_nonnegative_number(value: Any) -> int | float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
 def exact_follower_result_from_metadata(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
     candidate = metadata or {}
     count = exact_nonnegative_integer(candidate.get("followerCount"))
@@ -500,6 +508,11 @@ def metadata_from_media(
     caption = _dict(media.get("caption"))
     upload_candidates = [media.get(field) for field in ["taken_at", "taken_at_timestamp", "datePublished", "uploadDate", "published_at", "publish_time", "creation_time", "created_at"]]
     play_count = exact_nonnegative_integer(media.get("play_count"))
+    video_duration = exact_nonnegative_number(
+        media.get("video_duration")
+        if media.get("video_duration") is not None
+        else clips.get("video_duration")
+    )
     follower_count = (
         exact_nonnegative_integer(direct_user.get("follower_count"))
         if include_follower_count
@@ -515,6 +528,7 @@ def metadata_from_media(
         "locationName": str(location.get("name") or location.get("short_name") or media.get("location_name") or "").strip(),
         "ad": media_is_advertisement(media),
         "uploadedAt": next((normalized for item in upload_candidates if (normalized := normalize_upload_time(item))), ""),
+        "videoDurationSeconds": video_duration,
         # The Reel permalink feed omits views, while the creator's Reels
         # connection exposes the exact integer as play_count.
         "viewCount": play_count,
@@ -543,7 +557,7 @@ def merge_reel_metadata(current: dict[str, Any] | None, found: dict[str, Any] | 
     observed = found or {}
     metric_fields = {"viewCount", "followerCount", "likeCount", "commentCount", "repostCount"}
     merged: dict[str, Any] = {}
-    for field in ["userId", "username", "caption", "audioName", "locationName", "ad", "uploadedAt", "viewCount", "viewSourceField", "followerCount", "followerSourceField", "likeCount", "commentCount", "repostCount", "isReel"]:
+    for field in ["userId", "username", "caption", "audioName", "locationName", "ad", "uploadedAt", "videoDurationSeconds", "viewCount", "viewSourceField", "followerCount", "followerSourceField", "likeCount", "commentCount", "repostCount", "isReel"]:
         if field in {"ad", "isReel"}:
             merged[field] = bool(existing.get(field) or observed.get(field))
         elif field in metric_fields:
@@ -552,6 +566,8 @@ def merge_reel_metadata(current: dict[str, Any] | None, found: dict[str, Any] | 
             merged[field] = existing.get(field) if exact_nonnegative_integer(existing.get("viewCount")) is not None else observed.get(field)
         elif field == "followerSourceField":
             merged[field] = existing.get(field) if exact_nonnegative_integer(existing.get("followerCount")) is not None else observed.get(field)
+        elif field == "videoDurationSeconds":
+            merged[field] = existing.get(field) if exact_nonnegative_number(existing.get(field)) is not None else observed.get(field)
         else:
             merged[field] = existing.get(field) if existing.get(field) not in (None, "") else observed.get(field, "")
     return merged
@@ -568,6 +584,9 @@ def merge_direct_reel_metadata(current: dict[str, Any] | None, direct: dict[str,
         merged["viewSourceField"] = observed.get("viewSourceField")
     if exact_nonnegative_integer(observed.get("followerCount")) is not None:
         merged["followerSourceField"] = observed.get("followerSourceField")
+    duration = exact_nonnegative_number(observed.get("videoDurationSeconds"))
+    if duration is not None:
+        merged["videoDurationSeconds"] = duration
     return merged
 
 
@@ -628,6 +647,9 @@ def build_collected_record(record: dict[str, Any], response_metadata: dict[str, 
         "location_name": response.get("locationName") or record.get("locationName") or "",
         "ad": "true" if response.get("ad") is True or record.get("ad") is True else "false",
         "uploaded_at": uploaded_at,
+        "video_duration_seconds": exact_nonnegative_number(response.get("videoDurationSeconds")) or (
+            0 if response.get("videoDurationSeconds") == 0 else ""
+        ),
         "days_since_upload": days_since_upload(uploaded_at, timestamp),
         "view_count": view_count,
         "like_count": exact_nonnegative_integer(response.get("likeCount")),
@@ -646,6 +668,9 @@ def build_anonymous_refresh_record(existing: dict[str, Any], observed: dict[str,
     refreshed["collected_at"] = observed.get("collected_at") or refreshed["collected_at"]
     for field in ["view_count", "like_count", "comment_count", "repost_count"]:
         refreshed[field] = exact_nonnegative_integer(observed.get(field))
+    duration = exact_nonnegative_number(observed.get("video_duration_seconds"))
+    if duration is not None:
+        refreshed["video_duration_seconds"] = duration
     follower_count = exact_nonnegative_integer(observed.get("follower_count"))
     refreshed["follower_count"] = follower_count if follower_count is not None else ""
     refreshed["days_since_upload"] = days_since_upload(refreshed.get("uploaded_at"), refreshed.get("collected_at"))
@@ -920,6 +945,11 @@ def _json_field_value(field: str, value: Any) -> Any:
     if base_field in {"days_since_previous", "days_since_upload"}:
         text = str(value).strip()
         return float(text) if re.fullmatch(r"-?(?:\d+(?:\.\d+)?|\.\d+)", text) else value
+    if base_field == "video_duration_seconds":
+        text = str(value).strip()
+        if re.fullmatch(r"(?:\d+(?:\.\d+)?|\.\d+)", text):
+            number = float(text)
+            return int(number) if number.is_integer() else number
     return value
 
 
