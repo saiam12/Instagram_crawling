@@ -89,6 +89,18 @@ def read_xlsx_header(path: Path) -> list[str]:
 
 
 class CollectorUtilityTests(unittest.TestCase):
+    def test_scheduler_flags_are_false_by_default(self) -> None:
+        options = parse_args([])
+        self.assertFalse(options.new_urls_only)
+        self.assertFalse(options.disable_recollect_cooldown)
+
+    def test_filter_new_urls_removes_prior_history_url(self) -> None:
+        existing = [reel_record(1)]
+        urls = [str(existing[0]["url"]), "https://www.instagram.com/reels/new/"]
+        filter_urls = getattr(reels_browser, "filter_new_urls", None)
+        self.assertIsNotNone(filter_urls)
+        self.assertEqual(filter_urls(urls, existing), ["https://www.instagram.com/reels/new/"])
+
     def test_stored_reel_progress_line_uses_saved_count_not_candidate_position(self) -> None:
         """Terminal progress must identify the nth persisted Reel, not the nth candidate inspected."""
         formatter = getattr(reels_browser, "stored_reel_progress_line", None)
@@ -771,6 +783,16 @@ class CollectorUtilityTests(unittest.TestCase):
 
 
 class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_cooldown_accepts_due_fashion_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = await LongReelStore.create(
+                Path(directory) / "reels_rows.csv",
+                disable_recollect_cooldown=True,
+            )
+            await store.append(reel_record(1, "2026-08-26T00:00:00Z"))
+            result = await store.append(reel_record(1, "2026-08-26T00:30:00Z"))
+            self.assertFalse(result.get("skipped"))
+
     async def test_hashtag_rediscovery_wait_is_interrupted_by_stop_request(self) -> None:
         wait_for_stop = getattr(reels_browser, "wait_for_stop_or_timeout", None)
         request_stop = getattr(reels_browser, "request_stop_threadsafe", None)

@@ -237,6 +237,19 @@ def normalize_reel_url(value: Any) -> dict[str, str] | None:
     return {"url": f"https://www.instagram.com/reels/{match.group(1)}/", "shortcode": match.group(1)}
 
 
+def filter_new_urls(urls: list[str], history_rows: list[dict[str, Any]]) -> list[str]:
+    """Keep discovered URLs that are absent from the collected Reel history."""
+    history_urls = {
+        normalized["url"] if (normalized := normalize_reel_url(row.get("url"))) else str(row.get("url") or "")
+        for row in history_rows
+    }
+    return [
+        url
+        for url in urls
+        if (normalized["url"] if (normalized := normalize_reel_url(url)) else url) not in history_urls
+    ]
+
+
 def shortcode_to_media_id(value: Any) -> str:
     shortcode = str(value or "").strip()
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -1261,10 +1274,12 @@ class LongReelStore:
         csv_path: Path,
         flush_record_count: int = REEL_STORE_FLUSH_RECORD_COUNT,
         xlsx_layout: str = "columns",
+        disable_recollect_cooldown: bool = False,
     ) -> None:
         self.csv_path = csv_path
         self.flush_record_count = flush_record_count
         self.xlsx_layout = xlsx_layout
+        self.disable_recollect_cooldown = disable_recollect_cooldown
         self.fields = list(ROW_COLLECTION_FIELDS)
         self.rows: list[dict[str, Any]] = []
         self.journal_path = Path(f"{csv_path}.pending.jsonl")
@@ -1278,8 +1293,9 @@ class LongReelStore:
         csv_path: Path | str,
         flush_record_count: int = REEL_STORE_FLUSH_RECORD_COUNT,
         xlsx_layout: str = "columns",
+        disable_recollect_cooldown: bool = False,
     ) -> "LongReelStore":
-        store = cls(Path(csv_path), flush_record_count, xlsx_layout)
+        store = cls(Path(csv_path), flush_record_count, xlsx_layout, disable_recollect_cooldown)
         migrated_journal: Path | None = None
         if not store.csv_path.exists() and store.csv_path.name == REEL_HISTORY_FILENAME:
             for legacy_name in LEGACY_REEL_HISTORY_FILENAMES:
@@ -1339,7 +1355,7 @@ class LongReelStore:
 
     async def append(self, record: dict[str, Any]) -> dict[str, Any]:
         async with self.lock:
-            cooldown = long_collected_record_cooldown(self.rows, record)
+            cooldown = None if self.disable_recollect_cooldown else long_collected_record_cooldown(self.rows, record)
             if cooldown:
                 return cooldown
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1538,6 +1554,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(storage_layout="history")
     parser.add_argument("--output-stem", default="")
     parser.add_argument("--xlsx-layout", choices=["rows", "columns", "both"], default="columns", help=argparse.SUPPRESS)
+    parser.add_argument("--new-urls-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--disable-recollect-cooldown", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -2714,6 +2732,7 @@ async def run_collector(options: argparse.Namespace) -> int:
                 csv_path,
                 options.checkpoint_items,
                 options.xlsx_layout,
+                options.disable_recollect_cooldown,
             )
         executable_path = locate_browser_executable()
         async_playwright = load_playwright()
@@ -3118,7 +3137,10 @@ async def run_collector(options: argparse.Namespace) -> int:
                 )
                 filtered_count += prefiltered["uploadAgeSkipped"]
                 cooldown_skipped_count += prefiltered["cooldownSkipped"]
-                candidates = unattempted_hashtag_urls(prefiltered["urls"], attempted_hashtag_urls)
+                candidates = prefiltered["urls"]
+                if options.new_urls_only:
+                    candidates = filter_new_urls(candidates, reel_store.rows)
+                candidates = unattempted_hashtag_urls(candidates, attempted_hashtag_urls)
                 print(
                     "후보 사전 필터: "
                     f"전체={prefiltered['total']}, "
