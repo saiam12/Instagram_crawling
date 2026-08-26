@@ -72,6 +72,11 @@ class SchedulerTests(unittest.TestCase):
         ]
         self.assertEqual(due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + timedelta(days=2)), [])
 
+    def test_initial_count_ignores_malformed_url(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        rows = [{"url": "not a URL", "collection_number": "1", "collected_at": isoformat_utc(base)}]
+        self.assertEqual(initial_count_in_window(rows, base, base + timedelta(hours=1)), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

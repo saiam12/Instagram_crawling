@@ -169,6 +169,8 @@ def initial_count_in_window(rows: list[dict[str, Any]], start: datetime, end: da
     for row in rows:
         if not isinstance(row, dict):
             continue
+        if _normalize_reel_url(row.get("url")) is None:
+            continue
         try:
             is_initial = int(str(row.get("collection_number", "")).strip()) == 1
         except (TypeError, ValueError):
