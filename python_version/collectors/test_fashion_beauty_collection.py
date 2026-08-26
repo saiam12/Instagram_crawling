@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from .fashion_beauty_collection import (
+    SupervisorLock,
+    _due_retry_delay,
     decide_next_work,
     invoke_generic_collector,
     publish_dataset_outputs,
@@ -104,6 +107,9 @@ class ManualClock:
     def __call__(self) -> datetime:
         return self.current
 
+    def advance(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds)
+
 
 class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -131,6 +137,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     async def test_due_jobs_from_both_domains_run_before_active_window_discovery(self) -> None:
         started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
         initial_at = started_at - timedelta(minutes=30)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=0.5,
+            discovery_hours=0.5,
+            discovery_interval_minutes=30,
+        )
         histories = {
             dataset: self.write_history(
                 dataset,
@@ -157,7 +169,35 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                         [kwargs["urls"][0], 2, isoformat_utc(started_at)]  # type: ignore[index]
                     )
             else:
-                clock.current = started_at + timedelta(hours=self.config.duration_hours)
+                clock.current = started_at + timedelta(hours=config.duration_hours)
+            return 0
+
+        with patch(
+            "collectors.fashion_beauty_collection.wait_for_stop_or_timeout",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call["mode"] for call in calls[:3]], ["recollect", "recollect", "discover"])
+        self.assertEqual({call["dataset"] for call in calls[:2]}, {"fashion", "beauty"})
+        self.assertEqual(calls[2]["dataset"], "fashion")
+        self.assertEqual(calls[2]["max_items"], 50)
+        self.assertTrue(all(supervisor and not generic for supervisor, generic in lock_observations))
+        self.assertTrue((self.data_root / "fashion_collector_status.json").exists())
+        self.assertTrue((self.data_root / "beauty_collector_status.json").exists())
+
+    async def test_discovery_rechecks_window_and_deadlines_after_each_bounded_batch(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                clock.current = started_at + timedelta(minutes=31)
+            else:
+                clock.current = started_at + timedelta(hours=1)
             return 0
 
         with patch(
@@ -166,14 +206,167 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
 
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            [(call["dataset"], call["max_items"]) for call in calls],
+            [("fashion", 50), ("beauty", 50)],
+        )
+        fashion_status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("deadline", fashion_status["last_error"].lower())
+
+    async def test_fresh_malformed_supervisor_lock_is_not_stolen(self) -> None:
+        lock_path = self.data_root / ".datasets" / "fashion_beauty_scheduler.lock.json"
+        lock_path.parent.mkdir(parents=True)
+        lock_path.write_bytes(b"")
+
+        with patch("collectors.fashion_beauty_collection.asyncio.sleep", new=AsyncMock()) as retry_sleep:
+            with self.assertRaisesRegex(RuntimeError, "initializ"):
+                await SupervisorLock(lock_path).acquire()
+
+        self.assertTrue(lock_path.exists())
+        self.assertEqual(lock_path.read_bytes(), b"")
+        self.assertGreaterEqual(retry_sleep.await_count, 1)
+
+    def test_due_retry_backoff_is_bounded_for_long_outages(self) -> None:
+        self.assertEqual(
+            [_due_retry_delay(attempt) for attempt in (1, 2, 3, 4, 5, 6, 20_000)],
+            [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0],
+        )
+
+    async def test_nonzero_due_recollection_is_published_reported_and_retried_serially(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
+        history = self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/retry/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+            }],
+        )
+        workspace_export = self.data_root / ".datasets" / "fashion" / "reels.csv"
+        workspace_export.write_text("fixture", encoding="utf-8")
+        clock = ManualClock(started_at)
+        attempts = 0
+        active = 0
+        max_active = 0
+        waits: list[float] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            nonlocal attempts, active, max_active
+            attempts += 1
+            active += 1
+            max_active = max(max_active, active)
+            active -= 1
+            if attempts == 1:
+                return 7
+            with history.open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow(
+                    [kwargs["urls"][0], 2, isoformat_utc(clock())]  # type: ignore[index]
+                )
+            clock.current = started_at + timedelta(hours=self.config.duration_hours)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
+            self.assertIn("code 7", status["last_error"])
+            self.assertEqual(status["collector_failures"], 1)
+            self.assertEqual((self.data_root / "fashion_reels.csv").read_text(encoding="utf-8"), "fixture")
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 7)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(max_active, 1)
+        self.assertEqual(waits, [1.0])
+
+    async def test_failed_due_job_backoff_does_not_delay_other_due_domain(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 31, tzinfo=timezone.utc)
+        histories = {
+            "fashion": self.write_history(
+                "fashion",
+                [{
+                    "url": "https://www.instagram.com/reels/fashion_retry/",
+                    "collection_number": 1,
+                    "collected_at": isoformat_utc(started_at - timedelta(minutes=31)),
+                }],
+            ),
+            "beauty": self.write_history(
+                "beauty",
+                [{
+                    "url": "https://www.instagram.com/reels/beauty_due/",
+                    "collection_number": 1,
+                    "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                }],
+            ),
+        }
+        clock = ManualClock(started_at)
+        calls: list[str] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            dataset = str(kwargs["dataset"])
+            calls.append(dataset)
+            if calls == ["fashion"]:
+                return 7
+            with histories[dataset].open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow(
+                    [kwargs["urls"][0], 2, isoformat_utc(clock())]  # type: ignore[index]
+                )
+            if len(calls) == 3:
+                clock.current = started_at + timedelta(hours=self.config.duration_hours)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 7)
+        self.assertEqual(calls, ["fashion", "beauty", "fashion"])
+
+    async def test_invocation_exception_is_reported_and_status_is_published(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            clock.current = started_at + timedelta(hours=self.config.duration_hours)
+            raise RuntimeError("deterministic collector failure")
+
+        result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        for dataset in ("fashion", "beauty"):
+            status = json.loads((self.data_root / f"{dataset}_collector_status.json").read_text(encoding="utf-8"))
+            if dataset == "fashion":
+                self.assertIn("deterministic collector failure", status["last_error"])
+                self.assertEqual(status["collector_failures"], 1)
+            self.assertEqual(status["state"], "completed")
+
+    async def test_idle_wait_is_clamped_to_run_deadline(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=5 / 3600,
+            discovery_hours=0,
+        )
+        waits: list[float] = []
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=AsyncMock(), clock=clock)
+
         self.assertEqual(result, 0)
-        self.assertEqual([call["mode"] for call in calls[:3]], ["recollect", "recollect", "discover"])
-        self.assertEqual({call["dataset"] for call in calls[:2]}, {"fashion", "beauty"})
-        self.assertEqual(calls[2]["dataset"], "fashion")
-        self.assertEqual(calls[2]["max_items"], 500)
-        self.assertTrue(all(supervisor and not generic for supervisor, generic in lock_observations))
-        self.assertTrue((self.data_root / "fashion_collector_status.json").exists())
-        self.assertTrue((self.data_root / "beauty_collector_status.json").exists())
+        self.assertEqual(waits, [5.0])
 
     async def test_window_cap_500_stops_discovery_but_keeps_due_jobs(self) -> None:
         now = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)

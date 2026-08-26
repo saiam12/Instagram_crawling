@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,12 +46,22 @@ _PUBLIC_SOURCES = {
     "users_xlsx": "users.xlsx",
 }
 
+_LOCK_READ_ATTEMPTS = 3
+_LOCK_READ_RETRY_SECONDS = 0.05
+_LOCK_MALFORMED_GRACE_SECONDS = 2.0
+_DUE_RETRY_MAX_SECONDS = 30.0
+
 
 @dataclass(frozen=True)
 class WorkDecision:
     due_jobs: tuple[DueJob, ...]
     discover: bool
     remaining_capacity: int
+
+
+def _due_retry_delay(attempt: int) -> float:
+    exponent = min(max(0, attempt - 1), 5)
+    return min(float(2**exponent), _DUE_RETRY_MAX_SECONDS)
 
 
 def utc_now() -> datetime:
@@ -190,17 +201,35 @@ class SupervisorLock:
                 self.acquired = True
                 return self
             except FileExistsError:
-                try:
-                    existing = json.loads(self.path.read_text(encoding="utf-8"))
-                    existing_pid = int(existing.get("pid", 0))
-                except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                    existing_pid = 0
+                existing_pid = await self._read_existing_pid()
                 if existing_pid and process_is_alive(existing_pid):
                     raise RuntimeError(
                         f"Another fashion/beauty supervisor is already running (PID {existing_pid})."
                     )
                 self.path.unlink(missing_ok=True)
         raise RuntimeError(f"Could not acquire supervisor lock: {self.path}")
+
+    async def _read_existing_pid(self) -> int:
+        """Read a lock owner without stealing a file another process is writing."""
+        for attempt in range(_LOCK_READ_ATTEMPTS):
+            try:
+                existing = json.loads(self.path.read_text(encoding="utf-8"))
+                pid = int(existing.get("pid", 0))
+                if pid <= 0:
+                    raise ValueError("lock PID must be positive")
+                return pid
+            except FileNotFoundError:
+                return 0
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                if attempt + 1 < _LOCK_READ_ATTEMPTS:
+                    await asyncio.sleep(_LOCK_READ_RETRY_SECONDS)
+        try:
+            age_seconds = max(0.0, time.time() - self.path.stat().st_mtime)
+        except FileNotFoundError:
+            return 0
+        if age_seconds <= _LOCK_MALFORMED_GRACE_SECONDS:
+            raise RuntimeError("The fashion/beauty supervisor lock is still initializing; try again shortly.")
+        return 0
 
     async def release(self) -> None:
         if not self.acquired:
@@ -299,6 +328,9 @@ def current_status(
     discovery_ends_at: datetime,
     ends_at: datetime,
     now: datetime,
+    *,
+    last_error: str = "",
+    collector_failures: int = 0,
 ) -> dict[str, Any]:
     rows = read_history(dataset)
     active_name = window_dataset(started_at, now) if now < discovery_ends_at else None
@@ -327,8 +359,32 @@ def current_status(
         "window_cap_reached": current_count >= config.max_new_items_per_window,
         "due_recollections": len(pending),
         "overdue_recollections": sum(job.due_at < now for job in pending),
-        "last_error": "",
+        "collector_failures": collector_failures,
+        "last_error": last_error,
     }
+
+
+async def _invoke_before_deadline(
+    invoke: Invocation,
+    clock: Clock,
+    deadline: datetime,
+    **kwargs: Any,
+) -> tuple[int, str]:
+    mode = str(kwargs.get("mode", "collector"))
+    remaining = (deadline - clock()).total_seconds()
+    if remaining <= 0:
+        return 2, f"{mode} deadline reached before collector invocation"
+    try:
+        result = int(await asyncio.wait_for(invoke(**kwargs), timeout=remaining))
+    except TimeoutError:
+        return 2, f"{mode} collector exceeded its deadline"
+    except Exception as error:
+        return 2, f"{mode} collector failed: {error}"
+    if clock() > deadline:
+        return 2, f"{mode} collector completed after its deadline"
+    if result:
+        return result, f"{mode} collector exited with code {result}"
+    return 0, ""
 
 
 async def run_fashion_beauty_collection(
@@ -342,6 +398,11 @@ async def run_fashion_beauty_collection(
     ends_at = started_at + timedelta(hours=config.duration_hours)
     stop_event = asyncio.Event()
     lock_path = config.data_root / ".datasets" / "fashion_beauty_scheduler.lock.json"
+    last_errors = {"fashion": "", "beauty": ""}
+    collector_failures = {"fashion": 0, "beauty": 0}
+    retry_attempts: dict[tuple[str, str, datetime], int] = {}
+    retry_not_before: dict[tuple[str, str, datetime], datetime] = {}
+    exit_code = 0
 
     async with SupervisorLock(lock_path):
         while clock() < ends_at:
@@ -357,13 +418,48 @@ async def run_fashion_beauty_collection(
                 key=lambda job: (job.due_at, job.dataset, job.url),
             )
 
-            if pending:
-                next_job = pending[0]
-                await invoke(
+            wait_seconds = 30.0
+            invoked = False
+            eligible_jobs = [
+                job
+                for job in pending
+                if retry_not_before.get((job.dataset, job.url, job.due_at), now) <= now
+            ]
+
+            if eligible_jobs:
+                next_job = eligible_jobs[0]
+                job_key = (next_job.dataset, next_job.url, next_job.due_at)
+                invoked = True
+                result, error = await _invoke_before_deadline(
+                    invoke,
+                    clock,
+                    ends_at,
                     config=config,
                     dataset=next_job.dataset,
                     mode="recollect",
                     urls=[next_job.url],
+                )
+                if result:
+                    exit_code = max(exit_code, result)
+                    last_errors[next_job.dataset] = error
+                    collector_failures[next_job.dataset] += 1
+                    attempt = retry_attempts.get(job_key, 0) + 1
+                    retry_attempts[job_key] = attempt
+                    wait_seconds = _due_retry_delay(attempt)
+                    retry_not_before[job_key] = clock() + timedelta(seconds=wait_seconds)
+                else:
+                    retry_attempts.pop(job_key, None)
+                    retry_not_before.pop(job_key, None)
+            elif pending:
+                wait_seconds = min(
+                    30.0,
+                    max(
+                        0.0,
+                        min(
+                            (retry_not_before[(job.dataset, job.url, job.due_at)] - now).total_seconds()
+                            for job in pending
+                        ),
+                    ),
                 )
             elif now < discovery_ends_at:
                 selected = dataset_by_name(config, window_dataset(started_at, now))
@@ -376,7 +472,17 @@ async def run_fashion_beauty_collection(
                     window_start=window_start,
                 )
                 if decision.discover:
-                    await invoke(
+                    batch_size = min(config.new_items_per_window, decision.remaining_capacity)
+                    invocation_deadline = min(
+                        window_start + timedelta(minutes=config.discovery_interval_minutes),
+                        discovery_ends_at,
+                        ends_at,
+                    )
+                    invoked = True
+                    result, error = await _invoke_before_deadline(
+                        invoke,
+                        clock,
+                        invocation_deadline,
                         config=config,
                         dataset=selected.name,
                         mode="discover",
@@ -384,8 +490,12 @@ async def run_fashion_beauty_collection(
                             selected.keywords,
                             active_window_index(started_at, now, config.discovery_interval_minutes),
                         ),
-                        max_items=decision.remaining_capacity,
+                        max_items=batch_size,
                     )
+                    if result:
+                        exit_code = max(exit_code, result)
+                        last_errors[selected.name] = error
+                        collector_failures[selected.name] += 1
 
             status_now = clock()
             for dataset in configured_datasets:
@@ -399,11 +509,20 @@ async def run_fashion_beauty_collection(
                         discovery_ends_at,
                         ends_at,
                         status_now,
+                        last_error=last_errors[dataset.name],
+                        collector_failures=collector_failures[dataset.name],
                     ),
                 )
             if status_now < ends_at:
-                await wait_for_stop_or_timeout(stop_event, 30)
-    return 0
+                if invoked:
+                    await asyncio.sleep(0)
+                else:
+                    remaining_run_seconds = max(0.0, (ends_at - status_now).total_seconds())
+                    await wait_for_stop_or_timeout(
+                        stop_event,
+                        min(wait_seconds, remaining_run_seconds),
+                    )
+    return exit_code
 
 
 __all__ = [
