@@ -194,6 +194,45 @@ class XlsxCollectionTimingTests(unittest.TestCase):
             "2026-01-03T00:00:00Z",
         ])
 
+    def test_user_baseline_ignores_malformed_timestamp_and_negative_count(self) -> None:
+        invalid_middle_snapshots = (
+            ("1050", " not-a-timestamp "),
+            ("1050", "   "),
+            ("-5", "2026-01-02T00:00:00Z"),
+        )
+
+        for middle_count, middle_timestamp in invalid_middle_snapshots:
+            with self.subTest(
+                middle_count=middle_count,
+                middle_timestamp=middle_timestamp,
+            ):
+                rows = [[
+                    "user_id",
+                    "username",
+                    "follower_count",
+                    "collected_at",
+                    "2nd collect_follower_count",
+                    "2nd collect_collected_at",
+                    "3rd collect_follower_count",
+                    "3rd collect_collected_at",
+                ], [
+                    "5",
+                    "invalid_middle_snapshot",
+                    "1000",
+                    "2026-01-01T00:00:00Z",
+                    middle_count,
+                    middle_timestamp,
+                    "1100",
+                    "2026-01-03T00:00:00Z",
+                ]]
+
+                projected = _xlsx_project_rows("users", rows)
+
+                self.assertEqual(projected[3], [
+                    "3", "+2day", "5", "invalid_middle_snapshot", "", "1100", "100",
+                    "2026-01-03T00:00:00Z",
+                ])
+
     def test_retired_reel_fields_are_not_exported(self) -> None:
         rows = [[
             "url",

@@ -244,7 +244,10 @@ def _xlsx_project_user_rows(
                     collected_at,
                 ]
             )
-            if re.fullmatch(r"-?\d+", follower_count.strip()) and collected_at:
+            if (
+                re.fullmatch(r"\d+", follower_count.strip())
+                and _xlsx_parse_timestamp(collected_at) is not None
+            ):
                 previous_follower_count = follower_count
                 previous_collected_at = collected_at
     return projected
@@ -317,16 +320,21 @@ def _xlsx_add_elapsed_fields(fields: list[str]) -> list[str]:
     return expanded
 
 
-def _xlsx_elapsed_days(previous_value: str, collected_value: str) -> str:
+def _xlsx_parse_timestamp(value: str) -> datetime | None:
     try:
-        previous = datetime.fromisoformat(previous_value.replace("Z", "+00:00"))
-        collected = datetime.fromisoformat(collected_value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _xlsx_elapsed_days(previous_value: str, collected_value: str) -> str:
+    previous = _xlsx_parse_timestamp(previous_value)
+    collected = _xlsx_parse_timestamp(collected_value)
+    if previous is None or collected is None:
         return ""
-    if previous.tzinfo is None:
-        previous = previous.replace(tzinfo=timezone.utc)
-    if collected.tzinfo is None:
-        collected = collected.replace(tzinfo=timezone.utc)
     elapsed_days = max(0.0, (collected - previous).total_seconds() / 86_400)
     rounded_days = int((elapsed_days * 10) + 0.5) / 10
     if elapsed_days > 0 and rounded_days == 0:
