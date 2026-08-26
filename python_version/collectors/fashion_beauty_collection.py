@@ -440,7 +440,8 @@ async def run_fashion_beauty_collection(
                     urls=[next_job.url],
                 )
                 if result:
-                    exit_code = max(exit_code, result)
+                    if exit_code == 0:
+                        exit_code = result
                     last_errors[next_job.dataset] = error
                     collector_failures[next_job.dataset] += 1
                     attempt = retry_attempts.get(job_key, 0) + 1
@@ -493,7 +494,8 @@ async def run_fashion_beauty_collection(
                         max_items=batch_size,
                     )
                     if result:
-                        exit_code = max(exit_code, result)
+                        if exit_code == 0:
+                            exit_code = result
                         last_errors[selected.name] = error
                         collector_failures[selected.name] += 1
 

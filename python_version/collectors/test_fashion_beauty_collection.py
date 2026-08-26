@@ -347,6 +347,41 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(status["collector_failures"], 1)
             self.assertEqual(status["state"], "completed")
 
+    async def test_negative_collector_result_stays_nonzero_for_discovery_and_recollection(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
+        for mode in ("discover", "recollect"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary_directory:
+                data_root = Path(temporary_directory)
+                config = RunConfig(
+                    data_root=data_root,
+                    duration_hours=0.5,
+                    discovery_hours=0.5,
+                    discovery_interval_minutes=30,
+                )
+                if mode == "recollect":
+                    history = data_root / ".datasets" / "fashion" / ".collector" / "reels_history_active.csv"
+                    history.parent.mkdir(parents=True)
+                    with history.open("w", newline="", encoding="utf-8-sig") as file:
+                        writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+                        writer.writeheader()
+                        writer.writerow({
+                            "url": "https://www.instagram.com/reels/negative/",
+                            "collection_number": 1,
+                            "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                        })
+                clock = ManualClock(started_at)
+
+                async def fake_invoke(**_kwargs: object) -> int:
+                    clock.current = started_at + timedelta(minutes=30)
+                    return -9
+
+                result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+                self.assertEqual(result, -9)
+                status = json.loads((data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
+                self.assertIn("code -9", status["last_error"])
+                self.assertEqual(status["collector_failures"], 1)
+
     async def test_idle_wait_is_clamped_to_run_deadline(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
         clock = ManualClock(started_at)
