@@ -99,9 +99,17 @@ def _normalize_reel_url(value: Any) -> str | None:
         parsed = urlsplit(text)
     except ValueError:
         return None
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    try:
+        hostname = parsed.hostname
+        parsed.port  # Force validation of non-numeric and out-of-range ports.
+    except ValueError:
         return None
-    hostname = parsed.hostname.lower().rstrip(".")
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    if authority.endswith(":"):
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        return None
+    hostname = hostname.lower().rstrip(".")
     if hostname != "instagram.com" and not hostname.endswith(".instagram.com"):
         return None
     match = _REEL_PATH.fullmatch(parsed.path)

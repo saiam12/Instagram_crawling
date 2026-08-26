@@ -77,6 +77,14 @@ class SchedulerTests(unittest.TestCase):
         rows = [{"url": "not a URL", "collection_number": "1", "collected_at": isoformat_utc(base)}]
         self.assertEqual(initial_count_in_window(rows, base, base + timedelta(hours=1)), 0)
 
+    def test_initial_count_rejects_invalid_port_but_keeps_valid_url(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        rows = [
+            {"url": "https://instagram.com:bad/reels/a/", "collection_number": "1", "collected_at": isoformat_utc(base)},
+            {"url": "https://instagram.com/reels/b/", "collection_number": "1", "collected_at": isoformat_utc(base + timedelta(minutes=1))},
+        ]
+        self.assertEqual(initial_count_in_window(rows, base, base + timedelta(hours=1)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
