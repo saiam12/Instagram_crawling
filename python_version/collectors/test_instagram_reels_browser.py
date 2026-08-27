@@ -685,6 +685,20 @@ class CollectorUtilityTests(unittest.TestCase):
             "ad": "false",
         }))
 
+    def test_reel_core_data_rejects_an_unnormalized_missing_repost_count(self) -> None:
+        self.assertFalse(has_complete_reel_core_data({
+            "url": "https://www.instagram.com/reels/DA55rVCNIrp/",
+            "user_id": "52988919621",
+            "username": "kzby.kr",
+            "uploaded_at": "2024-10-09T13:16:30.000Z",
+            "view_count": 24_585,
+            "like_count": 3_262,
+            "comment_count": 7,
+            "repost_count": None,
+            "follower_count": 1_000,
+            "ad": "false",
+        }))
+
     def test_exact_metric_results_are_applied_together_before_a_reel_is_saved(self) -> None:
         apply_results = getattr(reels_browser, "apply_exact_metric_results", None)
         self.assertIsNotNone(apply_results)
@@ -732,6 +746,31 @@ class CollectorUtilityTests(unittest.TestCase):
         )
 
         self.assertEqual(result, {"status": "success", "error": ""})
+        self.assertEqual(record["follower_count"], 37_293)
+
+    def test_exact_metric_results_normalize_a_missing_repost_count_to_zero(self) -> None:
+        record = {
+            "view_count": None,
+            "like_count": 564,
+            "comment_count": 15,
+            "repost_count": None,
+            "follower_count": "",
+        }
+
+        result = reels_browser.apply_exact_metric_results(
+            record,
+            "Db2uAL7xbRZ",
+            {"Db2uAL7xbRZ": 24_585},
+            {
+                "status": "success",
+                "followerCount": 37_293,
+                "sourceField": "edge_followed_by.count",
+            },
+        )
+
+        self.assertEqual(result, {"status": "success", "error": ""})
+        self.assertEqual(record["repost_count"], 0)
+        self.assertEqual(record["view_count"], 24_585)
         self.assertEqual(record["follower_count"], 37_293)
 
     def test_incomplete_exact_metric_results_do_not_partially_modify_a_reel(self) -> None:
@@ -1159,7 +1198,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["repostCount"], 6)
         self.assertEqual(view_counts, {"BA": 24_585})
 
-    async def test_direct_metric_retry_recovers_missing_first_response(self) -> None:
+    async def test_missing_repost_count_does_not_block_an_exact_metric_response(self) -> None:
         class Page:
             def __init__(self) -> None:
                 self.requests = 0
@@ -1178,12 +1217,10 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
                     "like_count": 321,
                     "comment_count": 45,
                 }
-                if self.requests == 2:
-                    media["media_repost_count"] = 6
                 return {"status": 200, "text": json.dumps({"items": [media]})}
 
         async def slow_page() -> object:
-            raise AssertionError("A successful direct retry must not open the fallback page")
+            raise AssertionError("A missing repost count must not open the fallback page")
 
         page = Page()
         metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
@@ -1195,9 +1232,9 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             retry_delay_seconds=0.5,
         )
 
-        self.assertEqual(page.requests, 2)
-        self.assertEqual(page.waits, [500])
-        self.assertEqual(metadata["repostCount"], 6)
+        self.assertEqual(page.requests, 1)
+        self.assertEqual(page.waits, [])
+        self.assertEqual(metadata["repostCount"], 0)
         self.assertEqual(view_counts, {"BA": 24_585})
 
     async def test_follower_web_lookup_retries_transient_errors_three_times(self) -> None:

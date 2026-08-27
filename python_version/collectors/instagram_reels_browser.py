@@ -647,9 +647,12 @@ async def resolve_follower_result(
 
 def has_exact_engagement_metadata(metadata: dict[str, Any] | None) -> bool:
     candidate = metadata or {}
+    # Instagram does not expose a repost aggregate for every Reel. A missing
+    # field is normalized to the verified zero-value convention during record
+    # construction, so likes and comments remain the required API fields.
     return all(
         exact_nonnegative_integer(candidate.get(field)) is not None
-        for field in ["likeCount", "commentCount", "repostCount"]
+        for field in ["likeCount", "commentCount"]
     )
 
 
@@ -681,7 +684,8 @@ def metadata_from_media(
         if include_follower_count
         else None
     )
-    repost_count = media.get("media_repost_count") if media.get("media_repost_count") is not None else media.get("repost_count")
+    repost_value = media.get("media_repost_count") if media.get("media_repost_count") is not None else media.get("repost_count")
+    repost_count = 0 if repost_value is None else exact_nonnegative_integer(repost_value)
     return {
         "userId": str(user.get("pk") or user.get("pk_id") or user.get("id") or "").strip(),
         "username": str(user.get("username") or "").strip(),
@@ -700,7 +704,7 @@ def metadata_from_media(
         "followerSourceField": "follower_count" if follower_count is not None else None,
         "likeCount": exact_nonnegative_integer(media.get("like_count")),
         "commentCount": exact_nonnegative_integer(media.get("comment_count")),
-        "repostCount": exact_nonnegative_integer(repost_count),
+        "repostCount": repost_count,
         "isReel": media_is_reel(media),
     }
 
@@ -899,6 +903,8 @@ def apply_exact_metric_results(
     view_counts: dict[str, int],
     follower_result: dict[str, Any],
 ) -> dict[str, str]:
+    if record.get("repost_count") in (None, ""):
+        record["repost_count"] = 0
     for field in ["like_count", "comment_count", "repost_count"]:
         if exact_nonnegative_integer(record.get(field)) is None:
             return {"status": f"exact_{field}_unavailable", "error": f"Exact Network integer was unavailable for {field}."}
@@ -3418,7 +3424,7 @@ async def run_collector(
             missing_engagement_field = next(
                 (
                     field
-                    for field in ["like_count", "comment_count", "repost_count"]
+                    for field in ["like_count", "comment_count"]
                     if exact_nonnegative_integer(collected.get(field)) is None
                 ),
                 "",
