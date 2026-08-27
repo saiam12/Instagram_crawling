@@ -16,10 +16,12 @@ USER_FIELDS = [
     "user_id",
     "username",
     "biography",
+    "profile_category",
+    "post_count",
     "follower_count",
     "collected_at",
 ]
-FOLLOWER_SNAPSHOT_FIELDS = ["follower_count", "collected_at"]
+PROFILE_SNAPSHOT_FIELDS = ["post_count", "follower_count", "collected_at"]
 LEGACY_FOLLOWER_TIMESTAMP_FIELD = "follower_count_collected_at"
 USER_HISTORY_DIRECTORY = ".collector"
 USER_HISTORY_FILENAME = "users_history_active.csv"
@@ -57,7 +59,7 @@ def _validate_exact_follower_result(result: dict[str, Any]) -> dict[str, Any]:
     if validated.get("status") != "success":
         return validated
     source_field = validated.get("sourceField")
-    if source_field != "edge_followed_by.count":
+    if source_field not in {"edge_followed_by.count", "profile_header_text"}:
         validated.update({
             "status": "untrusted_follower_source",
             "error": f"Rejected follower count from untrusted source field: {source_field or '<missing>'}.",
@@ -68,7 +70,7 @@ def _validate_exact_follower_result(result: dict[str, Any]) -> dict[str, Any]:
     if exact_count is None:
         validated.update({
             "status": "invalid_follower_count",
-            "error": "edge_followed_by.count was not an exact nonnegative integer.",
+            "error": f"{source_field or 'follower source'} was not an exact nonnegative integer.",
             "followerCount": None,
         })
         return validated
@@ -131,7 +133,7 @@ def follower_snapshot_labels(fields: list[str]) -> list[str]:
         match = re.match(r"^(\d+(?:st|nd|rd|th) collect)_(.+)$", field)
         if (
             match
-            and match.group(2) in {*FOLLOWER_SNAPSHOT_FIELDS, LEGACY_FOLLOWER_TIMESTAMP_FIELD}
+            and match.group(2) in {*PROFILE_SNAPSHOT_FIELDS, LEGACY_FOLLOWER_TIMESTAMP_FIELD}
             and match.group(1) not in labels
         ):
             labels.append(match.group(1))
@@ -143,20 +145,24 @@ def follower_snapshot_field(label: str, field: str) -> str:
 
 
 def latest_follower_snapshot(row: dict[str, Any], fields: list[str]) -> dict[str, str]:
+    post_count = str(row.get("post_count", "") or "")
     count = str(row.get("follower_count", "") or "")
     collected_at = str(row.get("collected_at", "") or row.get(LEGACY_FOLLOWER_TIMESTAMP_FIELD, "") or "")
     for label in follower_snapshot_labels(fields):
+        snapshot_post_count = str(row.get(follower_snapshot_field(label, "post_count"), "") or "")
         snapshot_count = str(row.get(follower_snapshot_field(label, "follower_count"), "") or "")
         snapshot_time = str(
             row.get(follower_snapshot_field(label, "collected_at"), "")
             or row.get(follower_snapshot_field(label, LEGACY_FOLLOWER_TIMESTAMP_FIELD), "")
             or ""
         )
+        if snapshot_post_count:
+            post_count = snapshot_post_count
         if snapshot_count:
             count = snapshot_count
         if snapshot_time:
             collected_at = snapshot_time
-    return {"follower_count": count, "collected_at": collected_at}
+    return {"post_count": post_count, "follower_count": count, "collected_at": collected_at}
 
 
 def migrate_user_rows(
@@ -166,7 +172,7 @@ def migrate_user_rows(
     labels = follower_snapshot_labels(fields)
     migrated_fields = [
         *USER_FIELDS,
-        *(f"{label}_{field}" for label in labels for field in FOLLOWER_SNAPSHOT_FIELDS),
+        *(f"{label}_{field}" for label in labels for field in PROFILE_SNAPSHOT_FIELDS),
     ]
     migrated_rows: list[dict[str, str]] = []
     for source in rows:
@@ -300,22 +306,41 @@ class FollowerEnricher:
     def _ensure_snapshot_fields(self, label: str) -> None:
         if label == "Initial":
             return
-        for field in FOLLOWER_SNAPSHOT_FIELDS:
+        for field in PROFILE_SNAPSHOT_FIELDS:
             snapshot_field = follower_snapshot_field(label, field)
             if snapshot_field not in self.user_fields:
                 self.user_fields.append(snapshot_field)
                 for row in self.users.values():
                     row.setdefault(snapshot_field, "")
 
-    def _record_snapshot(self, row: dict[str, Any], label: str, count: Any, collected_at: str) -> None:
+    def _record_snapshot(
+        self,
+        row: dict[str, Any],
+        label: str,
+        follower_count: Any,
+        post_count: Any,
+        collected_at: str,
+    ) -> None:
         self._ensure_snapshot_fields(label)
-        row[follower_snapshot_field(label, "follower_count")] = str(count)
+        row[follower_snapshot_field(label, "post_count")] = "" if post_count is None else str(post_count)
+        row[follower_snapshot_field(label, "follower_count")] = "" if follower_count is None else str(follower_count)
         row[follower_snapshot_field(label, "collected_at")] = collected_at
 
     def _enqueue(self, row: dict[str, Any], *, force: bool = False) -> bool:
         key = str(row["_key"])
-        has_biography = bool(str(row.get("biography", "") or "").strip())
-        if self.stopped or not row.get("username") or key in self.queued or (not force and has_biography and self._is_fresh(row)):
+        # A successful immediate follower lookup may legitimately have an
+        # empty biography or post count.  Those optional profile fields must
+        # not cause the same account to be queued again for another follower
+        # request in the same run.  A failed lookup without a count remains
+        # eligible for a later retry.
+        latest = latest_follower_snapshot(row, self.user_fields)
+        has_exact_follower_snapshot = bool(str(latest.get("follower_count", "") or "").strip())
+        if (
+            self.stopped
+            or not row.get("username")
+            or key in self.queued
+            or (not force and has_exact_follower_snapshot and self._is_fresh(row))
+        ):
             return False
         row["lookup_status"] = "queued"
         row["last_error"] = ""
@@ -417,8 +442,18 @@ class FollowerEnricher:
         row["last_error"] = str(result.get("error", ""))[:500]
         if "biography" in result:
             row["biography"] = str(result.get("biography") or "")
+        if "profile_category" in result:
+            row["profile_category"] = str(result.get("profile_category") or "")
+        if "postCount" in result:
+            row["post_count"] = "" if result.get("postCount") is None else str(result.get("postCount"))
         if status == "success":
-            self._record_snapshot(row, label, result.get("followerCount", ""), collected_at)
+            self._record_snapshot(
+                row,
+                label,
+                result.get("followerCount", ""),
+                result.get("postCount"),
+                collected_at,
+            )
             self.stats["success"] += 1
         elif status in {"not_professional_or_unavailable", "profile_unavailable"}:
             self.stats["unavailable"] += 1

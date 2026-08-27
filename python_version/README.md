@@ -63,16 +63,19 @@ python -m venv .venv
 
 조회수·팔로워 수·좋아요·댓글·리포스트는 Instagram Response의 원본 정수만 저장합니다.
 화면의 `2.4만`, `36K`, `1.6M` 같은 축약 표기는 손실된 자릿수를 복원할 수 없으므로 사용하지 않습니다.
-각 릴스는 상세 화면이 안정될 때까지 기본 2초를 기다린 뒤 로그인된 브라우저 안에서 Instagram 내부 `media info` 읽기 요청을 한 번 실행합니다.
-`--direct-reel-info-wait-seconds 3`처럼 초 단위로 조절할 수 있으며, `0`이면 기다리지 않고 즉시 실행합니다.
+각 릴스는 상세 화면이 안정될 때까지 기본 3초를 기다린 뒤 로그인된 브라우저 안에서 Instagram 내부 `media info` 읽기 요청을 실행합니다.
+지표가 빠졌거나 일시적 요청 오류가 나면 기본 3회까지 `2초`, `4초` 간격으로 다시 확인합니다.
+`--direct-reel-info-wait-seconds 3`과 `--exact-metric-attempts 3`처럼 조절할 수 있으며, 대기 시간을 `0`으로 설정하면 즉시 재시도합니다.
 여기서 대상 shortcode의 `play_count`, 좋아요·댓글·리포스트 원본 정수를 모두 받으면 느린 상세 페이지
 재탐색과 작성자 Reels 스크롤을 생략합니다. 이 요청은 유료 Graph API가 아니므로 API 키나 건당 요금이
 없지만, Instagram의 요청 제한은 적용될 수 있습니다. 직접 요청이 실패하거나 필드가 빠지면 작성자
-Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동 전환합니다. `media info`의
+Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동 전환합니다. 프로필 팔로워 조회의 일시적 웹 오류도
+동일한 횟수만큼 새 페이지에서 재시도합니다. 401·403·429·로그인·챌린지 제한은 반복 요청하지 않습니다. `media info`의
 `item.user.follower_count`가 정확한 0 이상의 정수로 확인되면 그 값을 릴스 저장에 바로 사용합니다.
-저장된 작성자는 백그라운드 `web_profile_info` 조회로 정확 팔로워 수와 `biography`(프로필 소개글)를
-`users.csv`·`users.xlsx`에 기록합니다. 이 추가 조회가 실패해도 릴스 저장 결과와 직접 확인한 팔로워 수는 유지하며,
-소개글만 빈칸으로 둡니다.
+저장된 작성자는 백그라운드 `web_profile_info` 조회로 정확 팔로워 수, 전체 `post_count`(게시물 수),
+`biography`(프로필 소개글), `profile_category`(예: `의류(브랜드)`)를 `users.csv`·`users.xlsx`에 기록합니다.
+이 추가 조회가 실패해도 프로필 화면에 축약되지 않은 전체 정수(예: `팔로워 3230`, `게시물 2078`)가 보이면 그 값을 자동으로 사용합니다.
+`1.6만`·`3.2K`처럼 원래 정수를 알 수 없는 축약 표기는 사용하지 않습니다.
 정확값을 얻지 못한 후보는 저장하거나 `--max-items` 완료 개수에 포함하지 않고 다음 후보로 넘어갑니다.
 터미널의 릴스 진행 표시는 실제로 저장된 릴스만 `[현재 저장 수/목표] URL` 형식으로 카운트합니다.
 `[METRIC]` 디버그 줄은 콘솔에 출력하지 않습니다. 원본 필드 검증은 수집 내부에서 유지합니다.
@@ -80,27 +83,68 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 
 ## 패션·뷰티 승인 수집
 
-다음 명령은 패션과 뷰티를 서로 분리된 데이터 세트로 함께 수집합니다.
+세 가지 예약 수집 명령을 제공합니다.
 
 ```powershell
-./collector.ps1 fashion
+.\collector.ps1 fashion          # 패션만 30분마다 수집
+.\collector.ps1 beauty           # 화장품·뷰티만 30분마다 수집
+.\collector.ps1 fashion-beauty   # 패션과 화장품·뷰티를 30분마다 교대 수집
 ```
 
-기본 실행 시간은 16시간입니다. 처음 8시간 동안 30분 창마다 패션과 뷰티를 번갈아 탐색하고,
-각 활성 창에서 신규 50개를 목표로 하되 절대 500개를 넘지 않습니다. 최초 수집 후보에는 업로드 후
+저장된 Instagram 로그인 프로필을 사용해 브라우저 창 없이 실행하려면 각 명령 뒤에 `--background`를 붙입니다.
+처음 로그인할 때는 이 옵션을 빼고 실행한 뒤, 이후 실행부터 사용합니다.
+
+```powershell
+.\collector.ps1 fashion --background
+.\collector.ps1 beauty --background
+.\collector.ps1 fashion-beauty --background
+```
+
+최초 수집할 Reel의 업로드 경과일을 바꾸려면 `--maxdays`를 사용합니다. 예를 들어 최근 14일 이내만
+수집하려면 `.\collector.ps1 fashion-beauty --background --maxdays 14`를 실행합니다.
+
+기본 실행 시간은 16시간입니다. 처음 8시간 동안 각 활성 30분 창에서 내장 키워드 12개를 순환해
+검색합니다. `fashion`과 `beauty`는 해당 도메인을 매 창 수집하고, `fashion-beauty`는 패션과
+화장품·뷰티를 창마다 교대합니다. 각 키워드에서 릴스 후보 50개를 확보하며, 신규 수집은 창마다 50개를 목표로 하되 절대 500개를 넘지 않습니다.
+최초 수집 후보에는 업로드 후
 30일 이내 필터를 적용합니다. 각 Reel은 최초 수집과 `+30분`, `+1시간`, `+2시간`, `+4시간`,
 `+8시간` 재수집을 합쳐 최대 여섯 개 스냅샷을 남깁니다. 나머지 8시간에는 신규 탐색 없이 기한이 된
 재수집을 마무리합니다. 옵션을 모두 명시한 같은 실행은 다음과 같습니다.
 
 ```powershell
-./collector.ps1 fashion --duration-hours 16 --discovery-hours 8 --new-items-per-window 50 --max-new-items-per-window 500 --max-upload-age-days 30 --discovery-interval-minutes 30
+.\collector.ps1 fashion-beauty --duration-hours 16 --discovery-hours 8 --new-items-per-window 50 --max-new-items-per-window 500 --max-upload-age-days 30 --discovery-interval-minutes 30
 ```
 
-`--fashion-hashtag-query`와 `--beauty-hashtag-query`로 각 도메인의 내장 키워드를 바꿀 수 있습니다.
-두 데이터 세트는 `data_web\fashion_reels.xlsx`, `data_web\fashion_users.xlsx`,
-`data_web\beauty_reels.xlsx`, `data_web\beauty_users.xlsx`와 같은 도메인별 CSV·JSON·XLSX 및
-상태 파일로 게시되며, 기존 기본 `reels.*`와 `users.*`는 건드리지 않습니다. 도메인별 공개 출력의
-재수집 경과 시간은 `hours_since_previous`로 표시됩니다. Ctrl+C를 한 번 누르면 실행을 중단하고
+패션·뷰티 내장 키워드(각 48개)를 유지한 채 **6시간 동안 신규 Reel만** 수집하고, 재수집 없이
+기본 `data_web\reels.*`와 `data_web\users.*`에 바로 누적하려면 아래의 단일 옵션을 사용합니다.
+최근 365일 이내 업로드된 후보만 대상으로 하며, 한 활성 30분 창에서 키워드 12개를 검색해
+키워드당 최대 50개(최대 600개) 후보를 모두 조건 검사하고, 조건을 통과한 신규 Reel을 최대
+600개 저장합니다. 패션과 뷰티는 30분마다 교대하므로, 다음 활성 창에서 각 도메인의 다음 12개
+키워드 그룹으로 넘어가며 6시간 동안 각 분야의 48개 키워드를 모두 순환합니다.
+
+```powershell
+.\collector.ps1 fashion-beauty --six-hour-new-only --background
+```
+
+`--six-hour-new-only`는 `--duration-hours 6 --new-only --base-output --maxdays 365 --new-items-per-window 600 --max-new-items-per-window 600`를 한 번에 적용합니다.
+이 프리셋에서는 `+30분`·`+1시간` 등의 재수집 작업을 만들거나 실행하지 않습니다. `--background`는
+저장된 로그인 프로필이 있을 때만 추가하세요. 처음 로그인할 때는 빼고 실행하면 됩니다.
+정확 지표는 기본 3회 확인하며, 필요하면 `--exact-metric-attempts 5 --exact-metric-retry-delay-seconds 3`을
+명령 끝에 붙여 더 보수적으로 설정할 수 있습니다.
+
+필요하면 같은 동작을 세부 옵션으로도 지정할 수 있습니다.
+
+```powershell
+.\collector.ps1 fashion-beauty --duration-hours 6 --new-only --base-output --maxdays 365 --new-items-per-window 600 --max-new-items-per-window 600 --background
+```
+
+`--fashion-hashtag-query`와 `--beauty-hashtag-query`로 선택한 도메인의 내장 키워드를 바꿀 수 있습니다.
+각 명령은 선택한 도메인의 `data_web\fashion_reels.xlsx`, `data_web\fashion_users.xlsx`,
+`data_web\beauty_reels.xlsx`, `data_web\beauty_users.xlsx` 같은 CSV·JSON·XLSX 및 상태 파일만
+게시하며, 기존 기본 `reels.*`와 `users.*`는 건드리지 않습니다. 도메인별 공개 출력의
+Reel 파일은 최초 수집과 재수집을 각각 별도 행으로 추가하므로, 기존 행은 바뀌지 않습니다. 재수집 경과 시간은
+`hours_since_previous`로 표시됩니다. 새 실행은 이전 실행에서 이미 기한을 넘긴 재수집을 즉시 연속 처리하지 않고,
+이번 실행에서 최초 수집한 Reel을 `+0.5`, `+1`, `+2`, `+4`, `+8시간`에 재수집합니다. Ctrl+C를 한 번 누르면 실행을 중단하고
 마지막 체크포인트까지 저장된 출력을 보존합니다.
 
 ## 공개 출력 동기화
@@ -138,7 +182,8 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 공개 원본 정수를 확인하지 못한 지표는 이전 값을 복사하거나 축약 표기를 풀지 않고 새 수집 칸을 비워 둔 채 다음 URL로 넘어갑니다.
 
 팔로워는 `media info`의 `item.user.follower_count`가 정확한 0 이상의 정수이면 바로 기록하며 프로필 조회를 생략합니다.
-이 값이 없거나 정확한 정수가 아닐 때만 `web_profile_info`의 `edge_followed_by.count`를 확인합니다. 무로그인 권한으로
+이 값이 없거나 정확한 정수가 아닐 때만 `web_profile_info`의 `edge_followed_by.count`를 확인합니다. 이 요청이 실패해도
+프로필 화면에 축약되지 않은 전체 팔로워 정수가 보이면 자동으로 그 값을 사용합니다. 무로그인 권한으로
 확인할 수 없으면 `web_error`일 때만 최대 3회 재시도한 뒤 해당 새 수집 칸을 비워 두고 다음 릴스로 계속 진행합니다.
 로그인 필요·403·429·필드 누락은 재시도해도 권한이 생기지 않으므로 즉시 빈칸 처리합니다. 이 모드는 BGM을 새로 수집하지 않고
 기존 값을 유지하며, 이전 내부 이력(`data_web\.collector\reels_history_active.csv`)이 없는 URL은 보존할 원본 정보가 없어 저장하지 않습니다.
@@ -149,7 +194,7 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 .\collector.ps1 --max-items 50 --background
 .\collector.ps1 refresh --background
 .\collector.ps1 followers
-./collector.ps1 fashion
+.\collector.ps1 fashion-beauty
 ```
 
 ## 해시태그 직접 수집 예시

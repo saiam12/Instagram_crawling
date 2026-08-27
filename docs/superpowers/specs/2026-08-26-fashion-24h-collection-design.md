@@ -33,17 +33,17 @@
 
 두 도메인의 Reel 공개 형식은 기존 `reels.xlsx`의 열 순서와 재수집 표시 방식을 공유한다. 두 User CSV/XLSX는 수집 회차별 행 이력과 `follower_count_change` 열을 공유한다. 기존 기본 산출물은 이 작업에서 수정하지 않는다.
 
-모든 Reel 수집은 영상 길이를 정수 초 단위의 `video_duration_seconds`로 저장한다. Instagram 응답에서 값을 확인할 수 없으면 빈칸으로 두고 해당 Reel 저장은 계속한다. 팔로워 수를 수집할 때는 같은 프로필 응답의 `biography`(사용자가 작성한 프로필 소개글)를 동일한 User 이력 행에 함께 기록한다. 기본 User 공개 파일에는 직전 팔로워 수집 시각과의 `days_since_previous`를 표시한다. 패션·화장품 공개 Reel/User 파일은 짧은 재수집 간격을 분명하게 보이도록 일 단위 대신 `hours_since_previous`를 사용하며, 값은 `+0.5hour`, `+4hour`처럼 표기한다. 기본 Reel 공개 파일의 기존 일 단위 표기는 바꾸지 않는다.
+모든 Reel 수집은 영상 길이를 정수 초 단위의 `video_duration_seconds`로 저장한다. Instagram 응답에서 값을 확인할 수 없으면 빈칸으로 두고 해당 Reel 저장은 계속한다. 패션·화장품 공개 Reel 파일은 최초 수집과 재수집을 각각 별도 행으로 추가해 기존 행을 변경하지 않는다. 팔로워 수를 수집할 때는 같은 프로필 응답의 `biography`(사용자가 작성한 프로필 소개글)를 동일한 User 이력 행에 함께 기록한다. 기본 User 공개 파일에는 직전 팔로워 수집 시각과의 `days_since_previous`를 표시한다. 패션·화장품 공개 Reel/User 파일은 짧은 재수집 간격을 분명하게 보이도록 일 단위 대신 `hours_since_previous`를 사용하며, 값은 `+0.5hour`, `+4hour`처럼 표기한다. 기본 Reel 공개 파일의 기존 일 단위 표기는 바꾸지 않는다.
 
 ## 명령 인터페이스
 
-`collector.ps1` 및 Python 실행기에 `fashion` 명령을 추가한다. 명령 이름은 기존 승인안을 유지하지만 패션·화장품 두 도메인을 함께 운용한다.
+`collector.ps1` 및 Python 실행기에 세 예약 명령을 제공한다. `fashion`은 패션만, `beauty`는 화장품만, `fashion-beauty`는 패션·화장품 두 도메인을 30분 창마다 교대로 운용한다.
 
 ```powershell
-.\collector.ps1 fashion --duration-hours 16 --discovery-hours 8 --new-items-per-window 50 --max-new-items-per-window 500 --max-upload-age-days 30 --discovery-interval-minutes 30
+.\collector.ps1 fashion-beauty --duration-hours 16 --discovery-hours 8 --new-items-per-window 50 --max-new-items-per-window 500 --max-upload-age-days 30 --discovery-interval-minutes 30
 ```
 
-기본값은 위의 패션·화장품 운영값이다. 별도 키워드 옵션이 없으면 내장 키워드를 순환한다. 각 도메인은 활성 창마다 여섯 개 키워드 묶음을 사용하며, 여덟 번의 활성 창 안에 48개 키워드를 모두 한 번씩 탐색한다. `--fashion-hashtag-query` 또는 `--beauty-hashtag-query`를 주면 해당 도메인의 내장 키워드를 대체한다.
+기본값은 위의 패션·화장품 운영값이다. 별도 키워드 옵션이 없으면 내장 키워드를 순환한다. 각 도메인은 활성 창마다 열두 개 키워드 묶음을 사용하며, 네 번의 활성 창 안에 48개 키워드를 모두 한 번씩 탐색한다. 단독 명령은 해당 도메인을 매 창 탐색하고, `fashion-beauty`는 패션과 화장품을 창마다 교대한다. `--fashion-hashtag-query` 또는 `--beauty-hashtag-query`를 주면 해당 도메인의 내장 키워드를 대체한다.
 
 ## 스케줄러와 수집 순서
 

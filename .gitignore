@@ -18,3 +18,7 @@ AGENTS.md
 .codex_tmp/*
 default_version
 outputs/
+.tmp/
+.tmp_*/
+.codex_tmp/
+*.inspect.ndjson

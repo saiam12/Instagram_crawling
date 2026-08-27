@@ -1,4 +1,4 @@
-"""Serial supervisor for isolated fashion and beauty collection datasets."""
+"""Serial supervisor for fashion and beauty collection datasets."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ import json
 import math
 import os
 import re
+import signal
 import shutil
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -69,12 +71,21 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def datasets(config: RunConfig) -> tuple[DatasetConfig, DatasetConfig]:
+def datasets(config: RunConfig) -> tuple[DatasetConfig, ...]:
     base = config.data_root / ".datasets"
-    return (
-        DatasetConfig("fashion", base / "fashion", config.fashion_keywords),
-        DatasetConfig("beauty", base / "beauty", config.beauty_keywords),
-    )
+    fashion_root = config.data_root if config.base_output else base / "fashion"
+    beauty_root = config.data_root if config.base_output else base / "beauty"
+    available = {
+        "fashion": DatasetConfig("fashion", fashion_root, config.fashion_keywords, config.base_output),
+        "beauty": DatasetConfig("beauty", beauty_root, config.beauty_keywords, config.base_output),
+    }
+    return tuple(available[name] for name in config.domains)
+
+
+def active_dataset_name(config: RunConfig, started_at: datetime, now: datetime) -> Literal["fashion", "beauty"]:
+    if len(config.domains) == 1:
+        return config.domains[0]
+    return window_dataset(started_at, now, config.discovery_interval_minutes)
 
 
 def dataset_by_name(config: RunConfig, name: str) -> DatasetConfig:
@@ -110,7 +121,7 @@ def decide_next_work(
     dataset: DatasetConfig | None = None,
     window_start: datetime | None = None,
 ) -> WorkDecision:
-    selected = dataset or dataset_by_name(config, "fashion")
+    selected = dataset or datasets(config)[0]
     start, end = (
         (window_start, window_start + timedelta(minutes=config.discovery_interval_minutes))
         if window_start is not None
@@ -126,6 +137,8 @@ def decide_next_work(
 
 
 def _public_root(dataset: DatasetConfig) -> Path:
+    if dataset.base_output:
+        return dataset.data_root
     if dataset.data_root.parent.name == ".datasets":
         return dataset.data_root.parent.parent
     return dataset.data_root.parent
@@ -265,7 +278,26 @@ def publish_dataset_outputs(dataset: DatasetConfig) -> dict[str, Path]:
     public_root = _public_root(dataset)
     written: dict[str, Path] = {}
     projections: dict[str, tuple[list[str], list[dict[str, Any]], bool]] = {}
+    reel_history = dataset.data_root / REEL_HISTORY_DIRECTORY / REEL_HISTORY_FILENAME
+
+    # The generic collector creates a wide, one-row-per-Reel public projection.
+    # Scheduled domains instead expose their raw append-only history so every
+    # recollection is a new row and earlier snapshots never change.
+    if reel_history.exists():
+        fields, rows, _changed = _read_csv_projection(reel_history, "reels")
+        destinations = {
+            "reels_csv": public_root / f"{dataset.name}_reels.csv",
+            "reels_json": public_root / f"{dataset.name}_reels.json",
+            "reels_xlsx": public_root / f"{dataset.name}_reels.xlsx",
+        }
+        _atomic_write_csv(destinations["reels_csv"], fields, rows)
+        _write_json_atomic(destinations["reels_json"], rows)
+        _atomic_write_xlsx(destinations["reels_xlsx"], "reels", fields, rows)
+        written.update(destinations)
+
     for kind, source_name in _PUBLIC_SOURCES.items():
+        if reel_history.exists() and kind.startswith("reels_"):
+            continue
         source = dataset.data_root / source_name
         if not source.exists():
             continue
@@ -405,10 +437,21 @@ async def invoke_generic_collector(
     hashtags: Sequence[str] = (),
     urls: Sequence[str] = (),
     max_items: int | None = None,
+    progress_offset: int = 0,
+    stop_event: asyncio.Event | None = None,
 ) -> int:
     selected = dataset_by_name(config, dataset)
     selected.data_root.mkdir(parents=True, exist_ok=True)
-    arguments = ["--data-dir", str(selected.data_root)]
+    arguments = [
+        "--data-dir", str(selected.data_root),
+        "--progress-offset", str(max(0, progress_offset)),
+        "--direct-reel-info-wait-seconds", str(config.direct_reel_info_wait_seconds),
+        "--exact-metric-attempts", str(config.exact_metric_attempts),
+        "--exact-metric-retry-delay-seconds", str(config.exact_metric_retry_delay_seconds),
+        "--hashtag-candidates-per-keyword", str(config.hashtag_candidates_per_keyword),
+    ]
+    if config.background:
+        arguments.append("--background")
     urls_file: Path | None = None
 
     if mode == "discover":
@@ -442,18 +485,31 @@ async def invoke_generic_collector(
         raise ValueError(f"Unknown collection mode: {mode}")
 
     try:
-        return await run_collector(parse_args(arguments))
+        options = parse_args(arguments)
+        if stop_event is None:
+            return await run_collector(options)
+        return await run_collector(
+            options,
+            external_stop_event=stop_event,
+            register_signal_handler=False,
+        )
     finally:
         if urls_file is not None:
             urls_file.unlink(missing_ok=True)
 
 
-def active_window_index(started_at: datetime, now: datetime, interval_minutes: float) -> int:
+def active_window_index(
+    started_at: datetime,
+    now: datetime,
+    interval_minutes: float,
+    *,
+    alternating_domains: bool = True,
+) -> int:
     interval_seconds = float(interval_minutes) * 60
     if interval_seconds <= 0:
         raise ValueError("discovery_interval_minutes must be greater than zero")
     overall_index = max(0, int((now - started_at).total_seconds() // interval_seconds))
-    return overall_index // 2 + 1
+    return overall_index // 2 + 1 if alternating_domains else overall_index + 1
 
 
 def _active_window_start(started_at: datetime, now: datetime, interval_minutes: float) -> datetime:
@@ -480,24 +536,33 @@ def current_status(
     collector_failures: int = 0,
 ) -> dict[str, Any]:
     rows = read_history(dataset)
-    active_name = (
-        window_dataset(started_at, now, config.discovery_interval_minutes)
-        if now < discovery_ends_at
-        else None
-    )
+    active_name = active_dataset_name(config, started_at, now) if now < discovery_ends_at else None
     window_start = _active_window_start(started_at, now, config.discovery_interval_minutes)
     window_end = window_start + timedelta(minutes=config.discovery_interval_minutes)
     current_count = initial_count_in_window(rows, window_start, window_end)
-    pending = due_jobs(dataset, rows, now)
+    pending = (
+        []
+        if config.new_only
+        else [job for job in due_jobs(dataset, rows, now) if job.due_at >= started_at]
+    )
     active_keywords: Sequence[str] = ()
     if active_name == dataset.name:
         active_keywords = keyword_group(
             dataset.keywords,
-            active_window_index(started_at, now, config.discovery_interval_minutes),
+            active_window_index(
+                started_at,
+                now,
+                config.discovery_interval_minutes,
+                alternating_domains=len(config.domains) > 1,
+            ),
         )
     return {
         "dataset": dataset.name,
-        "state": "completed" if now >= ends_at else ("recollection_only" if now >= discovery_ends_at else "running"),
+        "state": (
+            "completed"
+            if now >= ends_at
+            else ("new_only" if config.new_only else ("recollection_only" if now >= discovery_ends_at else "running"))
+        ),
         "started_at": _isoformat(started_at),
         "discovery_ends_at": _isoformat(discovery_ends_at),
         "ends_at": _isoformat(ends_at),
@@ -549,141 +614,178 @@ async def run_fashion_beauty_collection(
     ends_at = started_at + timedelta(hours=config.duration_hours)
     stop_event = asyncio.Event()
     lock_path = config.data_root / ".datasets" / "fashion_beauty_scheduler.lock.json"
-    last_errors = {"fashion": "", "beauty": ""}
-    collector_failures = {"fashion": 0, "beauty": 0}
+    last_errors = {name: "" for name in config.domains}
+    collector_failures = {name: 0 for name in config.domains}
     retry_attempts: dict[tuple[str, str, datetime], int] = {}
     retry_not_before: dict[tuple[str, str, datetime], datetime] = {}
+    completed_new_only_windows: set[tuple[str, datetime]] = set()
     exit_code = 0
+    interrupt_count = 0
+    previous_sigint = signal.getsignal(signal.SIGINT)
 
-    async with SupervisorLock(lock_path):
-        while clock() < ends_at:
-            now = clock()
-            configured_datasets = datasets(config)
-            histories = {dataset.name: read_history(dataset) for dataset in configured_datasets}
-            pending = sorted(
-                (
-                    job
-                    for dataset in configured_datasets
-                    for job in due_jobs(dataset, histories[dataset.name], now)
-                ),
-                key=lambda job: (job.due_at, job.dataset, job.url),
-            )
+    def handle_interrupt(_signum: int, _frame: Any) -> None:
+        nonlocal interrupt_count
+        interrupt_count += 1
+        if interrupt_count == 1:
+            stop_event.set()
+            print("중지 요청: 예약 수집을 멈추고 현재 저장 작업을 마무리합니다.", file=sys.stderr)
+        else:
+            raise KeyboardInterrupt
 
-            wait_seconds = 30.0
-            invoked = False
-            eligible_jobs = [
-                job
-                for job in pending
-                if retry_not_before.get((job.dataset, job.url, job.due_at), now) <= now
-            ]
-
-            if eligible_jobs:
-                next_job = eligible_jobs[0]
-                job_key = (next_job.dataset, next_job.url, next_job.due_at)
-                invoked = True
-                result, error = await _invoke_before_deadline(
-                    invoke,
-                    clock,
-                    ends_at,
-                    config=config,
-                    dataset=next_job.dataset,
-                    mode="recollect",
-                    urls=[next_job.url],
-                )
-                if result:
-                    if exit_code == 0:
-                        exit_code = result
-                    last_errors[next_job.dataset] = error
-                    collector_failures[next_job.dataset] += 1
-                    attempt = retry_attempts.get(job_key, 0) + 1
-                    retry_attempts[job_key] = attempt
-                    wait_seconds = _due_retry_delay(attempt)
-                    retry_not_before[job_key] = clock() + timedelta(seconds=wait_seconds)
-                else:
-                    retry_attempts.pop(job_key, None)
-                    retry_not_before.pop(job_key, None)
-            elif pending:
-                wait_seconds = min(
-                    30.0,
-                    max(
-                        0.0,
-                        min(
-                            (retry_not_before[(job.dataset, job.url, job.due_at)] - now).total_seconds()
-                            for job in pending
+    signal.signal(signal.SIGINT, handle_interrupt)
+    try:
+        async with SupervisorLock(lock_path):
+            while not stop_event.is_set() and clock() < ends_at:
+                now = clock()
+                configured_datasets = datasets(config)
+                histories = {dataset.name: read_history(dataset) for dataset in configured_datasets}
+                pending = (
+                    []
+                    if config.new_only
+                    else sorted(
+                        (
+                            job
+                            for dataset in configured_datasets
+                            for job in due_jobs(dataset, histories[dataset.name], now)
+                            if job.due_at >= started_at
                         ),
-                    ),
-                )
-            elif now < discovery_ends_at:
-                selected = dataset_by_name(
-                    config,
-                    window_dataset(started_at, now, config.discovery_interval_minutes),
-                )
-                window_start = _active_window_start(started_at, now, config.discovery_interval_minutes)
-                decision = decide_next_work(
-                    config,
-                    histories[selected.name],
-                    now,
-                    dataset=selected,
-                    window_start=window_start,
-                )
-                if decision.discover:
-                    batch_size = min(config.new_items_per_window, decision.remaining_capacity)
-                    invocation_deadline = min(
-                        window_start + timedelta(minutes=config.discovery_interval_minutes),
-                        discovery_ends_at,
-                        ends_at,
+                        key=lambda job: (job.due_at, job.dataset, job.url),
                     )
+                )
+
+                wait_seconds = 30.0
+                invoked = False
+                eligible_jobs = [
+                    job
+                    for job in pending
+                    if retry_not_before.get((job.dataset, job.url, job.due_at), now) <= now
+                ]
+
+                if eligible_jobs:
+                    next_job = eligible_jobs[0]
+                    job_key = (next_job.dataset, next_job.url, next_job.due_at)
                     invoked = True
                     result, error = await _invoke_before_deadline(
                         invoke,
                         clock,
-                        invocation_deadline,
+                        ends_at,
                         config=config,
-                        dataset=selected.name,
-                        mode="discover",
-                        hashtags=keyword_group(
-                            selected.keywords,
-                            active_window_index(started_at, now, config.discovery_interval_minutes),
-                        ),
-                        max_items=batch_size,
+                        dataset=next_job.dataset,
+                        mode="recollect",
+                        urls=[next_job.url],
+                        stop_event=stop_event,
                     )
                     if result:
                         if exit_code == 0:
                             exit_code = result
-                        last_errors[selected.name] = error
-                        collector_failures[selected.name] += 1
-
-            status_now = clock()
-            for dataset in configured_datasets:
-                publish_dataset_outputs(dataset)
-                write_dataset_status(
-                    dataset,
-                    current_status(
-                        config,
-                        dataset,
-                        started_at,
-                        discovery_ends_at,
-                        ends_at,
-                        status_now,
-                        last_error=last_errors[dataset.name],
-                        collector_failures=collector_failures[dataset.name],
-                    ),
-                )
-            if status_now < ends_at:
-                if invoked:
-                    await asyncio.sleep(0)
-                else:
-                    remaining_run_seconds = max(0.0, (ends_at - status_now).total_seconds())
-                    await wait_for_stop_or_timeout(
-                        stop_event,
-                        min(wait_seconds, remaining_run_seconds),
+                        last_errors[next_job.dataset] = error
+                        collector_failures[next_job.dataset] += 1
+                        attempt = retry_attempts.get(job_key, 0) + 1
+                        retry_attempts[job_key] = attempt
+                        wait_seconds = _due_retry_delay(attempt)
+                        retry_not_before[job_key] = clock() + timedelta(seconds=wait_seconds)
+                    else:
+                        retry_attempts.pop(job_key, None)
+                        retry_not_before.pop(job_key, None)
+                elif pending:
+                    wait_seconds = min(
+                        30.0,
+                        max(
+                            0.0,
+                            min(
+                                (retry_not_before[(job.dataset, job.url, job.due_at)] - now).total_seconds()
+                                for job in pending
+                            ),
+                        ),
                     )
+                elif now < discovery_ends_at:
+                    selected = dataset_by_name(config, active_dataset_name(config, started_at, now))
+                    window_start = _active_window_start(started_at, now, config.discovery_interval_minutes)
+                    decision = decide_next_work(
+                        config,
+                        histories[selected.name],
+                        now,
+                        dataset=selected,
+                        window_start=window_start,
+                    )
+                    window_key = (selected.name, window_start)
+                    if decision.discover and (not config.new_only or window_key not in completed_new_only_windows):
+                        batch_size = min(config.new_items_per_window, decision.remaining_capacity)
+                        invocation_deadline = min(
+                            window_start + timedelta(minutes=config.discovery_interval_minutes),
+                            discovery_ends_at,
+                            ends_at,
+                        )
+                        invoked = True
+                        result, error = await _invoke_before_deadline(
+                            invoke,
+                            clock,
+                            invocation_deadline,
+                            config=config,
+                            dataset=selected.name,
+                            mode="discover",
+                            hashtags=keyword_group(
+                                selected.keywords,
+                                active_window_index(
+                                    started_at,
+                                    now,
+                                    config.discovery_interval_minutes,
+                                    alternating_domains=len(config.domains) > 1,
+                                ),
+                            ),
+                            max_items=batch_size,
+                            progress_offset=config.max_new_items_per_window - decision.remaining_capacity,
+                            stop_event=stop_event,
+                        )
+                        if result:
+                            if exit_code == 0:
+                                exit_code = result
+                            last_errors[selected.name] = error
+                            collector_failures[selected.name] += 1
+                        elif config.new_only:
+                            # One pass deliberately examines every candidate from this
+                            # keyword group.  Do not rescan the same group merely
+                            # because fewer than the requested number qualified.
+                            completed_new_only_windows.add(window_key)
+
+                status_now = clock()
+                for dataset in configured_datasets:
+                    # The generic collector already publishes the standard
+                    # reels.* and users.* files atomically for base-output
+                    # runs. Do not create domain-prefixed copies there.
+                    if not config.base_output:
+                        publish_dataset_outputs(dataset)
+                    write_dataset_status(
+                        dataset,
+                        current_status(
+                            config,
+                            dataset,
+                            started_at,
+                            discovery_ends_at,
+                            ends_at,
+                            status_now,
+                            last_error=last_errors[dataset.name],
+                            collector_failures=collector_failures[dataset.name],
+                        ),
+                    )
+                if status_now < ends_at and not stop_event.is_set():
+                    if invoked:
+                        await asyncio.sleep(0)
+                    else:
+                        remaining_run_seconds = max(0.0, (ends_at - status_now).total_seconds())
+                        await wait_for_stop_or_timeout(
+                            stop_event,
+                            min(wait_seconds, remaining_run_seconds),
+                        )
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
     return exit_code
 
 
 __all__ = [
     "SupervisorLock",
     "WorkDecision",
+    "active_dataset_name",
     "active_window_index",
     "current_status",
     "dataset_by_name",

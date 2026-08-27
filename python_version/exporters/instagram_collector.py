@@ -23,8 +23,15 @@ XLSX_FILENAME = "instagram_data.xlsx"
 XLSX_INVALID_XML_CHARACTER_PATTERN = re.compile(
     r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]"
 )
-XLSX_NUMERIC_FIELDS = {"collection_number", "video_duration_seconds", "view_count", "follower_count", "follower_count_change", "like_count", "comment_count", "repost_count"}
-XLSX_PERCENT_FIELDS: set[str] = set()
+XLSX_NUMERIC_FIELDS = {"collection_number", "video_duration_seconds", "view_count", "view_count_change", "post_count", "follower_count", "follower_count_change", "like_count", "like_count_change", "comment_count", "comment_count_change", "repost_count", "repost_count_change"}
+XLSX_PERCENT_FIELDS = {"reaction_rate", "reaction_rate_change"}
+XLSX_SIGNED_NUMERIC_FIELDS = {
+    "view_count_change",
+    "like_count_change",
+    "comment_count_change",
+    "repost_count_change",
+    "follower_count_change",
+}
 XLSX_DELTA_FIELDS = {"view_count", "like_count", "comment_count", "repost_count", "follower_count"}
 XLSX_DATE_FIELDS = {"collected_at", "uploaded_at"}
 XLSX_TEXT_IDENTIFIER_FIELDS = {"user_id"}
@@ -34,6 +41,8 @@ XLSX_USERS_FIELDS = [
     "user_id",
     "username",
     "biography",
+    "profile_category",
+    "post_count",
     "follower_count",
     "follower_count_change",
     "collected_at",
@@ -55,6 +64,13 @@ XLSX_REELS_WEB_FIELDS = [
     "comment_count",
     "repost_count",
     "follower_count",
+    "reaction_rate",
+    "view_count_change",
+    "like_count_change",
+    "comment_count_change",
+    "repost_count_change",
+    "follower_count_change",
+    "reaction_rate_change",
 ]
 XLSX_REELS_WEB_HIDDEN_FIELDS = {"location_name"}
 XLSX_REELS_COLUMNS_FIELDS = [
@@ -76,6 +92,13 @@ XLSX_REELS_COLUMNS_FIELDS = [
     "comment_count",
     "repost_count",
     "follower_count",
+    "reaction_rate",
+    "view_count_change",
+    "like_count_change",
+    "comment_count_change",
+    "repost_count_change",
+    "follower_count_change",
+    "reaction_rate_change",
 ]
 XLSX_REELS_ROW_FIELDS = [
     "collection_number",
@@ -84,7 +107,6 @@ XLSX_REELS_ROW_FIELDS = [
 ]
 XLSX_REELS_ROW_DROPPED_FIELDS = {
     "collection_label",
-    "reaction_rate",
     "follower_count_collected_at",
     "follower_lookup_status",
 }
@@ -182,11 +204,11 @@ def _xlsx_project_user_rows(
     """Flatten a user's follower-count columns into collection-history rows."""
     snapshot_indexes: dict[int, dict[str, int]] = {1: {}}
     for field, index in indexes.items():
-        if field in {"follower_count", "collected_at"}:
+        if field in {"post_count", "follower_count", "collected_at"}:
             snapshot_indexes[1][field] = index
             continue
         match = re.fullmatch(
-            r"(\d+)(?:st|nd|rd|th) collect_(follower_count|collected_at)",
+            r"(\d+)(?:st|nd|rd|th) collect_(post_count|follower_count|collected_at)",
             field,
         )
         if match:
@@ -202,13 +224,20 @@ def _xlsx_project_user_rows(
             source_value(row, "user_id"),
             source_value(row, "username"),
             source_value(row, "biography"),
+            source_value(row, "profile_category"),
         ]
         previous_follower_count = ""
         previous_collected_at = ""
         for collection_number in sorted(snapshot_indexes):
             snapshot = snapshot_indexes[collection_number]
+            post_index = snapshot.get("post_count")
             follower_index = snapshot.get("follower_count")
             collected_at_index = snapshot.get("collected_at")
+            post_count = (
+                row[post_index]
+                if post_index is not None and post_index < len(row)
+                else ""
+            )
             follower_count = (
                 row[follower_index]
                 if follower_index is not None and follower_index < len(row)
@@ -219,7 +248,7 @@ def _xlsx_project_user_rows(
                 if collected_at_index is not None and collected_at_index < len(row)
                 else ""
             )
-            if collection_number != 1 and not (follower_count or collected_at):
+            if collection_number != 1 and not (post_count or follower_count or collected_at):
                 continue
             days_since_previous = (
                 _xlsx_elapsed_days(previous_collected_at, collected_at)
@@ -239,6 +268,7 @@ def _xlsx_project_user_rows(
                     str(collection_number),
                     days_since_previous,
                     *identity,
+                    post_count,
                     follower_count,
                     follower_count_change,
                     collected_at,
@@ -378,8 +408,9 @@ def _xlsx_cell(reference: str, value: str, field_name: str, is_header: bool) -> 
         except ValueError:
             pass
     if not is_header and base_field in XLSX_PERCENT_FIELDS and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
-        return f'<c r="{reference}" s="5"><v>{value.strip()}</v></c>'
-    if not is_header and base_field == "follower_count_change" and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
+        style = "7" if base_field == "reaction_rate_change" else "5"
+        return f'<c r="{reference}" s="{style}"><v>{value.strip()}</v></c>'
+    if not is_header and base_field in XLSX_SIGNED_NUMERIC_FIELDS and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
         return f'<c r="{reference}" s="6"><v>{value.strip()}</v></c>'
     if not is_header and base_field in XLSX_NUMERIC_FIELDS and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
         return f'<c r="{reference}" s="4"><v>{value.strip()}</v></c>'
@@ -479,12 +510,12 @@ def write_xlsx_workbook(destination: Path, sheets: list[tuple[str, list[list[str
                 "xl/styles.xml",
                 '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
                 '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-                '<numFmts count="4"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/><numFmt numFmtId="165" formatCode="@"/><numFmt numFmtId="168" formatCode="0.00%"/><numFmt numFmtId="169" formatCode="+#,##0;-#,##0;0"/></numFmts>'
+                '<numFmts count="5"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/><numFmt numFmtId="165" formatCode="@"/><numFmt numFmtId="168" formatCode="0.00%"/><numFmt numFmtId="169" formatCode="+#,##0;-#,##0;0"/><numFmt numFmtId="170" formatCode="+0.00%;-0.00%;0.00%"/></numFmts>'
                 '<fonts count="2"><font><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Aptos"/></font></fonts>'
                 '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF0F766E"/><bgColor indexed="64"/></patternFill></fill></fills>'
                 '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
                 '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-                '<cellXfs count="7"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="169" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+                '<cellXfs count="8"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="169" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="170" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
                 '</styleSheet>',
             )
             for index, (_, rows) in enumerate(sheets, start=1):

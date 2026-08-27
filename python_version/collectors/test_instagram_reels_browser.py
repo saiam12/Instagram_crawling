@@ -118,7 +118,9 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(defaults.storage_layout, "history")
         self.assertEqual(defaults.output_stem, "reels")
         self.assertEqual(defaults.xlsx_layout, "columns")
-        self.assertEqual(getattr(defaults, "direct_reel_info_wait_seconds", None), 2)
+        self.assertEqual(getattr(defaults, "direct_reel_info_wait_seconds", None), 3)
+        self.assertEqual(getattr(defaults, "exact_metric_attempts", None), 3)
+        self.assertEqual(getattr(defaults, "exact_metric_retry_delay_seconds", None), 2)
         self.assertFalse(defaults.no_login)
         self.assertEqual(defaults.data_dir, PYTHON_VERSION_ROOT / "data_web")
         self.assertEqual(defaults.profile_dir, PYTHON_VERSION_ROOT / ".instagram_browser_profile")
@@ -126,12 +128,15 @@ class CollectorUtilityTests(unittest.TestCase):
             "--max-items", "10000", "--page-recycle-items", "250",
             "--checkpoint-items", "500", "--direct-concurrency", "2",
             "--followers-after-reels", "--direct-reel-info-wait-seconds", "4",
+            "--exact-metric-attempts", "4", "--exact-metric-retry-delay-seconds", "3.5",
         ])
         self.assertEqual(options.max_items, 10_000)
         self.assertEqual(options.page_recycle_items, 250)
         self.assertEqual(options.checkpoint_items, 500)
         self.assertEqual(options.direct_concurrency, 1)
         self.assertEqual(getattr(options, "direct_reel_info_wait_seconds", None), 4)
+        self.assertEqual(getattr(options, "exact_metric_attempts", None), 4)
+        self.assertEqual(getattr(options, "exact_metric_retry_delay_seconds", None), 3.5)
         self.assertTrue(options.followers_after_reels)
 
     def test_user_xlsx_contains_current_user_data_and_biography(self) -> None:
@@ -140,8 +145,8 @@ class CollectorUtilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             (data_dir / "users.csv").write_text(
-                "user_id,username,biography,follower_count,collected_at\n"
-                "987654321,profile_user,영상은 릴스탭 눌러주세요~,37293,2026-01-01T00:00:00.000Z\n",
+                "user_id,username,biography,profile_category,post_count,follower_count,collected_at\n"
+                "987654321,profile_user,영상은 릴스탭 눌러주세요~,의류(브랜드),2078,37293,2026-01-01T00:00:00.000Z\n",
                 encoding="utf-8",
             )
             output = writer(data_dir)
@@ -161,20 +166,32 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertIn("영상은 릴스탭 눌러주세요~", worksheet_xml)
         self.assertEqual(public_fields, [
             "collection_number", "days_since_previous", "user_id", "username", "biography",
-            "follower_count", "follower_count_change", "collected_at",
+            "profile_category", "post_count", "follower_count", "follower_count_change", "collected_at",
         ])
         self.assertEqual(xlsx_header, public_fields)
         self.assertEqual(public_rows[0]["follower_count_change"], "")
         self.assertEqual(history_fields, [
-            "user_id", "username", "biography", "follower_count", "collected_at",
+            "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at",
         ])
         self.assertEqual(history_rows[0]["follower_count"], "37293")
+        self.assertEqual(history_rows[0]["profile_category"], "의류(브랜드)")
+        self.assertEqual(history_rows[0]["post_count"], "2078")
 
     def test_direct_reel_info_wait_rejects_negative_and_nonfinite_values(self) -> None:
         self.assertEqual(parse_args(["--direct-reel-info-wait-seconds", "0"]).direct_reel_info_wait_seconds, 0)
         for value in ("-1", "nan", "inf", "-inf"):
             with self.subTest(value=value), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 parse_args(["--direct-reel-info-wait-seconds", value])
+
+    def test_exact_metric_retry_options_are_bounded(self) -> None:
+        for arguments in (
+            ["--exact-metric-attempts", "0"],
+            ["--exact-metric-attempts", "6"],
+            ["--exact-metric-retry-delay-seconds", "-1"],
+            ["--exact-metric-retry-delay-seconds", "nan"],
+        ):
+            with self.subTest(arguments=arguments), redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                parse_args(arguments)
 
     def test_collection_entry_keeps_the_reels_url_in_foreground_login_mode(self) -> None:
         entry_url = getattr(reels_browser, "initial_collection_page_url", None)
@@ -192,9 +209,10 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(parse_hashtag_query('"맛집" OR "서울맛집" OR #맛집'), ["맛집", "서울맛집"])
         self.assertEqual(parse_metric_count("1.2만"), 12_000)
         self.assertEqual(parse_metric_count("3.4M"), 3_400_000)
-        self.assertEqual(hashtag_candidate_limit(100, 12), 36)
-        self.assertEqual(hashtag_candidate_limit(200, 24), 36)
+        self.assertEqual(hashtag_candidate_limit(100, 12), 50)
+        self.assertEqual(hashtag_candidate_limit(200, 24), 50)
         self.assertEqual(hashtag_candidate_limit(0, 6), 0)
+        self.assertEqual(hashtag_candidate_limit(600, 12, 50), 50)
         unlimited = parse_args(["--max-items", "0", "--hashtag-query", '"패션" OR "ootd"'])
         self.assertEqual(unlimited.max_items, 0)
         self.assertEqual(unlimited.hashtags, ["패션", "ootd"])
@@ -1141,6 +1159,86 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["repostCount"], 6)
         self.assertEqual(view_counts, {"BA": 24_585})
 
+    async def test_direct_metric_retry_recovers_missing_first_response(self) -> None:
+        class Page:
+            def __init__(self) -> None:
+                self.requests = 0
+                self.waits: list[int] = []
+
+            async def wait_for_timeout(self, milliseconds: int) -> None:
+                self.waits.append(milliseconds)
+
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                self.requests += 1
+                media: dict[str, object] = {
+                    "code": "BA",
+                    "product_type": "clips",
+                    "user": {"pk": "123", "username": "example"},
+                    "play_count": 24_585,
+                    "like_count": 321,
+                    "comment_count": 45,
+                }
+                if self.requests == 2:
+                    media["media_repost_count"] = 6
+                return {"status": 200, "text": json.dumps({"items": [media]})}
+
+        async def slow_page() -> object:
+            raise AssertionError("A successful direct retry must not open the fallback page")
+
+        page = Page()
+        metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
+            page,
+            "BA",
+            {},
+            slow_page,
+            max_direct_attempts=3,
+            retry_delay_seconds=0.5,
+        )
+
+        self.assertEqual(page.requests, 2)
+        self.assertEqual(page.waits, [500])
+        self.assertEqual(metadata["repostCount"], 6)
+        self.assertEqual(view_counts, {"BA": 24_585})
+
+    async def test_follower_web_lookup_retries_transient_errors_three_times(self) -> None:
+        class Context:
+            async def new_page(self) -> "Page":
+                return Page(self)
+
+        class Page:
+            def __init__(self, context: Context) -> None:
+                self.context = context
+
+            def is_closed(self) -> bool:
+                return False
+
+            async def close(self) -> None:
+                return None
+
+        calls = 0
+
+        async def flaky_lookup(_page: object, _username: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return {"status": "web_error", "error": "temporary", "source": "test"}
+            return {
+                "status": "success",
+                "followerCount": 1_234,
+                "sourceField": "edge_followed_by.count",
+            }
+
+        lookup = reels_browser.SequentialWebFollowerLookup(
+            Page(Context()),
+            max_attempts=3,
+            retry_delay_seconds=0,
+        )
+        with patch.object(reels_browser, "request_web_follower_count", new=flaky_lookup):
+            result = await lookup({"username": "example", "userId": "123"})
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(result["status"], "success")
+
     async def test_prefetched_direct_reel_info_is_reused_without_a_second_request(self) -> None:
         class Page:
             async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
@@ -1884,6 +1982,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
                             "user": {
                                 "username": "example",
                                 "biography": "🌟 영상은 릴스탭 눌러주세요🌟\n💗 누구보다 빠르게 이쁘고 트렌디한 신상템 소개해요 💕",
+                                "category_name": "의류(브랜드)",
+                                "media_count": 2_078,
                                 "edge_followed_by": {"count": 37_293},
                             }
                         }
@@ -1904,7 +2004,50 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             result.get("biography"),
             "🌟 영상은 릴스탭 눌러주세요🌟\n💗 누구보다 빠르게 이쁘고 트렌디한 신상템 소개해요 💕",
         )
+        self.assertEqual(result.get("profile_category"), "의류(브랜드)")
+        self.assertEqual(result.get("postCount"), 2_078)
         self.assertEqual(output.getvalue(), "")
+
+    async def test_follower_lookup_uses_an_exact_visible_profile_header_when_the_endpoint_fails(self) -> None:
+        class Response:
+            status = 200
+
+        class Page:
+            url = ""
+
+            async def goto(self, url: str, **_kwargs: object) -> Response:
+                self.url = url
+                return Response()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+            async def evaluate(self, _script: str, _username: str) -> dict[str, object]:
+                return {
+                    "status": 400,
+                    "text": "{}",
+                    "profileText": "euqele\n게시물 2078 팔로워 3230 팔로우 5111\n의류(브랜드)\n롯데잠실 4층",
+                    "profileTexts": ["팔로워 3230", "의류(브랜드)"],
+                }
+
+        result = await request_web_follower_count(Page(), "euqele")
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["followerCount"], 3_230)
+        self.assertEqual(result["sourceField"], "profile_header_text")
+        self.assertEqual(result["profile_category"], "의류(브랜드)")
+        self.assertEqual(result["postCount"], 2_078)
+
+    def test_visible_profile_follower_parser_rejects_compact_labels(self) -> None:
+        parser = getattr(reels_browser, "exact_visible_profile_follower_count", None)
+        post_parser = getattr(reels_browser, "exact_visible_profile_post_count", None)
+        self.assertIsNotNone(parser)
+        self.assertIsNotNone(post_parser)
+        self.assertEqual(parser("게시물 2078 팔로워 3230 팔로우 5111"), 3_230)
+        self.assertEqual(post_parser("게시물 2078 팔로워 3230 팔로우 5111"), 2_078)
+        self.assertEqual(parser("1.6만 followers"), None)
+        self.assertEqual(post_parser("게시물 2.1만"), None)
+        self.assertEqual(parser("followers 3.2K"), None)
 
     async def test_anonymous_follower_retry_stops_after_three_transient_errors(self) -> None:
         """Catch an anonymous retry loop that can run forever after web errors."""
@@ -2052,14 +2195,16 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(recovered.stats()["rows"], 2)
             self.assertFalse(recovered.journal_path.exists())
 
-    async def test_long_store_exports_one_standard_wide_bundle(self) -> None:
+    async def test_long_store_exports_recollections_as_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             csv_path = Path(directory) / "reels_rows.csv"
-            store = await LongReelStore.create(csv_path, 100, "columns")
+            store = await LongReelStore.create(csv_path, 100, "rows")
             first = reel_record(1, "2026-01-01T00:00:00.000Z")
             second = reel_record(1, "2026-01-01T06:00:00.000Z")
             first["view_count"] = 1_000
             second["view_count"] = 1_250
+            first["follower_count"] = 10_000
+            second["follower_count"] = 10_000
             await store.append(first)
             await store.append(second)
             await store.flush()
@@ -2075,31 +2220,45 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             for path in outputs.values():
                 self.assertTrue(path.exists(), path)
             expected_fields = [
-                "collection_number", "collected_at", "url", "user_id", "username",
+                "collection_number", "days_since_previous", "collected_at", "url", "user_id", "username",
                 "title", "hashtags", "audio_name", "location_name", "ad",
                 "uploaded_at", "video_duration_seconds", "days_since_upload", "view_count", "like_count",
                 "comment_count", "repost_count", "follower_count",
-                "2nd collect_collected_at", "2nd collect_days_since_previous",
-                "2nd collect_days_since_upload", "2nd collect_video_duration_seconds", "2nd collect_view_count",
-                "2nd collect_like_count", "2nd collect_comment_count",
-                "2nd collect_repost_count", "2nd collect_follower_count",
+                "reaction_rate",
+                "view_count_change", "like_count_change", "comment_count_change",
+                "repost_count_change", "follower_count_change", "reaction_rate_change",
             ]
             csv_fields, csv_rows = read_csv_objects(outputs["csv"])
             json_rows = json.loads(outputs["json"].read_text(encoding="utf-8"))
-            self.assertEqual(len(json_rows), 1)
+            self.assertEqual(len(csv_rows), 2)
+            self.assertEqual(len(json_rows), 2)
             self.assertEqual(csv_fields, expected_fields)
             self.assertEqual(list(json_rows[0]), expected_fields)
             self.assertEqual(read_xlsx_header(outputs["xlsx"]), expected_fields)
-            self.assertEqual(csv_rows[0]["collection_number"], "2")
+            self.assertEqual(csv_rows[0]["collection_number"], "1")
+            self.assertEqual(csv_rows[1]["collection_number"], "2")
             self.assertEqual(csv_rows[0]["video_duration_seconds"], "12.5")
-            self.assertEqual(csv_rows[0]["2nd collect_video_duration_seconds"], "12.5")
-            self.assertEqual(csv_rows[0]["2nd collect_days_since_previous"], "+0.3day")
-            self.assertEqual(csv_rows[0]["2nd collect_view_count"], "1,250(+250)")
-            self.assertEqual(json_rows[0]["collection_number"], 2)
+            self.assertEqual(csv_rows[1]["video_duration_seconds"], "12.5")
+            self.assertEqual(csv_rows[1]["days_since_previous"], "0.25")
+            self.assertEqual(csv_rows[1]["view_count"], "1250")
+            self.assertEqual(csv_rows[0]["reaction_rate"], "0.1")
+            self.assertEqual(csv_rows[1]["reaction_rate"], "0.125")
+            self.assertEqual(csv_rows[0]["view_count_change"], "")
+            self.assertEqual(csv_rows[1]["view_count_change"], "250")
+            self.assertEqual(csv_rows[1]["follower_count_change"], "0")
+            self.assertAlmostEqual(float(csv_rows[1]["reaction_rate_change"]), 0.025)
+            self.assertEqual(json_rows[0]["collection_number"], 1)
+            self.assertEqual(json_rows[1]["collection_number"], 2)
             self.assertEqual(json_rows[0]["video_duration_seconds"], 12.5)
-            self.assertEqual(json_rows[0]["2nd collect_video_duration_seconds"], 12.5)
-            self.assertEqual(json_rows[0]["2nd collect_days_since_previous"], "+0.3day")
-            self.assertEqual(json_rows[0]["2nd collect_view_count"], "1,250(+250)")
+            self.assertEqual(json_rows[1]["video_duration_seconds"], 12.5)
+            self.assertEqual(json_rows[1]["days_since_previous"], 0.25)
+            self.assertEqual(json_rows[1]["view_count"], 1_250)
+            self.assertEqual(json_rows[0]["reaction_rate"], 0.1)
+            self.assertEqual(json_rows[1]["reaction_rate"], 0.125)
+            self.assertIsNone(json_rows[0]["view_count_change"])
+            self.assertEqual(json_rows[1]["view_count_change"], 250)
+            self.assertEqual(json_rows[1]["follower_count_change"], 0)
+            self.assertAlmostEqual(json_rows[1]["reaction_rate_change"], 0.025)
             self.assertEqual(
                 read_reel_urls_from_xlsx(outputs["xlsx"]),
                 ["https://www.instagram.com/reels/test_1/"],
@@ -2152,6 +2311,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "followerCount": 37_293,
                 "sourceField": "edge_followed_by.count",
                 "biography": "🌟 영상은 릴스탭 눌러주세요🌟\n매일 신상 코디를 소개해요.",
+                "profile_category": "의류(브랜드)",
+                "postCount": 2_078,
             }
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2162,6 +2323,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("biography", fields)
         self.assertEqual(rows[0].get("biography"), "🌟 영상은 릴스탭 눌러주세요🌟\n매일 신상 코디를 소개해요.")
+        self.assertEqual(rows[0].get("profile_category"), "의류(브랜드)")
+        self.assertEqual(rows[0].get("post_count"), "2078")
         self.assertEqual(rows[0].get("follower_count"), "37293")
         self.assertEqual(rows[0].get("collected_at"), "2026-01-02T03:04:05.000Z")
 
@@ -2176,6 +2339,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
                 return {
                     "status": "success",
                     "followerCount": 123,
+                    "postCount": 456,
                     "biography": "saved profile biography",
                     "error": "",
                     "source": "test",
@@ -2196,11 +2360,11 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             fields, rows = read_csv_objects(user_history_path(directory))
             self.assertEqual(rows[0]["2nd collect_follower_count"], "123")
             self.assertEqual(fields, [
-                "user_id", "username", "biography", "follower_count", "collected_at",
-                "2nd collect_follower_count", "2nd collect_collected_at",
+                "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at",
+                "2nd collect_post_count", "2nd collect_follower_count", "2nd collect_collected_at",
             ])
 
-    async def test_follower_enricher_refreshes_a_fresh_legacy_user_without_biography(self) -> None:
+    async def test_follower_enricher_does_not_requery_a_fresh_user_without_biography(self) -> None:
         current = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
         calls = 0
 
@@ -2226,8 +2390,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             await enricher.drain()
             _fields, rows = read_csv_objects(user_history_path(directory))
 
-        self.assertEqual(calls, 1)
-        self.assertEqual(rows[0].get("biography"), "영상은 릴스탭 눌러주세요~")
+        self.assertEqual(calls, 0)
+        self.assertEqual(rows[0].get("biography"), "")
 
     async def test_immediate_follower_lookup_bypasses_a_fresh_legacy_cache(self) -> None:
         current = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -2257,6 +2421,30 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["follower_count"], "37293")
             self.assertEqual(result.get("followerCount"), 37_293)
             self.assertEqual(result.get("sourceField"), "edge_followed_by.count")
+
+    async def test_immediate_follower_lookup_is_not_queued_again_when_optional_profile_fields_are_empty(self) -> None:
+        current = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+        calls = 0
+
+        async def lookup(_payload: dict[str, str]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {
+                "status": "success",
+                "followerCount": 8_191,
+                "sourceField": "edge_followed_by.count",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            enricher = FollowerEnricher(data_dir=directory, lookup_impl=lookup, now=lambda: current)
+            payload = {"user_id": "987654321", "username": "same_user", "seen_at": current.isoformat()}
+
+            result = await enricher.lookup_user_now(**payload)
+            await enricher.track_user(**payload)
+            await enricher.drain()
+
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(calls, 1)
 
     async def test_immediate_exact_follower_lookup_accepts_a_large_drop_from_legacy_data(self) -> None:
         current = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -2292,7 +2480,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows[0]["2nd collect_follower_count"], "48000")
             self.assertEqual(fields[-2:], ["2nd collect_follower_count", "2nd collect_collected_at"])
 
-    async def test_immediate_follower_lookup_rejects_an_untrusted_success_source(self) -> None:
+    async def test_immediate_follower_lookup_accepts_a_full_visible_profile_header_count(self) -> None:
         async def lookup(_payload: dict[str, str]) -> dict[str, object]:
             return {
                 "status": "success",
@@ -2306,11 +2494,10 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             await enricher.drain()
             fields, rows = read_csv_objects(user_history_path(directory))
 
-            self.assertEqual(result["status"], "untrusted_follower_source")
-            self.assertIsNone(result.get("followerCount"))
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result.get("followerCount"), 37_293)
             self.assertEqual(result.get("sourceField"), "profile_header_text")
-            self.assertNotIn("follower_count", fields[4:])
-            self.assertEqual(rows[0]["follower_count"], "")
+            self.assertEqual(rows[0]["follower_count"], "37293")
 
     async def test_immediate_follower_lookup_rejects_non_integer_network_counts(self) -> None:
         invalid_values: list[object] = ["37293", True, -1]
@@ -2414,7 +2601,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             await enricher.ready()
             fields, rows = read_csv_objects(user_history_path(directory))
 
-            self.assertEqual(fields, ["user_id", "username", "biography", "follower_count", "collected_at"])
+            self.assertEqual(fields, ["user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at"])
             self.assertEqual(rows[0]["collected_at"], "2026-01-01T00:00:00Z")
 
     async def test_follower_queue_stops_after_five_web_errors(self) -> None:

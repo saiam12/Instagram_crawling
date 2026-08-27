@@ -1,9 +1,17 @@
 import unittest
 
-from exporters.instagram_collector import _xlsx_project_rows
+from exporters.instagram_collector import _xlsx_cell, _xlsx_project_rows
 
 
 class XlsxCollectionTimingTests(unittest.TestCase):
+    def test_change_cells_use_signed_formats_except_for_zero(self) -> None:
+        for value in ("19", "-1", "0"):
+            with self.subTest(value=value):
+                self.assertIn('s="6"', _xlsx_cell("A2", value, "view_count_change", False))
+        for value in ("0.25", "-0.25", "0"):
+            with self.subTest(value=value):
+                self.assertIn('s="7"', _xlsx_cell("B2", value, "reaction_rate_change", False))
+
     def test_view_count_is_numeric_and_wide_refresh_gets_delta(self) -> None:
         rows = [[
             "url",
@@ -233,7 +241,7 @@ class XlsxCollectionTimingTests(unittest.TestCase):
                     "2026-01-03T00:00:00Z",
                 ])
 
-    def test_retired_reel_fields_are_not_exported(self) -> None:
+    def test_reel_reaction_rate_is_exported_as_a_fixed_field(self) -> None:
         rows = [[
             "url",
             "collected_at",
@@ -252,7 +260,7 @@ class XlsxCollectionTimingTests(unittest.TestCase):
 
         projected = _xlsx_project_rows("reels_rows", rows)
 
-        self.assertNotIn("reaction_rate", projected[0])
+        self.assertIn("reaction_rate", projected[0])
         self.assertNotIn("follower_count_collected_at", projected[0])
         self.assertNotIn("follower_lookup_status", projected[0])
 

@@ -11,6 +11,9 @@ from typing import Any, Literal, Sequence
 from urllib.parse import urlsplit
 
 
+KEYWORDS_PER_WINDOW = 12
+
+
 FASHION_KEYWORDS: Sequence[str] = (
     "패션", "데일리룩", "오오티디", "오늘의코디", "코디추천", "패션스타그램",
     "여자코디", "남자코디", "미니멀룩", "스트릿패션", "캐주얼룩", "빈티지룩",
@@ -48,6 +51,7 @@ class DatasetConfig:
     name: Literal["fashion", "beauty"]
     data_root: Path
     keywords: Sequence[str]
+    base_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,8 +63,16 @@ class RunConfig:
     new_items_per_window: int = 50
     max_new_items_per_window: int = 500
     max_upload_age_days: float = 30
+    background: bool = False
+    direct_reel_info_wait_seconds: float = 3
+    exact_metric_attempts: int = 3
+    exact_metric_retry_delay_seconds: float = 2
+    hashtag_candidates_per_keyword: int = 50
+    new_only: bool = False
+    base_output: bool = False
     fashion_keywords: Sequence[str] = FASHION_KEYWORDS
     beauty_keywords: Sequence[str] = BEAUTY_KEYWORDS
+    domains: tuple[Literal["fashion", "beauty"], ...] = ("fashion", "beauty")
 
 
 @dataclass(frozen=True)
@@ -173,9 +185,9 @@ def keyword_group(keywords: Sequence[str], active_window_number: int) -> tuple[s
         raise ValueError("keywords must contain at least one entry")
     if active_window_number < 1:
         raise ValueError("active_window_number must be one-based")
-    group_count = math.ceil(len(keywords) / 6)
-    start = ((int(active_window_number) - 1) % group_count) * 6
-    return tuple(keywords[start : start + 6])
+    group_count = math.ceil(len(keywords) / KEYWORDS_PER_WINDOW)
+    start = ((int(active_window_number) - 1) % group_count) * KEYWORDS_PER_WINDOW
+    return tuple(keywords[start : start + KEYWORDS_PER_WINDOW])
 
 
 def initial_count_in_window(rows: list[dict[str, Any]], start: datetime, end: datetime) -> int:
@@ -217,6 +229,7 @@ def is_initial_candidate_allowed(uploaded_at: Any, collected_at: Any, max_days: 
 __all__ = [
     "BEAUTY_KEYWORDS",
     "FASHION_KEYWORDS",
+    "KEYWORDS_PER_WINDOW",
     "SNAPSHOT_OFFSETS",
     "DatasetConfig",
     "DueJob",

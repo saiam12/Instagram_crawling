@@ -81,14 +81,28 @@ RECOLLECT_FIELDS = [
 ]
 # Keep refreshes ordered without exposing labels such as "Initial" and
 # "2nd collect" in the row-oriented output files.
-ROW_COLLECTION_FIELDS = ["collection_number", "days_since_previous", *CSV_FIELDS]
+REEL_CHANGE_METRICS = [
+    "view_count",
+    "like_count",
+    "comment_count",
+    "repost_count",
+    "follower_count",
+]
+REEL_METRIC_CHANGE_FIELDS = [f"{field}_change" for field in REEL_CHANGE_METRICS]
+REEL_CHANGE_FIELDS = [*REEL_METRIC_CHANGE_FIELDS, "reaction_rate_change"]
+ROW_COLLECTION_FIELDS = [
+    "collection_number",
+    "days_since_previous",
+    *CSV_FIELDS,
+    "reaction_rate",
+    *REEL_CHANGE_FIELDS,
+]
 REEL_HISTORY_DIRECTORY = ".collector"
 REEL_HISTORY_FILENAME = "reels_history_active.csv"
 LEGACY_REEL_HISTORY_FILENAMES = ("reels_history.csv",)
 PUBLIC_REELS_STEM = "reels"
 LEGACY_REEL_DROPPED_FIELDS = {
     "collection_label",
-    "reaction_rate",
     "follower_count_collected_at",
     "follower_lookup_status",
 }
@@ -114,6 +128,8 @@ DIRECT_REEL_CONCURRENCY = 1
 DIRECT_REEL_SETTLE_MILLISECONDS = 250
 DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS = 700
 DIRECT_REEL_INFO_TIMEOUT_SECONDS = 5.0
+EXACT_METRIC_MAX_ATTEMPTS = 3
+EXACT_METRIC_RETRY_DELAY_SECONDS = 2.0
 EXACT_REEL_DETAIL_SETTLE_MILLISECONDS = 1_000
 EXACT_REEL_DETAIL_TIMEOUT_MILLISECONDS = 3_000
 EXACT_REEL_DETAIL_POLL_MILLISECONDS = 150
@@ -121,6 +137,8 @@ EXACT_REEL_DETAIL_PAGE_ATTEMPTS = 3
 EXACT_REEL_DETAIL_RETRY_DELAY_MILLISECONDS = 1_500
 ANONYMOUS_FOLLOWER_MAX_ATTEMPTS = 3
 ANONYMOUS_FOLLOWER_RETRY_SECONDS = 1.0
+FOLLOWER_WEB_MAX_ATTEMPTS = 3
+FOLLOWER_WEB_RETRY_DELAY_SECONDS = 2.0
 RECOLLECT_COOLDOWN_SCHEDULE = [
     {"label": "6시간", "seconds": 6 * 60 * 60},
     {"label": "1일", "seconds": 24 * 60 * 60},
@@ -132,6 +150,9 @@ RECOLLECT_COOLDOWN_SCHEDULE = [
 PROFILE_INFO_TEXT_PATTERN = re.compile(
     r"(?:계정\s*정보|프로필|about\s+this\s+account|account\s+(?:info|information)|view\s+profile|profile)",
     re.I,
+)
+PROFILE_CATEGORY_TEXT_PATTERN = re.compile(
+    r"^[^\r\n]{1,100}\([^\r\n()]{1,60}\)$"
 )
 INSTAGRAM_USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 
@@ -328,6 +349,67 @@ def parse_metric_count(value: Any) -> int | str:
     return js_round(number) if math.isfinite(number) else ""
 
 
+def calculate_reaction_rate(view_count: Any, follower_count: Any) -> float | str:
+    """Return views divided by followers, or an empty value when unavailable."""
+    views = parse_metric_count(view_count)
+    followers = parse_metric_count(follower_count)
+    if not isinstance(views, int) or not isinstance(followers, int) or followers <= 0:
+        return ""
+    return views / followers
+
+
+def calculate_reel_derived_fields(
+    current: dict[str, Any], previous: dict[str, Any] | None,
+) -> dict[str, float | int | str]:
+    """Calculate stable rate and change fields for one collection-history row."""
+    reaction_rate = calculate_reaction_rate(
+        current.get("view_count"), current.get("follower_count")
+    )
+    derived: dict[str, float | int | str] = {"reaction_rate": reaction_rate}
+    if previous is None:
+        return {**derived, **{field: "" for field in REEL_CHANGE_FIELDS}}
+
+    for field in REEL_CHANGE_METRICS:
+        current_value = parse_metric_count(current.get(field))
+        previous_value = parse_metric_count(previous.get(field))
+        derived[f"{field}_change"] = (
+            current_value - previous_value
+            if isinstance(current_value, int) and isinstance(previous_value, int)
+            else ""
+        )
+
+    previous_rate = calculate_reaction_rate(
+        previous.get("view_count"), previous.get("follower_count")
+    )
+    derived["reaction_rate_change"] = (
+        reaction_rate - previous_rate
+        if isinstance(reaction_rate, float) and isinstance(previous_rate, float)
+        else ""
+    )
+    return derived
+
+
+def enrich_reel_collection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add calculated fields while comparing each Reel with its prior collection."""
+    enriched: list[dict[str, Any]] = [{} for _ in rows]
+    latest_by_url: dict[str, dict[str, Any]] = {}
+    ordered_rows = sorted(
+        enumerate(rows),
+        key=lambda item: (
+            (normalize_reel_url(item[1].get("url")) or {"url": str(item[1].get("url", "") or "")})["url"],
+            parse_datetime(item[1].get("collected_at"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+            item[0],
+        ),
+    )
+    for index, row in ordered_rows:
+        normalized = normalize_reel_url(row.get("url"))
+        url = normalized["url"] if normalized else str(row.get("url", "") or "")
+        enriched[index] = {**row, **calculate_reel_derived_fields(row, latest_by_url.get(url))}
+        latest_by_url[url] = row
+    return enriched
+
+
 def parse_follower_count(value: Any) -> int | str:
     text = str("" if value is None else value).replace("\u00a0", " ").strip()
     number = r"([0-9][0-9,.]*)\s*(천|만|억|[KMB])?"
@@ -361,6 +443,87 @@ def follower_count_success(count: int, source_field: str) -> dict[str, Any]:
         "source": "instagram_web",
         "sourceField": source_field,
     }
+
+
+def exact_visible_profile_follower_count(value: Any) -> int | None:
+    """Read a full integer follower value from the rendered profile header.
+
+    Compact labels such as ``1.6만`` and ``3.2K`` are deliberately rejected:
+    their original integer cannot be recovered exactly.  The profile header is
+    only used when Instagram visibly renders a complete integer.
+    """
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    number = r"(?P<count>\d{1,3}(?:,\d{3})*|\d+)"
+    suffix = r"(?![\d.]|\s*(?:천|만|억|[KMB]))"
+    patterns = [
+        re.compile(rf"(?:팔로워|followers?)\s*[:：]?\s*{number}{suffix}", re.I),
+        re.compile(rf"{number}{suffix}\s*(?:팔로워|followers?)", re.I),
+    ]
+    for raw in values:
+        text = str(raw or "").replace("\u00a0", " ")
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            try:
+                return int(match.group("count").replace(",", ""))
+            except ValueError:
+                continue
+    return None
+
+
+def exact_visible_profile_post_count(value: Any) -> int | None:
+    """Read a full integer post count from the rendered profile header."""
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    number = r"(?P<count>\d{1,3}(?:,\d{3})*|\d+)"
+    suffix = r"(?![\d.]|\s*(?:천|만|억|[KMB]))"
+    patterns = [
+        re.compile(rf"(?:게시물|posts?)\s*[:：]?\s*{number}{suffix}", re.I),
+        re.compile(rf"{number}{suffix}\s*(?:게시물|posts?)", re.I),
+    ]
+    for raw in values:
+        text = str(raw or "").replace("\u00a0", " ")
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            try:
+                return int(match.group("count").replace(",", ""))
+            except ValueError:
+                continue
+    return None
+
+
+def exact_profile_post_count(user: dict[str, Any]) -> int | None:
+    """Use the API's full media count when available, otherwise return None."""
+    for field in ["media_count", "post_count", "posts_count"]:
+        count = exact_nonnegative_integer(user.get(field))
+        if count is not None:
+            return count
+    return None
+
+
+def profile_category_from_data(user: dict[str, Any]) -> str:
+    """Return Instagram's professional-account category when it is supplied."""
+    for field in ["category_name", "business_category_name", "professional_category", "category"]:
+        candidate = user.get(field)
+        if isinstance(candidate, dict):
+            candidate = candidate.get("name") or candidate.get("title") or candidate.get("label")
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def profile_category_from_visible_text(value: Any) -> str:
+    """Keep visible professional categories such as ``의류(브랜드)`` as user data."""
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    for raw in values:
+        for line in re.split(r"[\r\n]+", str(raw or "")):
+            text = re.sub(r"\s+", " ", line).strip()
+            if PROFILE_CATEGORY_TEXT_PATTERN.fullmatch(text):
+                return text
+    return ""
 
 
 def follower_count_from_instagram_data(value: Any, username: str, depth: int = 0) -> int | str:
@@ -605,6 +768,14 @@ def direct_reel_info_diagnostic_message(diagnostic: dict[str, str] | None, missi
     return str(result.get("error") or "").strip()
 
 
+def is_direct_reel_info_access_denied(diagnostic: dict[str, str] | None) -> bool:
+    """Identify request statuses that must not be retried in the same session."""
+    result = diagnostic or {}
+    return result.get("status") == "http_error" and bool(
+        re.search(r"\bHTTP\s+(?:401|403|429)\b", str(result.get("error") or ""))
+    )
+
+
 def collect_reel_metadata(value: Any, destination: dict[str, dict[str, Any]], depth: int = 0) -> None:
     if not isinstance(value, (dict, list)) or depth > 16:
         return
@@ -709,7 +880,7 @@ def build_anonymous_refresh_from_exact_metrics(
     candidate["follower_count"] = (
         follower_count
         if follower_result.get("status") == "success"
-        and follower_result.get("sourceField") in {"follower_count", "edge_followed_by.count"}
+        and follower_result.get("sourceField") in {"follower_count", "edge_followed_by.count", "profile_header_text"}
         and follower_count is not None
         else ""
     )
@@ -737,7 +908,7 @@ def apply_exact_metric_results(
     follower_count = exact_nonnegative_integer(follower_result.get("followerCount"))
     if (
         follower_result.get("status") != "success"
-        or follower_result.get("sourceField") not in {"follower_count", "edge_followed_by.count"}
+        or follower_result.get("sourceField") not in {"follower_count", "edge_followed_by.count", "profile_header_text"}
         or follower_count is None
     ):
         return {
@@ -801,10 +972,17 @@ def collection_label(collection_number: int) -> str:
     return f"{collection_number}{suffix} collect"
 
 
-def stored_reel_progress_line(stored_count: int, max_items: int, url: str) -> str:
+def stored_reel_progress_line(
+    stored_count: int,
+    max_items: int,
+    url: str,
+    *,
+    progress_offset: int = 0,
+) -> str:
     """Format progress for Reels that were actually appended to the store."""
-    target = str(max_items) if max_items else "전체"
-    return f"[{stored_count}/{target}] {url}"
+    offset = max(0, progress_offset)
+    target = str(max_items + offset) if max_items else "전체"
+    return f"[{stored_count + offset}/{target}] {url}"
 
 
 def latest_field_value(row: dict[str, Any], fields: list[str], base_field: str, stop_before_label: str = "") -> str:
@@ -939,10 +1117,21 @@ def _json_field_value(field: str, value: Any) -> Any:
     base_field = parsed_snapshot["baseField"] if parsed_snapshot else field
     if base_field == "ad":
         return str(value).strip().lower() == "true"
-    if base_field in {"collection_number", "view_count", "like_count", "comment_count", "repost_count", "follower_count"}:
+    if base_field in {
+        "collection_number",
+        "view_count",
+        "like_count",
+        "comment_count",
+        "repost_count",
+        "follower_count",
+        *REEL_METRIC_CHANGE_FIELDS,
+    }:
         text = str(value).strip().replace(",", "")
         return int(text) if re.fullmatch(r"-?\d+", text) else value
     if base_field in {"days_since_previous", "days_since_upload"}:
+        text = str(value).strip()
+        return float(text) if re.fullmatch(r"-?(?:\d+(?:\.\d+)?|\.\d+)", text) else value
+    if base_field in {"reaction_rate", "reaction_rate_change"}:
         text = str(value).strip()
         return float(text) if re.fullmatch(r"-?(?:\d+(?:\.\d+)?|\.\d+)", text) else value
     if base_field == "video_duration_seconds":
@@ -1010,7 +1199,7 @@ def write_users_xlsx(data_dir: Path | str) -> Path:
     destination = Path(data_dir).resolve()
     fields, rows = read_csv_objects(ensure_user_history(destination))
     if not fields:
-        fields = ["user_id", "username", "biography", "follower_count", "collected_at"]
+        fields = ["user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at"]
     public_fields, public_rows = project_public_records("users", rows, fields)
     write_csv_records(destination / "users.csv", public_rows, public_fields)
     return write_reel_xlsx(
@@ -1081,8 +1270,18 @@ def write_long_output_bundle(
         if csv_path.parent.name == REEL_HISTORY_DIRECTORY
         else csv_path.parent
     )
-    wide_fields, wide_rows = long_rows_to_wide(rows)
-    public_fields, public_rows = project_public_records("reels", wide_rows, wide_fields)
+    # Preserve one record per collection in every public export.  Recollecting
+    # a Reel therefore appends a row instead of generating ``2nd collect_*``
+    # snapshot columns.
+    public_fields = [*fields, *([] if "reaction_rate" in fields else ["reaction_rate"])]
+    public_fields = [
+        *public_fields,
+        *(field for field in REEL_CHANGE_FIELDS if field not in public_fields),
+    ]
+    public_source_rows = enrich_reel_collection_rows(rows)
+    public_fields, public_rows = project_public_records(
+        "reels_rows", public_source_rows, public_fields
+    )
     public_csv = destination / f"{PUBLIC_REELS_STEM}.csv"
     public_json = destination / f"{PUBLIC_REELS_STEM}.json"
     public_xlsx = destination / f"{PUBLIC_REELS_STEM}.xlsx"
@@ -1095,7 +1294,7 @@ def write_long_output_bundle(
             public_xlsx,
             public_rows,
             public_fields,
-            layout="columns",
+            layout="rows",
             sheet_name="reels",
             project_rows=False,
         ),
@@ -1289,6 +1488,7 @@ def integrate_long_collected_record(
         "collection_number": collection_number,
         "days_since_previous": elapsed,
         **current,
+        **calculate_reel_derived_fields(current, previous),
     }
     rows.append(row)
     return {
@@ -1336,7 +1536,10 @@ class LongReelStore:
                 compatible = all(field in {*ROW_COLLECTION_FIELDS, *LEGACY_REEL_DROPPED_FIELDS} for field in legacy_fields)
                 if not compatible:
                     continue
-                store.rows = [{field: row.get(field, "") for field in store.fields} for row in legacy_rows]
+                store.rows = enrich_reel_collection_rows([
+                    {field: row.get(field, "") for field in store.fields}
+                    for row in legacy_rows
+                ])
                 await asyncio.to_thread(write_csv_records, store.csv_path, store.rows, store.fields)
                 legacy_journal = Path(f"{legacy_path}.pending.jsonl")
                 if legacy_journal.exists() and legacy_journal.stat().st_size:
@@ -1349,7 +1552,10 @@ class LongReelStore:
             # Retired columns are read once and omitted on the next atomic write.
             compatible = all(field in {*ROW_COLLECTION_FIELDS, *LEGACY_REEL_DROPPED_FIELDS} for field in fields)
             if compatible:
-                store.rows = [{field: row.get(field, "") for field in store.fields} for row in rows]
+                store.rows = enrich_reel_collection_rows([
+                    {field: row.get(field, "") for field in store.fields}
+                    for row in rows
+                ])
             else:
                 stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
                 legacy = store.csv_path.with_name(f"{store.csv_path.stem}_legacy_{stamp}{store.csv_path.suffix}")
@@ -1564,8 +1770,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect Instagram Reels and follower counts with a logged-in browser.")
     parser.add_argument("--start-url", default="https://www.instagram.com/reels/")
     parser.add_argument("--max-items", type=int, default=50)
+    parser.add_argument("--progress-offset", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--interval-seconds", type=float, default=5)
-    parser.add_argument("--direct-reel-info-wait-seconds", type=float, default=2)
+    parser.add_argument("--direct-reel-info-wait-seconds", type=float, default=3)
+    parser.add_argument("--exact-metric-attempts", type=int, default=EXACT_METRIC_MAX_ATTEMPTS)
+    parser.add_argument("--exact-metric-retry-delay-seconds", type=float, default=EXACT_METRIC_RETRY_DELAY_SECONDS)
+    parser.add_argument("--hashtag-candidates-per-keyword", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--manual", action="store_true")
     parser.add_argument("--background", action="store_true")
     parser.add_argument("--no-login", action="store_true", help="Use a temporary anonymous browser without a saved profile.")
@@ -1604,10 +1814,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         build_parser().error(str(error))
     if options.max_items < 0:
         build_parser().error("--max-items must be a non-negative integer.")
+    if options.progress_offset < 0:
+        build_parser().error("--progress-offset must be a non-negative integer.")
     if options.interval_seconds < 1:
         build_parser().error("--interval-seconds must be at least 1.")
     if not math.isfinite(options.direct_reel_info_wait_seconds) or options.direct_reel_info_wait_seconds < 0:
         build_parser().error("--direct-reel-info-wait-seconds must be 0 or greater.")
+    if not 1 <= options.exact_metric_attempts <= 5:
+        build_parser().error("--exact-metric-attempts must be an integer between 1 and 5.")
+    if not math.isfinite(options.exact_metric_retry_delay_seconds) or options.exact_metric_retry_delay_seconds < 0:
+        build_parser().error("--exact-metric-retry-delay-seconds must be 0 or greater.")
+    if options.hashtag_candidates_per_keyword < 0:
+        build_parser().error("--hashtag-candidates-per-keyword must be 0 or greater.")
     if options.manual and options.background:
         build_parser().error("--manual cannot be combined with --background.")
     if options.follower_interval_seconds < 1:
@@ -1743,12 +1961,18 @@ async def recycle_collection_page(context: Any, page: Any, url: str, reel_metada
     return await create_collection_page(context, url, reel_metadata)
 
 
-def hashtag_candidate_limit(max_items: int, hashtag_count: int) -> int:
-    """Return zero for exhaustive discovery, otherwise keep discovery broad and balanced."""
+def hashtag_candidate_limit(
+    max_items: int,
+    hashtag_count: int,
+    candidates_per_keyword: int = 0,
+) -> int:
+    """Return zero for exhaustive discovery, otherwise inspect 50 candidates per hashtag."""
+    if candidates_per_keyword > 0:
+        return int(candidates_per_keyword)
     if max_items == 0:
         return 0
     balanced_target = math.ceil(max(1, max_items) / max(1, hashtag_count))
-    return max(12, balanced_target * 4)
+    return max(50, balanced_target * 4)
 
 
 async def collect_hashtag_reel_urls(
@@ -1757,10 +1981,15 @@ async def collect_hashtag_reel_urls(
     max_items: int,
     reel_metadata: dict[str, dict[str, Any]] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    candidates_per_keyword: int = 0,
 ) -> list[str]:
     groups: list[list[str]] = []
     metadata = reel_metadata if reel_metadata is not None else {}
-    per_hashtag_limit = hashtag_candidate_limit(max_items, len(hashtags))
+    per_hashtag_limit = hashtag_candidate_limit(
+        max_items,
+        len(hashtags),
+        candidates_per_keyword,
+    )
     for hashtag_index, hashtag in enumerate(hashtags, start=1):
         if should_stop and should_stop():
             return []
@@ -1837,7 +2066,10 @@ async def collect_hashtag_reel_urls(
         groups.append(urls)
     combined: list[str] = []
     combined_seen: set[str] = set()
-    maximum_candidates = max(max_items * 4, max_items) if max_items else None
+    # Keep every discovered candidate from each keyword.  This preserves the
+    # requested 50-candidate pool per keyword instead of truncating the mixed
+    # list back to a much smaller global cap.
+    maximum_candidates = per_hashtag_limit * len(hashtags) if max_items else None
     index = 0
     while maximum_candidates is None or len(combined) < maximum_candidates:
         found = False
@@ -2434,9 +2666,14 @@ async def resolve_exact_reel_metrics(
     fallback_page_factory: Callable[[], Any],
     *,
     direct_metadata: dict[str, Any] | None = None,
+    direct_diagnostic: dict[str, str] | None = None,
+    max_direct_attempts: int = EXACT_METRIC_MAX_ATTEMPTS,
+    retry_delay_seconds: float = EXACT_METRIC_RETRY_DELAY_SECONDS,
 ) -> tuple[dict[str, Any], dict[str, int]]:
+    initial_diagnostic = direct_diagnostic if direct_diagnostic is not None else {}
+    last_direct_diagnostic = initial_diagnostic
     observed_direct = (
-        await request_reel_info_metadata(active_page, shortcode)
+        await request_reel_info_metadata(active_page, shortcode, initial_diagnostic)
         if direct_metadata is None
         else direct_metadata
     )
@@ -2444,6 +2681,32 @@ async def resolve_exact_reel_metrics(
         existing_metadata,
         observed_direct,
     )
+
+    # The first media-info response can arrive before Instagram has exposed
+    # every raw metric. Keep this *initial* collection attempt alive for a
+    # bounded retry sequence before switching to page-based fallbacks. Access
+    # denials and rate limits are deliberately not retried here.
+    attempts = max(1, min(5, int(max_direct_attempts)))
+    retry_delay_milliseconds = max(0, round(float(retry_delay_seconds) * 1_000))
+    for attempt in range(1, attempts):
+        if is_direct_reel_info_access_denied(initial_diagnostic):
+            break
+        if has_exact_engagement_metadata(metadata) and exact_view_counts_from_metadata(shortcode, metadata):
+            break
+        if retry_delay_milliseconds:
+            await active_page.wait_for_timeout(retry_delay_milliseconds * attempt)
+        retry_diagnostic: dict[str, str] = {}
+        retry_metadata = await request_reel_info_metadata(
+            active_page,
+            shortcode,
+            retry_diagnostic,
+        )
+        last_direct_diagnostic = retry_diagnostic
+        metadata = merge_direct_reel_metadata(metadata, retry_metadata)
+        if is_direct_reel_info_access_denied(retry_diagnostic):
+            break
+    if is_direct_reel_info_access_denied(last_direct_diagnostic):
+        return metadata, exact_view_counts_from_metadata(shortcode, metadata)
     fallback_page: Any = None
 
     async def get_fallback_page() -> Any:
@@ -2510,38 +2773,100 @@ async def request_web_follower_count(page: Any, username: str) -> dict[str, Any]
             return {"status": "challenge_required", "error": "Instagram requested an account check.", "source": "instagram_web"}
         endpoint = await page.evaluate(
             """async expected => {
+              const profile = document.querySelector('main header') || document.querySelector('header') || document.querySelector('main');
+              const visible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = getComputedStyle(node);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+              };
+              const profileText = profile?.innerText || '';
+              const profileTexts = profile ? [...new Set([...profile.querySelectorAll('span, a, div')]
+                .filter(visible)
+                .map(node => String(node.innerText || '').trim())
+                .filter(text => text && text.length <= 120))] : [];
               const response = await fetch(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(expected)}`, {
                 credentials: 'include',
                 headers: {'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest'}
               });
-              return {status: response.status, text: await response.text()};
+              return {status: response.status, text: await response.text(), profileText, profileTexts};
             }""",
             normalized,
         )
+        visible_profile_text = [endpoint.get("profileText", ""), *(endpoint.get("profileTexts") or [])]
+        visible_follower_count = exact_visible_profile_follower_count(visible_profile_text)
+        visible_post_count = exact_visible_profile_post_count(visible_profile_text)
+        visible_category = profile_category_from_visible_text(visible_profile_text)
+
+        def visible_follower_result(
+            error: str,
+            *,
+            biography: str = "",
+            profile_category: str = "",
+            post_count: int | None = None,
+        ) -> dict[str, Any]:
+            category = profile_category or visible_category
+            resolved_post_count = visible_post_count if post_count is None else post_count
+            if visible_follower_count is not None:
+                return {
+                    **follower_count_success(visible_follower_count, "profile_header_text"),
+                    "biography": biography,
+                    "profile_category": category,
+                    "postCount": resolved_post_count,
+                }
+            return {
+                "status": "web_error",
+                "error": error,
+                "source": "instagram_web",
+                "biography": biography,
+                "profile_category": category,
+                "postCount": resolved_post_count,
+            }
+
         endpoint_status = int(endpoint.get("status") or 0)
         if endpoint_status == 429:
-            return {"status": "rate_limited", "error": "Instagram returned HTTP 429 for web_profile_info.", "source": "instagram_web"}
+            if visible_follower_count is not None:
+                return visible_follower_result("Instagram returned HTTP 429 for web_profile_info.")
+            return {"status": "rate_limited", "error": "Instagram returned HTTP 429 for web_profile_info.", "source": "instagram_web", "profile_category": visible_category, "postCount": visible_post_count}
         if endpoint_status in {401, 403}:
-            return {"status": "login_required", "error": "Instagram login is required for web_profile_info.", "source": "instagram_web"}
+            if visible_follower_count is not None:
+                return visible_follower_result("Instagram login is required for web_profile_info.")
+            return {"status": "login_required", "error": "Instagram login is required for web_profile_info.", "source": "instagram_web", "profile_category": visible_category, "postCount": visible_post_count}
         if endpoint_status == 404:
-            return {"status": "profile_unavailable", "error": "Instagram profile is unavailable.", "source": "instagram_web"}
+            if visible_follower_count is not None:
+                return visible_follower_result("Instagram profile is unavailable.")
+            return {"status": "profile_unavailable", "error": "Instagram profile is unavailable.", "source": "instagram_web", "profile_category": visible_category, "postCount": visible_post_count}
         if endpoint_status != 200:
-            return {"status": "web_error", "error": f"Instagram web_profile_info returned HTTP {endpoint_status}.", "source": "instagram_web"}
-        payload = json.loads(str(endpoint.get("text") or ""))
+            return visible_follower_result(f"Instagram web_profile_info returned HTTP {endpoint_status}.")
+        try:
+            payload = json.loads(str(endpoint.get("text") or ""))
+        except json.JSONDecodeError:
+            return visible_follower_result("Instagram web_profile_info returned invalid JSON.")
         user = _dict(_dict(payload.get("data")).get("user"))
         response_username = str(user.get("username") or "").strip().lstrip("@")
         if response_username.casefold() != normalized.casefold():
-            return {"status": "web_error", "error": "Instagram web_profile_info returned a different username.", "source": "instagram_web"}
+            return visible_follower_result("Instagram web_profile_info returned a different username.")
         biography = str(user.get("biography") or "")
+        profile_category = profile_category_from_data(user) or visible_category
+        post_count = exact_profile_post_count(user)
+        if post_count is None:
+            post_count = visible_post_count
         count = exact_nonnegative_integer(_dict(user.get("edge_followed_by")).get("count"))
         if count is None:
-            return {
-                "status": "web_unavailable",
-                "error": "Exact follower count was absent from web_profile_info.",
-                "source": "instagram_web",
-                "biography": biography,
-            }
-        return {**follower_count_success(count, "edge_followed_by.count"), "biography": biography}
+            visible_result = visible_follower_result(
+                "Exact follower count was absent from web_profile_info.",
+                biography=biography,
+                profile_category=profile_category,
+                post_count=post_count,
+            )
+            if visible_result["status"] == "success":
+                return visible_result
+            return {**visible_result, "status": "web_unavailable"}
+        return {
+            **follower_count_success(count, "edge_followed_by.count"),
+            "biography": biography,
+            "profile_category": profile_category,
+            "postCount": post_count,
+        }
     except Exception as error:
         return {"status": "web_error", "error": str(error)[:500], "source": "instagram_web"}
 
@@ -2562,10 +2887,19 @@ def follower_lookup_delay_seconds(result: dict[str, Any], fallback_seconds: floa
 
 
 class SequentialWebFollowerLookup:
-    def __init__(self, page: Any, interval_seconds: float = 8) -> None:
+    def __init__(
+        self,
+        page: Any,
+        interval_seconds: float = 8,
+        *,
+        max_attempts: int = FOLLOWER_WEB_MAX_ATTEMPTS,
+        retry_delay_seconds: float = FOLLOWER_WEB_RETRY_DELAY_SECONDS,
+    ) -> None:
         self.page = page
         self.context = page.context
         self.interval_seconds = interval_seconds
+        self.max_attempts = max(1, min(5, int(max_attempts)))
+        self.retry_delay_seconds = max(0.0, float(retry_delay_seconds))
         self.completed_since_recycle = 0
         self.wait_before_next = 0.0
         self.lock = asyncio.Lock()
@@ -2587,13 +2921,22 @@ class SequentialWebFollowerLookup:
                     await self._replace_page()
                 except Exception as error:
                     return {"status": "web_error", "error": f"Follower page recovery failed: {str(error)[:400]}", "source": "instagram_web"}
-            result = await request_web_follower_count(self.page, payload["username"])
-            if result["status"] == "web_error":
+            result: dict[str, Any] = {
+                "status": "web_error",
+                "error": "Follower lookup did not run.",
+                "source": "instagram_web",
+            }
+            for attempt in range(self.max_attempts):
+                result = await request_web_follower_count(self.page, payload["username"])
+                if result.get("status") != "web_error" or attempt + 1 >= self.max_attempts:
+                    break
                 try:
+                    if self.retry_delay_seconds:
+                        await asyncio.sleep(self.retry_delay_seconds * (attempt + 1))
                     await self._replace_page()
-                    result = await request_web_follower_count(self.page, payload["username"])
                 except Exception as error:
                     result = {"status": "web_error", "error": f"Follower page retry failed: {str(error)[:400]}", "source": "instagram_web"}
+                    break
             self.completed_since_recycle += 1
             if self.completed_since_recycle >= FOLLOWER_PAGE_RECYCLE_LOOKUP_COUNT and result["status"] not in {"rate_limited", "login_required", "challenge_required"}:
                 try:
@@ -2648,6 +2991,30 @@ async def async_input(prompt: str) -> str:
     return await asyncio.to_thread(input, prompt)
 
 
+async def wait_for_login_confirmation(prompt: str, stop_event: asyncio.Event) -> bool:
+    """Wait for Enter without letting a Ctrl+C leave the collector blocked on input."""
+    print(prompt, end="", flush=True)
+    if os.name == "nt":
+        import msvcrt
+
+        while not stop_event.is_set():
+            if msvcrt.kbhit() and msvcrt.getwch() in {"\r", "\n"}:
+                print()
+                return True
+            await asyncio.sleep(0.05)
+        return False
+
+    input_task = asyncio.create_task(asyncio.to_thread(input))
+    stop_task = asyncio.create_task(stop_event.wait())
+    done, pending = await asyncio.wait({input_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    if input_task in done:
+        input_task.result()
+        return True
+    return False
+
+
 async def safe_close(value: Any) -> None:
     if value is None:
         return
@@ -2691,9 +3058,14 @@ def initial_collection_page_url(start_url: str, *, background: bool, no_login: b
     return start_url
 
 
-async def run_collector(options: argparse.Namespace) -> int:
+async def run_collector(
+    options: argparse.Namespace,
+    *,
+    external_stop_event: asyncio.Event | None = None,
+    register_signal_handler: bool = True,
+) -> int:
     stop_requested = False
-    stop_event = asyncio.Event()
+    stop_event = external_stop_event or asyncio.Event()
     event_loop = asyncio.get_running_loop()
     interrupt_count = 0
     status_reporter: CollectorStatusReporter | None = None
@@ -2728,8 +3100,17 @@ async def run_collector(options: argparse.Namespace) -> int:
         else:
             os._exit(130)
 
-    previous_sigint = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, handle_interrupt)
+    previous_sigint: Any = None
+    stop_watcher: asyncio.Task[None] | None = None
+    if register_signal_handler:
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, handle_interrupt)
+    elif external_stop_event is not None:
+        async def watch_for_external_stop() -> None:
+            await external_stop_event.wait()
+            request_graceful_stop("중지 요청")
+
+        stop_watcher = asyncio.create_task(watch_for_external_stop())
     if options.background and sys.stdin.isatty():
         def read_stop_input() -> None:
             try:
@@ -2774,7 +3155,12 @@ async def run_collector(options: argparse.Namespace) -> int:
             nonlocal follower_runtime
             if follower_runtime is None:
                 follower_runtime = await create_background_follower_runtime(chromium, context, executable_path)
-            lookup = SequentialWebFollowerLookup(follower_runtime.page, options.follower_interval_seconds)
+            lookup = SequentialWebFollowerLookup(
+                follower_runtime.page,
+                options.follower_interval_seconds,
+                max_attempts=options.exact_metric_attempts,
+                retry_delay_seconds=options.exact_metric_retry_delay_seconds,
+            )
             if follower_enricher is not None:
                 follower_enricher.set_lookup_impl(lookup)
             return lookup
@@ -2799,7 +3185,9 @@ async def run_collector(options: argparse.Namespace) -> int:
                 else:
                     error_suffix = f" ({progress['error']})" if progress["error"] else ""
                     outcome = f"{progress['status']}{error_suffix}"
-                print(f"[Follower {progress['completed']}/{progress['queued']}] @{progress['username']} -> {outcome}")
+                completed = options.progress_offset + int(progress["completed"])
+                queued = options.progress_offset + int(progress["queued"])
+                print(f"[Follower {completed}/{queued}] @{progress['username']} -> {outcome}")
                 asyncio.create_task(update_status({
                     "follower_completed": progress["completed"],
                     "follower_queued": progress["queued"],
@@ -2888,7 +3276,10 @@ async def run_collector(options: argparse.Namespace) -> int:
             print("저장된 Instagram 브라우저 프로필로 백그라운드 모드를 시작했습니다.")
         else:
             print("브라우저에서 Instagram에 로그인하고 릴스 화면을 연 뒤 이 창으로 돌아오세요.")
-            await async_input("준비가 끝났으면 Enter를 누르세요: ")
+            if not await wait_for_login_confirmation("준비가 끝났으면 Enter를 누르세요: ", stop_event):
+                request_graceful_stop("중지 요청")
+                await status_reporter.finish("stopped", {"last_error": ""})
+                return exit_code
             assert_instagram_page_access(page)
             expected_surface = is_instagram_hashtag_surface(page.url) if options.hashtags else is_instagram_reels_surface(page.url)
             if not expected_surface and not refresh_urls:
@@ -2964,6 +3355,9 @@ async def run_collector(options: argparse.Namespace) -> int:
                 response_metadata,
                 exact_fallback_page,
                 direct_metadata=direct_metadata,
+                direct_diagnostic=direct_reel_info_diagnostic,
+                max_direct_attempts=options.exact_metric_attempts,
+                retry_delay_seconds=options.exact_metric_retry_delay_seconds,
             )
             collected = build_collected_record(record, response_metadata)
             if anonymous_refresh:
@@ -3128,7 +3522,7 @@ async def run_collector(options: argparse.Namespace) -> int:
                 print(f"{record.get('cooldownLabel') or '재수집 간격'} 이내 중복 건너뜀: {record['url']}")
             elif record:
                 captured += 1
-                print(stored_reel_progress_line(captured, options.max_items, record["url"]))
+                print(stored_reel_progress_line(captured, options.max_items, record["url"], progress_offset=options.progress_offset))
             else:
                 missing_count += 1
                 print(f"수집 실패: {url}", file=sys.stderr)
@@ -3152,6 +3546,7 @@ async def run_collector(options: argparse.Namespace) -> int:
                         options.max_items,
                         reel_metadata,
                         should_stop=lambda: stop_requested,
+                        candidates_per_keyword=options.hashtag_candidates_per_keyword,
                     )
                 except CrawlerAccessError as error:
                     if options.max_items == 0 and error.code == "hashtag_reels_not_found":
@@ -3345,7 +3740,7 @@ async def run_collector(options: argparse.Namespace) -> int:
                         captured += 1
                         items_since_recycle += 1
                         consecutive_unproductive = 0
-                        print(stored_reel_progress_line(captured, options.max_items, record["url"]))
+                        print(stored_reel_progress_line(captured, options.max_items, record["url"], progress_offset=options.progress_offset))
                     else:
                         missing_count += 1
                         consecutive_unproductive += 1
@@ -3441,6 +3836,9 @@ async def run_collector(options: argparse.Namespace) -> int:
                 pass
         raise
     finally:
+        if stop_watcher is not None:
+            stop_watcher.cancel()
+            await asyncio.gather(stop_watcher, return_exceptions=True)
         await safe_close(context)
         await safe_close(browser)
         await safe_close(follower_runtime.browser if follower_runtime else None)
@@ -3452,7 +3850,8 @@ async def run_collector(options: argparse.Namespace) -> int:
                 pass
         if collector_lock:
             await collector_lock.release()
-        signal.signal(signal.SIGINT, previous_sigint)
+        if register_signal_handler:
+            signal.signal(signal.SIGINT, previous_sigint)
 
 
 def main(argv: list[str] | None = None) -> int:
