@@ -103,16 +103,19 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 최초 수집할 Reel의 업로드 경과일을 바꾸려면 `--maxdays`를 사용합니다. 예를 들어 최근 14일 이내만
 수집하려면 `.\collector.ps1 fashion-beauty --background --maxdays 14`를 실행합니다.
 
-기본 실행 시간은 16시간입니다. 처음 8시간 동안 각 활성 30분 창에서 내장 키워드 5개를 순환해
+기본 실행 시간은 16시간입니다. 처음 7시간 동안 각 활성 30분 창에서 내장 키워드 5개를 순환해
 검색합니다. `fashion`과 `beauty`는 해당 도메인을 매 창 수집하고, `fashion-beauty`는 패션과
 화장품·뷰티를 창마다 교대합니다. 각 키워드에서 릴스 후보를 최대 50개 확보하며, 신규 수집은 창마다 최대 300개까지 저장합니다.
 최초 수집 후보에는 업로드 후
 30일 이내 필터를 적용합니다. 각 Reel은 최초 수집과 `+30분`, `+1시간`, `+2시간`, `+4시간`,
-`+8시간` 재수집을 합쳐 최대 여섯 개 스냅샷을 남깁니다. 나머지 8시간에는 신규 탐색 없이 기한이 된
-재수집을 마무리합니다. 옵션을 모두 명시한 같은 실행은 다음과 같습니다.
+`+8시간` 재수집을 합쳐 최대 여섯 개 스냅샷을 남깁니다. 나머지 9시간에는 신규 탐색 없이 기한이 된
+재수집을 마무리합니다. 같은 도메인의 기한 재수집 URL은 최대 50개씩 한 브라우저 세션에서 처리하고,
+패션·뷰티의 기한이 겹치면 로그인 브라우저의 독립 탭에서 두 묶음을 병렬 처리합니다. 이번 실행에서
+생긴 모든 Reel의 여섯 번째 스냅샷까지 끝나면 16시간을 기다리지 않고 정상 종료합니다.
+옵션을 모두 명시한 같은 실행은 다음과 같습니다.
 
 ```powershell
-.\collector.ps1 fashion-beauty --duration-hours 16 --discovery-hours 8 --new-items-per-window 300 --max-new-items-per-window 300 --max-upload-age-days 30 --discovery-interval-minutes 30
+.\collector.ps1 fashion-beauty --duration-hours 16 --discovery-hours 7 --new-items-per-window 300 --max-new-items-per-window 300 --max-upload-age-days 30 --discovery-interval-minutes 30
 ```
 
 패션·뷰티 내장 키워드(각 48개)를 유지한 채 **6시간 동안 신규 Reel만** 수집하고, 재수집 없이

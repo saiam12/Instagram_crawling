@@ -28,7 +28,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 from xml.etree import ElementTree
 
@@ -3069,6 +3069,10 @@ async def run_collector(
     *,
     external_stop_event: asyncio.Event | None = None,
     register_signal_handler: bool = True,
+    shared_context: Any | None = None,
+    shared_browser: Any | None = None,
+    shared_playwright_runtime: Any | None = None,
+    enable_stop_input: bool = True,
 ) -> int:
     stop_requested = False
     stop_event = external_stop_event or asyncio.Event()
@@ -3079,11 +3083,13 @@ async def run_collector(
     collector_lock: CollectorLock | None = None
     browser: Any = None
     context: Any = None
+    page: Any = None
     follower_runtime: FollowerRuntime | None = None
     view_runtime: FollowerRuntime | None = None
     playwright_runtime: Any = None
     follower_enricher: FollowerEnricher | None = None
     exit_code = 0
+    owns_collection_context = shared_context is None
 
     def request_graceful_stop(source: str) -> bool:
         nonlocal stop_requested
@@ -3117,7 +3123,7 @@ async def run_collector(
             request_graceful_stop("중지 요청")
 
         stop_watcher = asyncio.create_task(watch_for_external_stop())
-    if options.background and sys.stdin.isatty():
+    if enable_stop_input and options.background and sys.stdin.isatty():
         def read_stop_input() -> None:
             try:
                 if sys.stdin.readline().strip():
@@ -3152,10 +3158,18 @@ async def run_collector(
                 options.disable_recollect_cooldown,
             )
         executable_path = locate_browser_executable()
-        async_playwright = load_playwright()
-        playwright_runtime = await async_playwright().start()
-        chromium = playwright_runtime.chromium
-        browser, context = await launch_collection_context(chromium, executable_path, options)
+        if owns_collection_context:
+            async_playwright = load_playwright()
+            playwright_runtime = await async_playwright().start()
+            chromium = playwright_runtime.chromium
+            browser, context = await launch_collection_context(chromium, executable_path, options)
+        else:
+            if shared_playwright_runtime is None:
+                raise RuntimeError("A shared Playwright runtime is required with a shared collection context.")
+            playwright_runtime = shared_playwright_runtime
+            chromium = playwright_runtime.chromium
+            browser = shared_browser
+            context = shared_context
 
         async def ensure_follower_runtime() -> SequentialWebFollowerLookup:
             nonlocal follower_runtime
@@ -3213,8 +3227,9 @@ async def run_collector(
 
         if options.followers_only:
             follower_enricher = await start_follower_enricher()
-            await safe_close(context)
-            context = None
+            if owns_collection_context:
+                await safe_close(context)
+                context = None
             queued = await follower_enricher.enqueue_all_exact()
             print(f"Follower web lookups queued: {queued}")
             stats = await follower_enricher.drain()
@@ -3790,8 +3805,12 @@ async def run_collector(
 
         await reel_store.flush()
         print("릴스 스냅샷 저장을 마치고 브라우저를 닫습니다.")
-        await safe_close(context)
-        context = None
+        if owns_collection_context:
+            await safe_close(context)
+            context = None
+        else:
+            await safe_close(page)
+            page = None
         follower_stats = {"success": 0, "unavailable": 0, "failed": 0, "stopStatus": "", "stopError": ""}
         merged = 0
         if follower_enricher is not None:
@@ -3845,11 +3864,14 @@ async def run_collector(
         if stop_watcher is not None:
             stop_watcher.cancel()
             await asyncio.gather(stop_watcher, return_exceptions=True)
-        await safe_close(context)
-        await safe_close(browser)
+        if owns_collection_context:
+            await safe_close(context)
+            await safe_close(browser)
+        else:
+            await safe_close(page)
         await safe_close(follower_runtime.browser if follower_runtime else None)
         await safe_close(view_runtime.browser if view_runtime else None)
-        if playwright_runtime:
+        if owns_collection_context and playwright_runtime:
             try:
                 await playwright_runtime.stop()
             except Exception:
@@ -3858,6 +3880,62 @@ async def run_collector(
             await collector_lock.release()
         if register_signal_handler:
             signal.signal(signal.SIGINT, previous_sigint)
+
+
+async def run_collectors_in_shared_context(
+    options_list: Sequence[argparse.Namespace],
+    *,
+    external_stop_event: asyncio.Event | None = None,
+) -> list[int]:
+    """Run independent output datasets concurrently in one logged-in browser context.
+
+    A persistent Chromium profile can only be opened by one browser process.  Each
+    collector therefore receives its own Reel and follower pages while sharing the
+    single persistent context and its already-authenticated session.
+    """
+    if not options_list:
+        return []
+    first = options_list[0]
+    if any(option.profile_dir != first.profile_dir for option in options_list):
+        raise ValueError("Shared collection requires the same browser profile directory.")
+    if any(bool(option.no_login) != bool(first.no_login) for option in options_list):
+        raise ValueError("Shared collection requires matching login modes.")
+
+    executable_path = locate_browser_executable()
+    async_playwright = load_playwright()
+    playwright_runtime = await async_playwright().start()
+    browser: Any = None
+    context: Any = None
+    try:
+        browser, context = await launch_collection_context(
+            playwright_runtime.chromium,
+            executable_path,
+            first,
+        )
+
+        async def run_one(index: int, options: argparse.Namespace) -> int:
+            try:
+                return await run_collector(
+                    options,
+                    external_stop_event=external_stop_event,
+                    register_signal_handler=False,
+                    shared_context=context,
+                    shared_browser=browser,
+                    shared_playwright_runtime=playwright_runtime,
+                    enable_stop_input=index == 0,
+                )
+            except Exception as error:
+                print(f"공유 브라우저 수집 실패 ({options.data_dir.name}): {error}", file=sys.stderr)
+                return 2
+
+        return list(await asyncio.gather(*(run_one(index, options) for index, options in enumerate(options_list))))
+    finally:
+        await safe_close(context)
+        await safe_close(browser)
+        try:
+            await playwright_runtime.stop()
+        except Exception:
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:

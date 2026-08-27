@@ -96,7 +96,7 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
     )
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data_web")
     parser.add_argument("--duration-hours", type=_finite_positive, default=16)
-    parser.add_argument("--discovery-hours", type=_finite_positive, default=8)
+    parser.add_argument("--discovery-hours", type=_finite_positive, default=7)
     parser.add_argument("--new-items-per-window", type=_positive_integer, default=300)
     parser.add_argument("--max-new-items-per-window", type=_positive_integer, default=300)
     parser.add_argument("--max-upload-age-days", "--maxdays", dest="max_upload_age_days", type=_finite_nonnegative, default=30)
@@ -150,8 +150,8 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
         # New-only runs have no post-discovery recollection period, so the
         # complete duration is an active discovery period.
         options.discovery_hours = options.duration_hours
-    elif options.discovery_hours > options.duration_hours - 8:
-        parser.error("--discovery-hours must end at least 8 hours before --duration-hours")
+    elif options.discovery_hours > options.duration_hours - 9:
+        parser.error("--discovery-hours must end at least 9 hours before --duration-hours")
 
     try:
         fashion_keywords = (

@@ -59,7 +59,7 @@ class DatasetConfig:
 class RunConfig:
     data_root: Path
     duration_hours: float = 16
-    discovery_hours: float = 8
+    discovery_hours: float = 7
     discovery_interval_minutes: float = 30
     new_items_per_window: int = 300
     max_new_items_per_window: int = 300

@@ -33,6 +33,7 @@ from .instagram_reels_browser import (
     parse_args,
     process_is_alive,
     run_collector,
+    run_collectors_in_shared_context,
     wait_for_stop_or_timeout,
 )
 from exporters.instagram_collector import write_xlsx_workbook
@@ -53,6 +54,7 @@ _LOCK_READ_ATTEMPTS = 3
 _LOCK_READ_RETRY_SECONDS = 0.05
 _LOCK_MALFORMED_GRACE_SECONDS = 2.0
 _DUE_RETRY_MAX_SECONDS = 30.0
+_RECOLLECTION_BATCH_SIZE = 50
 
 
 @dataclass(frozen=True)
@@ -440,6 +442,38 @@ async def invoke_generic_collector(
     progress_offset: int = 0,
     stop_event: asyncio.Event | None = None,
 ) -> int:
+    options, urls_file = _generic_collector_options(
+        config=config,
+        dataset=dataset,
+        mode=mode,
+        hashtags=hashtags,
+        urls=urls,
+        max_items=max_items,
+        progress_offset=progress_offset,
+    )
+    try:
+        if stop_event is None:
+            return await run_collector(options)
+        return await run_collector(
+            options,
+            external_stop_event=stop_event,
+            register_signal_handler=False,
+        )
+    finally:
+        if urls_file is not None:
+            urls_file.unlink(missing_ok=True)
+
+
+def _generic_collector_options(
+    *,
+    config: RunConfig,
+    dataset: Literal["fashion", "beauty"] | str,
+    mode: Literal["discover", "recollect"] | str,
+    hashtags: Sequence[str] = (),
+    urls: Sequence[str] = (),
+    max_items: int | None = None,
+    progress_offset: int = 0,
+) -> tuple[Any, Path | None]:
     selected = dataset_by_name(config, dataset)
     selected.data_root.mkdir(parents=True, exist_ok=True)
     arguments = [
@@ -483,19 +517,40 @@ async def invoke_generic_collector(
         )
     else:
         raise ValueError(f"Unknown collection mode: {mode}")
+    return parse_args(arguments), urls_file
 
-    try:
-        options = parse_args(arguments)
-        if stop_event is None:
-            return await run_collector(options)
-        return await run_collector(
-            options,
-            external_stop_event=stop_event,
-            register_signal_handler=False,
+
+async def invoke_generic_recollection_batches(
+    *,
+    config: RunConfig,
+    batches: Sequence[tuple[str, Sequence[str]]],
+    stop_event: asyncio.Event | None = None,
+) -> list[int]:
+    """Collect one due-URL batch per domain in a shared authenticated browser."""
+    prepared = [
+        _generic_collector_options(
+            config=config,
+            dataset=dataset,
+            mode="recollect",
+            urls=urls,
         )
+        for dataset, urls in batches
+    ]
+    try:
+        options = [options for options, _urls_file in prepared]
+        if len(options) == 1:
+            return [
+                await run_collector(
+                    options[0],
+                    external_stop_event=stop_event,
+                    register_signal_handler=stop_event is None,
+                )
+            ]
+        return await run_collectors_in_shared_context(options, external_stop_event=stop_event)
     finally:
-        if urls_file is not None:
-            urls_file.unlink(missing_ok=True)
+        for _options, urls_file in prepared:
+            if urls_file is not None:
+                urls_file.unlink(missing_ok=True)
 
 
 def active_window_index(
@@ -534,6 +589,7 @@ def current_status(
     *,
     last_error: str = "",
     collector_failures: int = 0,
+    completed: bool = False,
 ) -> dict[str, Any]:
     rows = read_history(dataset)
     active_name = active_dataset_name(config, started_at, now) if now < discovery_ends_at else None
@@ -561,7 +617,7 @@ def current_status(
         "dataset": dataset.name,
         "state": (
             "completed"
-            if now >= ends_at
+            if completed or now >= ends_at
             else ("new_only" if config.new_only else ("recollection_only" if now >= discovery_ends_at else "running"))
         ),
         "started_at": _isoformat(started_at),
@@ -602,6 +658,65 @@ async def _invoke_before_deadline(
     if result:
         return result, f"{mode} collector exited with code {result}"
     return 0, ""
+
+
+async def _invoke_recollection_batches_before_deadline(
+    invoke: Invocation,
+    clock: Clock,
+    deadline: datetime,
+    *,
+    config: RunConfig,
+    batches: Sequence[tuple[str, tuple[DueJob, ...]]],
+    stop_event: asyncio.Event,
+) -> list[tuple[tuple[DueJob, ...], int, str]]:
+    """Run the due batches together, preserving a separate outcome per domain."""
+    if invoke is not invoke_generic_collector:
+        results = await asyncio.gather(
+            *(
+                _invoke_before_deadline(
+                    invoke,
+                    clock,
+                    deadline,
+                    config=config,
+                    dataset=dataset,
+                    mode="recollect",
+                    urls=[job.url for job in jobs],
+                    stop_event=stop_event,
+                )
+                for dataset, jobs in batches
+            )
+        )
+        return [
+            (jobs, result, error)
+            for (_dataset, jobs), (result, error) in zip(batches, results, strict=True)
+        ]
+
+    remaining = (deadline - clock()).total_seconds()
+    if remaining <= 0:
+        return [(jobs, 2, "recollect deadline reached before collector invocation") for _dataset, jobs in batches]
+    try:
+        results = await asyncio.wait_for(
+            invoke_generic_recollection_batches(
+                config=config,
+                batches=[(dataset, [job.url for job in jobs]) for dataset, jobs in batches],
+                stop_event=stop_event,
+            ),
+            timeout=remaining,
+        )
+    except TimeoutError:
+        return [(jobs, 2, "recollect collector exceeded its deadline") for _dataset, jobs in batches]
+    except Exception as error:
+        return [(jobs, 2, f"recollect collector failed: {error}") for _dataset, jobs in batches]
+    if clock() > deadline:
+        return [(jobs, 2, "recollect collector completed after its deadline") for _dataset, jobs in batches]
+    return [
+        (
+            jobs,
+            result,
+            "" if result == 0 else f"recollect collector exited with code {result}",
+        )
+        for (_dataset, jobs), result in zip(batches, results, strict=True)
+    ]
 
 
 async def run_fashion_beauty_collection(
@@ -653,6 +768,19 @@ async def run_fashion_beauty_collection(
                         key=lambda job: (job.due_at, job.dataset, job.url),
                     )
                 )
+                scheduled_before_end = (
+                    []
+                    if config.new_only
+                    else sorted(
+                        (
+                            job
+                            for dataset in configured_datasets
+                            for job in due_jobs(dataset, histories[dataset.name], ends_at)
+                            if job.due_at >= started_at
+                        ),
+                        key=lambda job: (job.due_at, job.dataset, job.url),
+                    )
+                )
 
                 wait_seconds = 30.0
                 invoked = False
@@ -663,31 +791,43 @@ async def run_fashion_beauty_collection(
                 ]
 
                 if eligible_jobs:
-                    next_job = eligible_jobs[0]
-                    job_key = (next_job.dataset, next_job.url, next_job.due_at)
+                    recollection_batches = [
+                        (
+                            dataset.name,
+                            tuple(job for job in eligible_jobs if job.dataset == dataset.name)[:_RECOLLECTION_BATCH_SIZE],
+                        )
+                        for dataset in configured_datasets
+                        if any(job.dataset == dataset.name for job in eligible_jobs)
+                    ]
                     invoked = True
-                    result, error = await _invoke_before_deadline(
+                    outcomes = await _invoke_recollection_batches_before_deadline(
                         invoke,
                         clock,
                         ends_at,
                         config=config,
-                        dataset=next_job.dataset,
-                        mode="recollect",
-                        urls=[next_job.url],
+                        batches=recollection_batches,
                         stop_event=stop_event,
                     )
-                    if result:
-                        if exit_code == 0:
-                            exit_code = result
-                        last_errors[next_job.dataset] = error
-                        collector_failures[next_job.dataset] += 1
-                        attempt = retry_attempts.get(job_key, 0) + 1
-                        retry_attempts[job_key] = attempt
-                        wait_seconds = _due_retry_delay(attempt)
-                        retry_not_before[job_key] = clock() + timedelta(seconds=wait_seconds)
-                    else:
-                        retry_attempts.pop(job_key, None)
-                        retry_not_before.pop(job_key, None)
+                    for recollection_jobs, result, error in outcomes:
+                        dataset_name = recollection_jobs[0].dataset
+                        if result:
+                            if exit_code == 0:
+                                exit_code = result
+                            last_errors[dataset_name] = error
+                            collector_failures[dataset_name] += 1
+                            wait_seconds = 0.0
+                            for job in recollection_jobs:
+                                job_key = (job.dataset, job.url, job.due_at)
+                                attempt = retry_attempts.get(job_key, 0) + 1
+                                retry_attempts[job_key] = attempt
+                                retry_delay = _due_retry_delay(attempt)
+                                retry_not_before[job_key] = clock() + timedelta(seconds=retry_delay)
+                                wait_seconds = max(wait_seconds, retry_delay)
+                        else:
+                            for job in recollection_jobs:
+                                job_key = (job.dataset, job.url, job.due_at)
+                                retry_attempts.pop(job_key, None)
+                                retry_not_before.pop(job_key, None)
                 elif pending:
                     wait_seconds = min(
                         30.0,
@@ -750,6 +890,23 @@ async def run_fashion_beauty_collection(
                             # because fewer than the requested number qualified.
                             completed_new_only_windows.add(window_key)
 
+                finish_after_iteration = (
+                    not config.new_only
+                    and now >= discovery_ends_at
+                    and not pending
+                    and not scheduled_before_end
+                )
+                if (
+                    not invoked
+                    and not pending
+                    and now >= discovery_ends_at
+                    and scheduled_before_end
+                ):
+                    wait_seconds = max(
+                        0.0,
+                        min((job.due_at - now).total_seconds() for job in scheduled_before_end),
+                    )
+
                 status_now = clock()
                 for dataset in configured_datasets:
                     # The generic collector already publishes the standard
@@ -768,8 +925,11 @@ async def run_fashion_beauty_collection(
                             status_now,
                             last_error=last_errors[dataset.name],
                             collector_failures=collector_failures[dataset.name],
+                            completed=finish_after_iteration,
                         ),
                     )
+                if finish_after_iteration:
+                    break
                 if status_now < ends_at and not stop_event.is_set():
                     if invoked:
                         await asyncio.sleep(0)
@@ -794,6 +954,7 @@ __all__ = [
     "datasets",
     "decide_next_work",
     "invoke_generic_collector",
+    "invoke_generic_recollection_batches",
     "publish_dataset_outputs",
     "read_history",
     "run_fashion_beauty_collection",
