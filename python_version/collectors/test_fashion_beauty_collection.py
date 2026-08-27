@@ -28,6 +28,7 @@ from .fashion_beauty_scheduler import (
     BEAUTY_KEYWORDS,
     FASHION_KEYWORDS,
     KEYWORDS_PER_WINDOW,
+    SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW,
     SNAPSHOT_OFFSETS,
     DatasetConfig,
     RunConfig,
@@ -60,8 +61,9 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(config.domains, ("fashion",))
         self.assertEqual(config.duration_hours, 16)
         self.assertEqual(config.discovery_hours, 8)
-        self.assertEqual(config.new_items_per_window, 50)
-        self.assertEqual(config.max_new_items_per_window, 500)
+        self.assertEqual(config.new_items_per_window, 300)
+        self.assertEqual(config.max_new_items_per_window, 300)
+        self.assertEqual(config.keywords_per_window, 5)
         self.assertEqual(config.max_upload_age_days, 30)
         self.assertEqual(parse_scheduled_command("beauty", []).domains, ("beauty",))
         self.assertEqual(
@@ -83,8 +85,9 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(config.new_only)
         self.assertTrue(config.base_output)
         self.assertEqual(config.max_upload_age_days, 365)
-        self.assertEqual(config.new_items_per_window, 600)
-        self.assertEqual(config.max_new_items_per_window, 600)
+        self.assertEqual(config.new_items_per_window, 250)
+        self.assertEqual(config.max_new_items_per_window, 250)
+        self.assertEqual(config.keywords_per_window, SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW)
         self.assertEqual(config.fashion_keywords, FASHION_KEYWORDS)
         self.assertEqual(config.beauty_keywords, BEAUTY_KEYWORDS)
         self.assertTrue(all(dataset.data_root == config.data_root for dataset in datasets(config)))
@@ -121,7 +124,7 @@ class CommandTests(unittest.TestCase):
             ["--discovery-hours", "0"],
             ["--discovery-interval-minutes", "inf"],
             ["--new-items-per-window", "0"],
-            ["--max-new-items-per-window", "601"],
+            ["--max-new-items-per-window", "301"],
             ["--new-items-per-window", "51", "--max-new-items-per-window", "50"],
             ["--max-upload-age-days", "-1"],
         )
@@ -185,9 +188,16 @@ class SchedulerTests(unittest.TestCase):
             tuple(FASHION_KEYWORDS[:KEYWORDS_PER_WINDOW]),
         )
         self.assertEqual(
-            keyword_group(FASHION_KEYWORDS, 5),
+            keyword_group(FASHION_KEYWORDS, 11),
             tuple(FASHION_KEYWORDS[:KEYWORDS_PER_WINDOW]),
         )
+
+    def test_five_keyword_groups_advance_the_start_keyword_and_cycle(self) -> None:
+        size = SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW
+        self.assertEqual(keyword_group(FASHION_KEYWORDS, 1, size), tuple(FASHION_KEYWORDS[:size]))
+        self.assertEqual(keyword_group(FASHION_KEYWORDS, 2, size), tuple(FASHION_KEYWORDS[size : size * 2]))
+        self.assertEqual(keyword_group(FASHION_KEYWORDS, 10, size), tuple(FASHION_KEYWORDS[size * 9 :]))
+        self.assertEqual(keyword_group(FASHION_KEYWORDS, 11, size), tuple(FASHION_KEYWORDS[:size]))
 
     def test_malformed_url_or_timestamp_is_excluded_from_due_jobs(self) -> None:
         base = datetime(2026, 8, 26, tzinfo=timezone.utc)
@@ -293,7 +303,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([call["mode"] for call in calls[:3]], ["recollect", "recollect", "discover"])
         self.assertEqual({call["dataset"] for call in calls[:2]}, {"fashion", "beauty"})
         self.assertEqual(calls[2]["dataset"], "fashion")
-        self.assertEqual(calls[2]["max_items"], 50)
+        self.assertEqual(calls[2]["max_items"], 300)
         self.assertTrue(all(supervisor and not generic for supervisor, generic in lock_observations))
         self.assertTrue((self.data_root / "fashion_collector_status.json").exists())
         self.assertTrue((self.data_root / "beauty_collector_status.json").exists())
@@ -390,7 +400,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 2)
         self.assertEqual(
             [(call["dataset"], call["max_items"]) for call in calls],
-            [("fashion", 50), ("beauty", 50)],
+            [("fashion", 300), ("beauty", 300)],
         )
         fashion_status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
         self.assertIn("deadline", fashion_status["last_error"].lower())
@@ -716,7 +726,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 0)
         self.assertEqual(waits, [5.0])
 
-    async def test_window_cap_500_stops_discovery_but_keeps_due_jobs(self) -> None:
+    async def test_window_cap_300_stops_discovery_but_keeps_due_jobs(self) -> None:
         now = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)
         rows = [
             {
@@ -724,7 +734,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 "collection_number": 1,
                 "collected_at": isoformat_utc(now.replace(minute=0) + timedelta(seconds=index)),
             }
-            for index in range(500)
+            for index in range(300)
         ]
         rows.append(
             {

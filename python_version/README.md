@@ -103,30 +103,30 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 최초 수집할 Reel의 업로드 경과일을 바꾸려면 `--maxdays`를 사용합니다. 예를 들어 최근 14일 이내만
 수집하려면 `.\collector.ps1 fashion-beauty --background --maxdays 14`를 실행합니다.
 
-기본 실행 시간은 16시간입니다. 처음 8시간 동안 각 활성 30분 창에서 내장 키워드 12개를 순환해
+기본 실행 시간은 16시간입니다. 처음 8시간 동안 각 활성 30분 창에서 내장 키워드 5개를 순환해
 검색합니다. `fashion`과 `beauty`는 해당 도메인을 매 창 수집하고, `fashion-beauty`는 패션과
-화장품·뷰티를 창마다 교대합니다. 각 키워드에서 릴스 후보 50개를 확보하며, 신규 수집은 창마다 50개를 목표로 하되 절대 500개를 넘지 않습니다.
+화장품·뷰티를 창마다 교대합니다. 각 키워드에서 릴스 후보를 최대 50개 확보하며, 신규 수집은 창마다 최대 300개까지 저장합니다.
 최초 수집 후보에는 업로드 후
 30일 이내 필터를 적용합니다. 각 Reel은 최초 수집과 `+30분`, `+1시간`, `+2시간`, `+4시간`,
 `+8시간` 재수집을 합쳐 최대 여섯 개 스냅샷을 남깁니다. 나머지 8시간에는 신규 탐색 없이 기한이 된
 재수집을 마무리합니다. 옵션을 모두 명시한 같은 실행은 다음과 같습니다.
 
 ```powershell
-.\collector.ps1 fashion-beauty --duration-hours 16 --discovery-hours 8 --new-items-per-window 50 --max-new-items-per-window 500 --max-upload-age-days 30 --discovery-interval-minutes 30
+.\collector.ps1 fashion-beauty --duration-hours 16 --discovery-hours 8 --new-items-per-window 300 --max-new-items-per-window 300 --max-upload-age-days 30 --discovery-interval-minutes 30
 ```
 
 패션·뷰티 내장 키워드(각 48개)를 유지한 채 **6시간 동안 신규 Reel만** 수집하고, 재수집 없이
 기본 `data_web\reels.*`와 `data_web\users.*`에 바로 누적하려면 아래의 단일 옵션을 사용합니다.
-최근 365일 이내 업로드된 후보만 대상으로 하며, 한 활성 30분 창에서 키워드 12개를 검색해
-키워드당 최대 50개(최대 600개) 후보를 모두 조건 검사하고, 조건을 통과한 신규 Reel을 최대
-600개 저장합니다. 패션과 뷰티는 30분마다 교대하므로, 다음 활성 창에서 각 도메인의 다음 12개
-키워드 그룹으로 넘어가며 6시간 동안 각 분야의 48개 키워드를 모두 순환합니다.
+최근 365일 이내 업로드된 후보만 대상으로 하며, 한 활성 30분 창에서 키워드 5개를 검색합니다.
+키워드당 최대 50개(최대 250개) 후보를 모두 조건 검사하고, 조건을
+통과한 신규 Reel을 최대 250개 저장합니다. 패션과 뷰티는 30분마다 교대하며, 각 도메인의 다음
+5개 키워드 그룹으로 넘어가므로 활성 창마다 먼저 검색하는 키워드도 순환합니다.
 
 ```powershell
 .\collector.ps1 fashion-beauty --six-hour-new-only --background
 ```
 
-`--six-hour-new-only`는 `--duration-hours 6 --new-only --base-output --maxdays 365 --new-items-per-window 600 --max-new-items-per-window 600`를 한 번에 적용합니다.
+`--six-hour-new-only`는 `--duration-hours 6 --new-only --base-output --maxdays 365 --new-items-per-window 250 --max-new-items-per-window 250`를 한 번에 적용합니다.
 이 프리셋에서는 `+30분`·`+1시간` 등의 재수집 작업을 만들거나 실행하지 않습니다. `--background`는
 저장된 로그인 프로필이 있을 때만 추가하세요. 처음 로그인할 때는 빼고 실행하면 됩니다.
 정확 지표는 기본 3회 확인하며, 필요하면 `--exact-metric-attempts 5 --exact-metric-retry-delay-seconds 3`을
@@ -135,7 +135,7 @@ Reels GraphQL과 릴스 상세 응답을 사용하는 기존 방식으로 자동
 필요하면 같은 동작을 세부 옵션으로도 지정할 수 있습니다.
 
 ```powershell
-.\collector.ps1 fashion-beauty --duration-hours 6 --new-only --base-output --maxdays 365 --new-items-per-window 600 --max-new-items-per-window 600 --background
+.\collector.ps1 fashion-beauty --duration-hours 6 --new-only --base-output --maxdays 365 --new-items-per-window 250 --max-new-items-per-window 250 --background
 ```
 
 `--fashion-hashtag-query`와 `--beauty-hashtag-query`로 선택한 도메인의 내장 키워드를 바꿀 수 있습니다.

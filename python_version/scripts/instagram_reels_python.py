@@ -23,7 +23,9 @@ from collectors.fashion_beauty_collection import run_fashion_beauty_collection  
 from collectors.fashion_beauty_scheduler import (  # noqa: E402
     BEAUTY_KEYWORDS,
     FASHION_KEYWORDS,
+    KEYWORDS_PER_WINDOW,
     RunConfig,
+    SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW,
 )
 from exporters.instagram_collector import DataStore, read_reel_urls_from_xlsx  # noqa: E402
 
@@ -95,8 +97,8 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data_web")
     parser.add_argument("--duration-hours", type=_finite_positive, default=16)
     parser.add_argument("--discovery-hours", type=_finite_positive, default=8)
-    parser.add_argument("--new-items-per-window", type=_positive_integer, default=50)
-    parser.add_argument("--max-new-items-per-window", type=_positive_integer, default=500)
+    parser.add_argument("--new-items-per-window", type=_positive_integer, default=300)
+    parser.add_argument("--max-new-items-per-window", type=_positive_integer, default=300)
     parser.add_argument("--max-upload-age-days", "--maxdays", dest="max_upload_age_days", type=_finite_nonnegative, default=30)
     parser.add_argument("--discovery-interval-minutes", type=_finite_positive, default=30)
     parser.add_argument("--background", action="store_true", help="Use the saved Instagram login without showing a browser window.")
@@ -123,6 +125,7 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
     parser.add_argument("--fashion-hashtag-query")
     parser.add_argument("--beauty-hashtag-query")
     options = parser.parse_args(arguments)
+    keywords_per_window = KEYWORDS_PER_WINDOW
     if options.six_hour_new_only:
         if command != "fashion-beauty":
             parser.error("--six-hour-new-only can only be used with fashion-beauty")
@@ -131,12 +134,14 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
         options.new_only = True
         options.base_output = True
         options.max_upload_age_days = 365
-        # Inspect about 50 candidates for each of the 12 active hashtags and
+        # Keep hashtag discovery inside the 30-minute window: inspect about
+        # 50 candidates for each of the 5 active hashtags and
         # retain every qualifying Reel from that one 30-minute window.
-        options.new_items_per_window = 600
-        options.max_new_items_per_window = 600
-    if options.max_new_items_per_window > 600:
-        parser.error("--max-new-items-per-window cannot exceed 600")
+        keywords_per_window = SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW
+        options.new_items_per_window = 250
+        options.max_new_items_per_window = 250
+    if options.max_new_items_per_window > 300:
+        parser.error("--max-new-items-per-window cannot exceed 300")
     if options.new_items_per_window > options.max_new_items_per_window:
         parser.error("--new-items-per-window cannot exceed --max-new-items-per-window")
     if options.exact_metric_attempts > 5:
@@ -185,6 +190,7 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
         direct_reel_info_wait_seconds=options.direct_reel_info_wait_seconds,
         exact_metric_attempts=options.exact_metric_attempts,
         exact_metric_retry_delay_seconds=options.exact_metric_retry_delay_seconds,
+        keywords_per_window=keywords_per_window,
         new_only=options.new_only,
         base_output=options.base_output,
         fashion_keywords=fashion_keywords,

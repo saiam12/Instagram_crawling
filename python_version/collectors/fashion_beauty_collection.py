@@ -555,6 +555,7 @@ def current_status(
                 config.discovery_interval_minutes,
                 alternating_domains=len(config.domains) > 1,
             ),
+            config.keywords_per_window,
         )
     return {
         "dataset": dataset.name,
@@ -732,6 +733,7 @@ async def run_fashion_beauty_collection(
                                     config.discovery_interval_minutes,
                                     alternating_domains=len(config.domains) > 1,
                                 ),
+                                config.keywords_per_window,
                             ),
                             max_items=batch_size,
                             progress_offset=config.max_new_items_per_window - decision.remaining_capacity,

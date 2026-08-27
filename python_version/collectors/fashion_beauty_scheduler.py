@@ -11,7 +11,8 @@ from typing import Any, Literal, Sequence
 from urllib.parse import urlsplit
 
 
-KEYWORDS_PER_WINDOW = 12
+KEYWORDS_PER_WINDOW = 5
+SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW = 5
 
 
 FASHION_KEYWORDS: Sequence[str] = (
@@ -60,14 +61,15 @@ class RunConfig:
     duration_hours: float = 16
     discovery_hours: float = 8
     discovery_interval_minutes: float = 30
-    new_items_per_window: int = 50
-    max_new_items_per_window: int = 500
+    new_items_per_window: int = 300
+    max_new_items_per_window: int = 300
     max_upload_age_days: float = 30
     background: bool = False
     direct_reel_info_wait_seconds: float = 3
     exact_metric_attempts: int = 3
     exact_metric_retry_delay_seconds: float = 2
     hashtag_candidates_per_keyword: int = 50
+    keywords_per_window: int = KEYWORDS_PER_WINDOW
     new_only: bool = False
     base_output: bool = False
     fashion_keywords: Sequence[str] = FASHION_KEYWORDS
@@ -180,14 +182,20 @@ def window_dataset(
     return "fashion" if index % 2 == 0 else "beauty"
 
 
-def keyword_group(keywords: Sequence[str], active_window_number: int) -> tuple[str, ...]:
+def keyword_group(
+    keywords: Sequence[str],
+    active_window_number: int,
+    keywords_per_window: int = KEYWORDS_PER_WINDOW,
+) -> tuple[str, ...]:
     if not keywords:
         raise ValueError("keywords must contain at least one entry")
     if active_window_number < 1:
         raise ValueError("active_window_number must be one-based")
-    group_count = math.ceil(len(keywords) / KEYWORDS_PER_WINDOW)
-    start = ((int(active_window_number) - 1) % group_count) * KEYWORDS_PER_WINDOW
-    return tuple(keywords[start : start + KEYWORDS_PER_WINDOW])
+    if keywords_per_window < 1:
+        raise ValueError("keywords_per_window must be greater than zero")
+    group_count = math.ceil(len(keywords) / keywords_per_window)
+    start = ((int(active_window_number) - 1) % group_count) * keywords_per_window
+    return tuple(keywords[start : start + keywords_per_window])
 
 
 def initial_count_in_window(rows: list[dict[str, Any]], start: datetime, end: datetime) -> int:
@@ -230,6 +238,7 @@ __all__ = [
     "BEAUTY_KEYWORDS",
     "FASHION_KEYWORDS",
     "KEYWORDS_PER_WINDOW",
+    "SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW",
     "SNAPSHOT_OFFSETS",
     "DatasetConfig",
     "DueJob",
