@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+debug_frames/
+results/
+cookies.txt
+*.cookies.txt
+!tests/
+!tests/**
+tests/__pycache__/
+tests/**/*.pyc

@@ -23,7 +23,7 @@ XLSX_FILENAME = "instagram_data.xlsx"
 XLSX_INVALID_XML_CHARACTER_PATTERN = re.compile(
     r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]"
 )
-XLSX_NUMERIC_FIELDS = {"collection_number", "video_duration_seconds", "view_count", "view_count_change", "post_count", "follower_count", "follower_count_change", "like_count", "like_count_change", "comment_count", "comment_count_change", "repost_count", "repost_count_change"}
+XLSX_NUMERIC_FIELDS = {"collection_number", "video_duration_seconds", "view_count", "view_count_change", "post_count", "follower_count", "following_count", "follower_count_change", "like_count", "like_count_change", "comment_count", "comment_count_change", "repost_count", "repost_count_change"}
 XLSX_PERCENT_FIELDS = {"reaction_rate", "reaction_rate_change"}
 XLSX_SIGNED_NUMERIC_FIELDS = {
     "view_count_change",
@@ -44,6 +44,7 @@ XLSX_USERS_FIELDS = [
     "profile_category",
     "post_count",
     "follower_count",
+    "following_count",
     "follower_count_change",
     "collected_at",
 ]
@@ -204,11 +205,11 @@ def _xlsx_project_user_rows(
     """Flatten a user's follower-count columns into collection-history rows."""
     snapshot_indexes: dict[int, dict[str, int]] = {1: {}}
     for field, index in indexes.items():
-        if field in {"post_count", "follower_count", "collected_at"}:
+        if field in {"post_count", "follower_count", "following_count", "collected_at"}:
             snapshot_indexes[1][field] = index
             continue
         match = re.fullmatch(
-            r"(\d+)(?:st|nd|rd|th) collect_(post_count|follower_count|collected_at)",
+            r"(\d+)(?:st|nd|rd|th) collect_(post_count|follower_count|following_count|collected_at)",
             field,
         )
         if match:
@@ -232,6 +233,7 @@ def _xlsx_project_user_rows(
             snapshot = snapshot_indexes[collection_number]
             post_index = snapshot.get("post_count")
             follower_index = snapshot.get("follower_count")
+            following_index = snapshot.get("following_count")
             collected_at_index = snapshot.get("collected_at")
             post_count = (
                 row[post_index]
@@ -243,12 +245,17 @@ def _xlsx_project_user_rows(
                 if follower_index is not None and follower_index < len(row)
                 else ""
             )
+            following_count = (
+                row[following_index]
+                if following_index is not None and following_index < len(row)
+                else ""
+            )
             collected_at = (
                 row[collected_at_index]
                 if collected_at_index is not None and collected_at_index < len(row)
                 else ""
             )
-            if collection_number != 1 and not (post_count or follower_count or collected_at):
+            if collection_number != 1 and not (post_count or follower_count or following_count or collected_at):
                 continue
             days_since_previous = (
                 _xlsx_elapsed_days(previous_collected_at, collected_at)
@@ -270,6 +277,7 @@ def _xlsx_project_user_rows(
                     *identity,
                     post_count,
                     follower_count,
+                    following_count,
                     follower_count_change,
                     collected_at,
                 ]

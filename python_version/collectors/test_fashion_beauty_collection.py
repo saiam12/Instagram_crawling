@@ -75,6 +75,13 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(parse_scheduled_command("fashion", ["--background"]).background)
         self.assertEqual(parse_scheduled_command("beauty", ["--maxdays", "14"]).max_upload_age_days, 14)
 
+    def test_test_single_hashtag_keeps_only_one_keyword_without_changing_normal_defaults(self) -> None:
+        config = parse_scheduled_command("fashion", ["--test-single-hashtag"])
+
+        self.assertEqual(config.keywords_per_window, 1)
+        self.assertEqual(config.fashion_keywords, (FASHION_KEYWORDS[0],))
+        self.assertEqual(parse_scheduled_command("fashion", []).keywords_per_window, KEYWORDS_PER_WINDOW)
+
     def test_discovery_must_end_nine_hours_before_run_end(self) -> None:
         with self.assertRaises(SystemExit):
             parse_fashion_command(["--duration-hours", "16", "--discovery-hours", "8"])
@@ -717,7 +724,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
     def test_due_retry_backoff_is_bounded_for_long_outages(self) -> None:
         self.assertEqual(
             [_due_retry_delay(attempt) for attempt in (1, 2, 3, 4, 5, 6, 20_000)],
-            [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0],
+            [300.0, 600.0, 1200.0, 1800.0, 1800.0, 1800.0, 1800.0],
         )
 
     async def test_nonzero_due_recollection_is_published_reported_and_retried_serially(self) -> None:
@@ -770,7 +777,120 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 7)
         self.assertEqual(attempts, 2)
         self.assertEqual(max_active, 1)
-        self.assertEqual(waits, [1.0])
+        self.assertEqual(sum(waits), 300.0)
+
+    async def test_repeated_due_failure_is_deferred_after_five_attempts(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=4,
+            discovery_hours=0,
+            domains=("fashion",),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/rate-limited/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+            }],
+        )
+        clock = ManualClock(started_at)
+        attempts = 0
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            return 2
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 5)
+        status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("retry deferred", status["last_error"])
+
+    async def test_rate_limit_pauses_all_due_work_for_thirty_minutes(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=31 / 60,
+            discovery_hours=0,
+            domains=("fashion",),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/rate-limited/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+            }],
+        )
+        clock = ManualClock(started_at)
+        attempts = 0
+        waits: list[float] = []
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+            status_path.write_text(
+                json.dumps({"follower_last_status": "rate_limited"}),
+                encoding="utf-8",
+            )
+            return 2
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(sum(waits[:60]), 1800.0)
+        status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("rate limit detected", status["last_error"])
+
+    async def test_failed_discovery_waits_before_retrying_the_same_window(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=1,
+            discovery_hours=1,
+            discovery_interval_minutes=60,
+            domains=("fashion",),
+        )
+        attempts = 0
+        waits: list[float] = []
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return 2
+            clock.current = started_at + timedelta(hours=1)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(sum(waits), 300.0)
 
     async def test_failed_due_job_backoff_does_not_delay_other_due_domain(self) -> None:
         started_at = datetime(2026, 8, 26, 0, 31, tzinfo=timezone.utc)

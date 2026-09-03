@@ -28,7 +28,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Sequence
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 from xml.etree import ElementTree
 
@@ -90,6 +90,7 @@ REEL_CHANGE_METRICS = [
 ]
 REEL_METRIC_CHANGE_FIELDS = [f"{field}_change" for field in REEL_CHANGE_METRICS]
 REEL_CHANGE_FIELDS = [*REEL_METRIC_CHANGE_FIELDS, "reaction_rate_change"]
+UNAVAILABLE_LIKE_COUNT_MARKER = "X"
 ROW_COLLECTION_FIELDS = [
     "collection_number",
     "days_since_previous",
@@ -126,8 +127,19 @@ REEL_MAX_CONSECUTIVE_RECOVERY_FAILURES = 6
 REEL_STATUS_WRITE_INTERVAL_SECONDS = 60
 DIRECT_REEL_CONCURRENCY = 1
 DIRECT_REEL_SETTLE_MILLISECONDS = 250
-DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS = 700
+# Keep listening for JSON responses that the current Reel page has already
+# initiated. This is deliberately a passive wait: it must not make a second
+# Instagram request simply because a metric arrives late.
+PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS = 20_000
+PASSIVE_RESPONSE_EXTENDED_WAIT_MILLISECONDS = 60_000
+DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS
+# The legacy media-info path is retained only as a diagnostic/test seam.  It
+# is disabled in normal operation and contains no browser-side fetch; regular
+# collection relies only on data emitted while Instagram renders the page.
+DIRECT_REEL_INFO_REQUESTS_ENABLED = False
 DIRECT_REEL_INFO_TIMEOUT_SECONDS = 5.0
+DIRECT_REEL_INFO_FETCH_TIMEOUT_MILLISECONDS = 4_000
+DIRECT_REEL_INFO_FRESH_PAGE_SETTLE_MILLISECONDS = 1_000
 EXACT_METRIC_MAX_ATTEMPTS = 3
 EXACT_METRIC_RETRY_DELAY_SECONDS = 2.0
 EXACT_REEL_DETAIL_SETTLE_MILLISECONDS = 1_000
@@ -155,6 +167,16 @@ PROFILE_CATEGORY_TEXT_PATTERN = re.compile(
     r"^[^\r\n]{1,100}\([^\r\n()]{1,60}\)$"
 )
 INSTAGRAM_USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+
+DIRECT_REEL_INFO_REQUEST_SCRIPT = r"""_mediaId => ({
+  // Direct endpoint requests are intentionally prohibited.  Tests may
+  // supply a synthetic result through Playwright's evaluate stub, but a real
+  // browser receives no endpoint to call here.
+  status: 0,
+  contentType: '',
+  media: null,
+  jsonError: false
+})"""
 
 
 def utc_now() -> datetime:
@@ -258,6 +280,19 @@ def normalize_reel_url(value: Any) -> dict[str, str] | None:
     if not match:
         return None
     return {"url": f"https://www.instagram.com/reels/{match.group(1)}/", "shortcode": match.group(1)}
+
+
+def reel_detail_page_url(value: Any) -> str:
+    """Return Instagram's singular Reel detail route for browser navigation.
+
+    Storage and deduplication retain the canonical ``/reels/<shortcode>/`` URL,
+    while the browser opens ``/reel/<shortcode>/`` because that surface can
+    expose the active media's page JSON more completely.
+    """
+    normalized = normalize_reel_url(value)
+    if normalized is None:
+        raise ValueError(f"Invalid Instagram Reel URL: {value}")
+    return f"https://www.instagram.com/reel/{quote(normalized['shortcode'], safe='')}/"
 
 
 def filter_new_urls(urls: list[str], history_rows: list[dict[str, Any]]) -> list[str]:
@@ -389,6 +424,25 @@ def calculate_reel_derived_fields(
     return derived
 
 
+def is_like_count_marked_unavailable(value: Any) -> bool:
+    """Return whether a visible but intentionally undisclosed like count is stored."""
+    return str(value or "").strip().upper() == UNAVAILABLE_LIKE_COUNT_MARKER
+
+
+def should_mark_like_count_unavailable(
+    visible_record: dict[str, Any], metadata: dict[str, Any] | None,
+) -> bool:
+    """Identify a rendered like control that exposes no exact count to this viewer.
+
+    The collector waits for the page's own JSON responses first. Only after
+    that wait has completed do we turn this UI state into the explicit ``X``
+    marker; an absent control remains a normal missing-metric failure.
+    """
+    return bool(visible_record.get("likeControlPresent")) and (
+        exact_nonnegative_integer((metadata or {}).get("likeCount")) is None
+    )
+
+
 def enrich_reel_collection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Add calculated fields while comparing each Reel with its prior collection."""
     enriched: list[dict[str, Any]] = [{} for _ in rows]
@@ -494,6 +548,28 @@ def exact_visible_profile_post_count(value: Any) -> int | None:
     return None
 
 
+def exact_visible_profile_following_count(value: Any) -> int | None:
+    """Read a full integer following value from the rendered profile header."""
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    number = r"(?P<count>\d{1,3}(?:,\d{3})*|\d+)"
+    suffix = r"(?![\d.]|\s*(?:천|만|억|[KMB]))"
+    patterns = [
+        re.compile(rf"(?:팔로우|following)\s*[:：]?\s*{number}{suffix}", re.I),
+        re.compile(rf"{number}{suffix}\s*(?:팔로우|following)", re.I),
+    ]
+    for raw in values:
+        text = str(raw or "").replace("\u00a0", " ")
+        for pattern in patterns:
+            match = pattern.search(text)
+            if not match:
+                continue
+            try:
+                return int(match.group("count").replace(",", ""))
+            except ValueError:
+                continue
+    return None
+
+
 def exact_profile_post_count(user: dict[str, Any]) -> int | None:
     """Use the API's full media count when available, otherwise return None."""
     for field in ["media_count", "post_count", "posts_count"]:
@@ -546,6 +622,49 @@ def follower_count_from_instagram_data(value: Any, username: str, depth: int = 0
         if found != "":
             return found
     return ""
+
+
+def profile_snapshot_from_instagram_data(value: Any, username: str, depth: int = 0) -> dict[str, Any]:
+    """Find an exact target-profile snapshot in a response the page initiated."""
+    if not isinstance(value, (dict, list)) or depth > 20:
+        return {}
+    expected = str(username or "").strip().lstrip("@").casefold()
+    if isinstance(value, dict):
+        observed_username = str(value.get("username") or value.get("user_name") or "").strip().lstrip("@").casefold()
+        if expected and observed_username == expected:
+            edge = _dict(value.get("edge_followed_by"))
+            following = _dict(value.get("edge_follow"))
+            follower_count = next(
+                (
+                    count
+                    for raw in [value.get("follower_count"), value.get("followers_count"), edge.get("count")]
+                    if (count := exact_nonnegative_integer(raw)) is not None
+                ),
+                None,
+            )
+            if follower_count is not None:
+                return {
+                    "followerCount": follower_count,
+                    "followingCount": next(
+                        (
+                            count
+                            for raw in [value.get("following_count"), value.get("follows_count"), following.get("count")]
+                            if (count := exact_nonnegative_integer(raw)) is not None
+                        ),
+                        None,
+                    ),
+                    "biography": str(value.get("biography") or ""),
+                    "profile_category": profile_category_from_data(value),
+                    "postCount": exact_profile_post_count(value),
+                }
+        children = value.values()
+    else:
+        children = value
+    for child in children:
+        snapshot = profile_snapshot_from_instagram_data(child, username, depth + 1)
+        if snapshot:
+            return snapshot
+    return {}
 
 
 def truncate_caption(value: Any, max_characters: int = 300) -> str:
@@ -648,8 +767,7 @@ async def resolve_follower_result(
 def has_exact_engagement_metadata(metadata: dict[str, Any] | None) -> bool:
     candidate = metadata or {}
     # Instagram does not expose a repost aggregate for every Reel. A missing
-    # field is normalized to the verified zero-value convention during record
-    # construction, so likes and comments remain the required API fields.
+    # field is kept blank, so likes and comments remain the required fields.
     return all(
         exact_nonnegative_integer(candidate.get(field)) is not None
         for field in ["likeCount", "commentCount"]
@@ -685,7 +803,7 @@ def metadata_from_media(
         else None
     )
     repost_value = media.get("media_repost_count") if media.get("media_repost_count") is not None else media.get("repost_count")
-    repost_count = 0 if repost_value is None else exact_nonnegative_integer(repost_value)
+    repost_count = exact_nonnegative_integer(repost_value)
     return {
         "userId": str(user.get("pk") or user.get("pk_id") or user.get("id") or "").strip(),
         "username": str(user.get("username") or "").strip(),
@@ -760,7 +878,7 @@ def merge_direct_reel_metadata(current: dict[str, Any] | None, direct: dict[str,
 def exact_view_counts_from_metadata(shortcode: str, metadata: dict[str, Any] | None) -> dict[str, int]:
     candidate = metadata or {}
     count = exact_nonnegative_integer(candidate.get("viewCount"))
-    if not shortcode or count is None or candidate.get("viewSourceField") != "play_count":
+    if not shortcode or count is None or candidate.get("viewSourceField") not in {"play_count", "view_count", "visible_dom", "profile_grid_dom"}:
         return {}
     return {shortcode: count}
 
@@ -772,6 +890,46 @@ def direct_reel_info_diagnostic_message(diagnostic: dict[str, str] | None, missi
     return str(result.get("error") or "").strip()
 
 
+def _parse_direct_reel_info_payload(raw_body: Any) -> dict[str, Any] | None:
+    """Parse a direct-endpoint payload, tolerating a harmless XSSI prefix."""
+    body = str(raw_body or "").lstrip("\ufeff \t\r\n")
+    candidates = [body]
+    object_start, object_end = body.find("{"), body.rfind("}")
+    if object_start >= 0 and object_end > object_start:
+        candidates.append(body[object_start:object_end + 1])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _direct_reel_info_invalid_json_error(endpoint: dict[str, Any]) -> str:
+    content_type = str(endpoint.get("contentType") or "").split(";", 1)[0].strip()
+    body_length = len(str(endpoint.get("text") or ""))
+    details = [part for part in [content_type, f"{body_length} bytes" if body_length else ""] if part]
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"Direct Reel info returned an invalid JSON response{suffix}."
+
+
+def is_direct_reel_info_html_response(diagnostic: dict[str, str] | None) -> bool:
+    """Return whether Instagram served a web document instead of the API JSON."""
+    return (diagnostic or {}).get("status") == "html_response"
+
+
+def _set_direct_reel_info_diagnostic(
+    diagnostic: dict[str, str] | None,
+    status: str,
+    error: str = "",
+) -> None:
+    if diagnostic is not None:
+        diagnostic.clear()
+        diagnostic.update({"status": status, "error": error})
+
+
 def is_direct_reel_info_access_denied(diagnostic: dict[str, str] | None) -> bool:
     """Identify request statuses that must not be retried in the same session."""
     result = diagnostic or {}
@@ -780,13 +938,22 @@ def is_direct_reel_info_access_denied(diagnostic: dict[str, str] | None) -> bool
     )
 
 
-def collect_reel_metadata(value: Any, destination: dict[str, dict[str, Any]], depth: int = 0) -> None:
+def collect_reel_metadata(
+    value: Any,
+    destination: dict[str, dict[str, Any]],
+    depth: int = 0,
+    *,
+    include_follower_count: bool = False,
+) -> None:
     if not isinstance(value, (dict, list)) or depth > 16:
         return
     if isinstance(value, dict):
         shortcode = str(value.get("code") or value.get("shortcode") or value.get("media_code") or "")
         if re.fullmatch(r"[A-Za-z0-9_-]+", shortcode):
-            merged = merge_reel_metadata(destination.get(shortcode), metadata_from_media(value))
+            merged = merge_reel_metadata(
+                destination.get(shortcode),
+                metadata_from_media(value, include_follower_count=include_follower_count),
+            )
             if any(merged.values()):
                 destination[shortcode] = merged
         children = value.values()
@@ -794,7 +961,88 @@ def collect_reel_metadata(value: Any, destination: dict[str, dict[str, Any]], de
         children = value
     for child in children:
         if isinstance(child, (dict, list)):
-            collect_reel_metadata(child, destination, depth + 1)
+            collect_reel_metadata(
+                child,
+                destination,
+                depth + 1,
+                include_follower_count=include_follower_count,
+            )
+
+
+async def _collect_reel_metadata_from_response(response: Any, destination: dict[str, dict[str, Any]]) -> None:
+    """Merge metadata from Instagram JSON and Fetch/XHR response bodies.
+
+    Instagram sometimes serves a JSON GraphQL payload with a non-JSON content
+    type (notably ``text/plain``).  Those Fetch/XHR responses still carry the
+    same passive ``play_count`` value, so use the transport type as a second
+    eligibility signal and tolerate Instagram's XSSI prefix while parsing.
+    """
+    try:
+        parsed = urlparse(response.url)
+        content_type = response.headers.get("content-type", "")
+        request = getattr(response, "request", None)
+        resource_type = str(getattr(request, "resource_type", "") or "").casefold()
+        is_json_content = "json" in content_type.casefold()
+        is_fetch_or_xhr = resource_type in {"fetch", "xhr"}
+        if (
+            not parsed.hostname
+            or not parsed.hostname.endswith("instagram.com")
+            or not (is_json_content or is_fetch_or_xhr)
+        ):
+            return
+        body = await response.text()
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = _parse_direct_reel_info_payload(body)
+        if not isinstance(payload, (dict, list)):
+            return
+        collect_reel_metadata(
+            payload,
+            destination,
+            include_follower_count=True,
+        )
+    except Exception:
+        return
+
+
+async def _collect_profile_snapshot_from_response(
+    response: Any,
+    username: str,
+    destination: dict[str, Any],
+) -> None:
+    """Read the target profile from a GraphQL/XHR response already in flight."""
+    try:
+        parsed = urlparse(response.url)
+        content_type = response.headers.get("content-type", "")
+        request = getattr(response, "request", None)
+        resource_type = str(getattr(request, "resource_type", "") or "").casefold()
+        if (
+            not parsed.hostname
+            or not parsed.hostname.endswith("instagram.com")
+            or not ("json" in content_type.casefold() or resource_type in {"fetch", "xhr"})
+        ):
+            return
+        body = await response.text()
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = _parse_direct_reel_info_payload(body)
+        snapshot = profile_snapshot_from_instagram_data(payload, username)
+        if snapshot and exact_nonnegative_integer(snapshot.get("followerCount")) is not None:
+            destination.update(snapshot)
+    except Exception:
+        return
+
+
+async def _cancel_pending_response_tasks(response_tasks: set[asyncio.Task[None]]) -> None:
+    pending_tasks = [task for task in response_tasks if not task.done()]
+    for task in pending_tasks:
+        task.cancel()
+    if pending_tasks:
+        done, _ = await asyncio.wait(pending_tasks, timeout=0.5)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
 
 
 def build_collected_record(record: dict[str, Any], response_metadata: dict[str, Any] | None = None, collected_at: str | None = None) -> dict[str, Any]:
@@ -842,10 +1090,15 @@ def build_anonymous_refresh_record(existing: dict[str, Any], observed: dict[str,
     refreshed["url"] = refreshed["url"] or observed.get("url")
     refreshed["collected_at"] = observed.get("collected_at") or refreshed["collected_at"]
     for field in ["view_count", "like_count", "comment_count", "repost_count"]:
-        refreshed[field] = exact_nonnegative_integer(observed.get(field))
-    duration = exact_nonnegative_number(observed.get("video_duration_seconds"))
-    if duration is not None:
-        refreshed["video_duration_seconds"] = duration
+        value = observed.get(field)
+        refreshed[field] = (
+            UNAVAILABLE_LIKE_COUNT_MARKER
+            if field == "like_count" and is_like_count_marked_unavailable(value)
+            else exact_nonnegative_integer(value)
+        )
+    # The anonymous refresh is a metrics snapshot. Keep the initial
+    # video-duration value instead of treating an unavailable or changed public
+    # page representation as a new duration observation.
     follower_count = exact_nonnegative_integer(observed.get("follower_count"))
     refreshed["follower_count"] = follower_count if follower_count is not None else ""
     refreshed["days_since_upload"] = days_since_upload(refreshed.get("uploaded_at"), refreshed.get("collected_at"))
@@ -884,7 +1137,7 @@ def build_anonymous_refresh_from_exact_metrics(
     candidate["follower_count"] = (
         follower_count
         if follower_result.get("status") == "success"
-        and follower_result.get("sourceField") in {"follower_count", "edge_followed_by.count", "profile_header_text"}
+        and follower_result.get("sourceField") in {"follower_count", "edge_followed_by.count", "passive_profile_response.follower_count", "profile_header_text"}
         and follower_count is not None
         else ""
     )
@@ -894,7 +1147,15 @@ def build_anonymous_refresh_from_exact_metrics(
 def has_complete_reel_core_data(record: dict[str, Any] | None) -> bool:
     if not record:
         return False
-    return all(str(record.get(field, "")).strip() for field in ["url", "user_id", "username", "uploaded_at"]) and all(exact_nonnegative_integer(record.get(field)) is not None for field in ["view_count", "like_count", "comment_count", "repost_count", "follower_count"]) and str(record.get("ad", "")).lower() in {"true", "false"}
+    return (
+        all(str(record.get(field, "")).strip() for field in ["url", "user_id", "username", "uploaded_at"])
+        and all(exact_nonnegative_integer(record.get(field)) is not None for field in ["view_count", "comment_count", "follower_count"])
+        and (
+            exact_nonnegative_integer(record.get("like_count")) is not None
+            or is_like_count_marked_unavailable(record.get("like_count"))
+        )
+        and str(record.get("ad", "")).lower() in {"true", "false"}
+    )
 
 
 def apply_exact_metric_results(
@@ -903,18 +1164,20 @@ def apply_exact_metric_results(
     view_counts: dict[str, int],
     follower_result: dict[str, Any],
 ) -> dict[str, str]:
-    if record.get("repost_count") in (None, ""):
-        record["repost_count"] = 0
-    for field in ["like_count", "comment_count", "repost_count"]:
-        if exact_nonnegative_integer(record.get(field)) is None:
-            return {"status": f"exact_{field}_unavailable", "error": f"Exact Network integer was unavailable for {field}."}
+    if (
+        exact_nonnegative_integer(record.get("like_count")) is None
+        and not is_like_count_marked_unavailable(record.get("like_count"))
+    ):
+        return {"status": "exact_like_count_unavailable", "error": "Exact page integer was unavailable for like_count."}
+    if exact_nonnegative_integer(record.get("comment_count")) is None:
+        return {"status": "exact_comment_count_unavailable", "error": "Exact page integer was unavailable for comment_count."}
     view_count = exact_nonnegative_integer(view_counts.get(shortcode))
     if view_count is None:
         return {"status": "exact_view_unavailable", "error": "Exact play_count was unavailable for the target Reel."}
     follower_count = exact_nonnegative_integer(follower_result.get("followerCount"))
     if (
         follower_result.get("status") != "success"
-        or follower_result.get("sourceField") not in {"follower_count", "edge_followed_by.count", "profile_header_text"}
+        or follower_result.get("sourceField") not in {"follower_count", "edge_followed_by.count", "passive_profile_response.follower_count", "profile_header_text"}
         or follower_count is None
     ):
         return {
@@ -1205,7 +1468,7 @@ def write_users_xlsx(data_dir: Path | str) -> Path:
     destination = Path(data_dir).resolve()
     fields, rows = read_csv_objects(ensure_user_history(destination))
     if not fields:
-        fields = ["user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at"]
+        fields = ["user_id", "username", "biography", "profile_category", "post_count", "follower_count", "following_count", "collected_at"]
     public_fields, public_rows = project_public_records("users", rows, fields)
     write_csv_records(destination / "users.csv", public_rows, public_fields)
     return write_reel_xlsx(
@@ -1875,9 +2138,82 @@ class CrawlerAccessError(RuntimeError):
         self.code = code
 
 
+def can_skip_anonymous_refresh_access_error(error: CrawlerAccessError, *, no_login: bool) -> bool:
+    """Only login walls are skippable during an anonymous URL refresh.
+
+    Rate limits and checkpoints must stop the whole run: continuing after those
+    signals would create additional requests. A login wall, on the other hand,
+    is specific to the current Reel and does not prove every queued public URL
+    is unavailable.
+    """
+    return bool(no_login and error.code == "login_required")
+
+
 def _response_status(response: Any) -> int | None:
     status = getattr(response, "status", None)
     return status() if callable(status) else status
+
+
+@dataclass
+class InstagramRateLimitState:
+    """Shared stop signal for every page in one browser context."""
+
+    limited: bool = False
+    response_url: str = ""
+    retry_after_seconds: float | None = None
+
+    def observe(self, response: Any) -> None:
+        if _response_status(response) != 429:
+            return
+        url = str(getattr(response, "url", "") or "")
+        hostname = urlparse(url).hostname
+        if not hostname or not hostname.endswith("instagram.com"):
+            return
+        self.limited = True
+        self.response_url = url
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("retry-after", "") if hasattr(headers, "get") else ""
+        try:
+            delay = float(retry_after)
+        except (TypeError, ValueError):
+            delay = -1
+        self.retry_after_seconds = delay if math.isfinite(delay) and delay >= 0 else None
+
+    def raise_if_limited(self) -> None:
+        if not self.limited:
+            return
+        retry_hint = (
+            f" Retry-After: {self.retry_after_seconds:g} seconds."
+            if self.retry_after_seconds is not None
+            else ""
+        )
+        raise CrawlerAccessError(
+            "rate_limited",
+            f"Instagram returned HTTP 429 for {self.response_url or 'a page response'}.{retry_hint}",
+        )
+
+
+_CONTEXT_RATE_LIMIT_STATES: dict[int, InstagramRateLimitState] = {}
+_PAGE_RATE_LIMIT_STATES: dict[int, InstagramRateLimitState] = {}
+
+
+def rate_limit_state_for_context(context: Any) -> InstagramRateLimitState:
+    state = getattr(context, "_instagram_collector_rate_limit_state", None)
+    if isinstance(state, InstagramRateLimitState):
+        return state
+    state = InstagramRateLimitState()
+    try:
+        setattr(context, "_instagram_collector_rate_limit_state", state)
+        return state
+    except Exception:
+        pass
+    key = id(context)
+    return _CONTEXT_RATE_LIMIT_STATES.setdefault(key, state)
+
+
+def rate_limit_state_for_page(page: Any) -> InstagramRateLimitState | None:
+    state = getattr(page, "_instagram_collector_rate_limit_state", None)
+    return state if isinstance(state, InstagramRateLimitState) else _PAGE_RATE_LIMIT_STATES.get(id(page))
 
 
 def assert_instagram_page_access(page: Any, response: Any = None, *, allow_login: bool = False) -> None:
@@ -1894,6 +2230,9 @@ async def navigate_with_retries(page: Any, url: str, *, attempts: int = 3, allow
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
+            state = rate_limit_state_for_page(page)
+            if state is not None:
+                state.raise_if_limited()
             response = await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             assert_instagram_page_access(page, response, allow_login=allow_login)
             return response
@@ -1906,31 +2245,42 @@ async def navigate_with_retries(page: Any, url: str, *, attempts: int = 3, allow
     raise last_error or RuntimeError(f"Failed to open {url}")
 
 
-def attach_reel_metadata_collector(page: Any, reel_metadata: dict[str, dict[str, Any]]) -> None:
-    async def collect_response(response: Any) -> None:
+def attach_reel_metadata_collector(
+    page: Any,
+    reel_metadata: dict[str, dict[str, Any]],
+    rate_limit_state: InstagramRateLimitState | None = None,
+) -> None:
+    if rate_limit_state is not None:
         try:
-            parsed = urlparse(response.url)
-            content_type = response.headers.get("content-type", "")
-            if not parsed.hostname or not parsed.hostname.endswith("instagram.com") or "json" not in content_type:
-                return
-            collect_reel_metadata(json.loads(await response.text()), reel_metadata)
+            setattr(page, "_instagram_collector_rate_limit_state", rate_limit_state)
         except Exception:
-            pass
+            _PAGE_RATE_LIMIT_STATES[id(page)] = rate_limit_state
 
     def on_response(response: Any) -> None:
-        asyncio.create_task(collect_response(response))
+        if rate_limit_state is not None:
+            rate_limit_state.observe(response)
+        asyncio.create_task(_collect_reel_metadata_from_response(response, reel_metadata))
 
     page.on("response", on_response)
 
 
-async def collect_embedded_reel_metadata(page: Any, reel_metadata: dict[str, dict[str, Any]]) -> None:
+async def collect_embedded_reel_metadata(
+    page: Any,
+    reel_metadata: dict[str, dict[str, Any]],
+    *,
+    include_follower_count: bool = False,
+) -> None:
     try:
         embedded = await page.locator('script[type="application/json"]').all_text_contents()
     except Exception:
         return
     for raw in embedded:
         try:
-            collect_reel_metadata(json.loads(raw), reel_metadata)
+            collect_reel_metadata(
+                json.loads(raw),
+                reel_metadata,
+                include_follower_count=include_follower_count,
+            )
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
 
@@ -1942,9 +2292,10 @@ async def create_collection_page(
     *,
     allow_login: bool = False,
     keep_open_on_navigation_failure: bool = False,
+    rate_limit_state: InstagramRateLimitState | None = None,
 ) -> Any:
     page = await context.new_page()
-    attach_reel_metadata_collector(page, reel_metadata)
+    attach_reel_metadata_collector(page, reel_metadata, rate_limit_state)
     try:
         await navigate_with_retries(page, url, allow_login=allow_login)
         await page.wait_for_timeout(500)
@@ -1957,14 +2308,20 @@ async def create_collection_page(
         raise
 
 
-async def recycle_collection_page(context: Any, page: Any, url: str, reel_metadata: dict[str, dict[str, Any]]) -> Any:
+async def recycle_collection_page(
+    context: Any,
+    page: Any,
+    url: str,
+    reel_metadata: dict[str, dict[str, Any]],
+    rate_limit_state: InstagramRateLimitState | None = None,
+) -> Any:
     if page:
         try:
             await page.close()
         except Exception:
             pass
     reel_metadata.clear()
-    return await create_collection_page(context, url, reel_metadata)
+    return await create_collection_page(context, url, reel_metadata, rate_limit_state=rate_limit_state)
 
 
 def hashtag_candidate_limit(
@@ -1988,6 +2345,7 @@ async def collect_hashtag_reel_urls(
     reel_metadata: dict[str, dict[str, Any]] | None = None,
     should_stop: Callable[[], bool] | None = None,
     candidates_per_keyword: int = 0,
+    rate_limit_state: InstagramRateLimitState | None = None,
 ) -> list[str]:
     groups: list[list[str]] = []
     metadata = reel_metadata if reel_metadata is not None else {}
@@ -1997,10 +2355,15 @@ async def collect_hashtag_reel_urls(
         candidates_per_keyword,
     )
     for hashtag_index, hashtag in enumerate(hashtags, start=1):
+        active_rate_limit_state = rate_limit_state or rate_limit_state_for_page(page)
+        if active_rate_limit_state is not None:
+            active_rate_limit_state.raise_if_limited()
         if should_stop and should_stop():
             return []
         await page.goto(hashtag_page_url(hashtag), wait_until="domcontentloaded", timeout=30_000)
         await page.wait_for_timeout(2_000)
+        if active_rate_limit_state is not None:
+            active_rate_limit_state.raise_if_limited()
         if should_stop and should_stop():
             return []
         if re.search(r"/accounts/login", page.url, re.I):
@@ -2011,6 +2374,8 @@ async def collect_hashtag_reel_urls(
         seen: set[str] = set()
         unchanged_attempts = 0
         for _ in range(30):
+            if active_rate_limit_state is not None:
+                active_rate_limit_state.raise_if_limited()
             if should_stop and should_stop():
                 return []
             if per_hashtag_limit and len(urls) >= per_hashtag_limit:
@@ -2068,6 +2433,8 @@ async def collect_hashtag_reel_urls(
                 break
             await page.mouse.wheel(0, 1_200)
             await page.wait_for_timeout(800)
+            if active_rate_limit_state is not None:
+                active_rate_limit_state.raise_if_limited()
         print(f"[Hashtag {hashtag_index}/{len(hashtags)}] #{hashtag} -> 릴스 후보 {len(urls)}개")
         groups.append(urls)
     combined: list[str] = []
@@ -2293,24 +2660,45 @@ EXTRACT_VISIBLE_REEL_SCRIPT = r"""() => {
     const matches = String(value || '').match(/\d+(?:[.,]\d+)*(?:\s*(?:천|만|억|[KMB]))?/gi) || [];
     return matches.sort((a, b) => b.length - a.length)[0]?.replace(/\s+/g, '') || '';
   };
+  const exactMetricToken = value => {
+    const text = String(value || '').replace(/\u00a0/g, ' ');
+    const matches = [...text.matchAll(/(?<![\d.,])(?:\d{1,3}(?:,\d{3})+|\d+)(?![\d.,\s]*(?:천|만|억|[KMB]))/gi)]
+      .map(match => match[0]);
+    return matches.sort((a, b) => b.length - a.length)[0] || '';
+  };
+  const metricSources = element => [
+    element?.getAttribute?.('aria-label') || '', element?.getAttribute?.('title') || '',
+    element?.querySelector?.('[aria-label]')?.getAttribute('aria-label') || '',
+    element?.querySelector?.('title')?.textContent || '', textOf(element),
+  ];
   const metricFrom = candidates => {
+    let compactToken = '';
     for (const control of candidates) {
       let node = control;
       for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
-        const token = metricToken(textOf(node));
-        if (token) return token;
+        for (const source of metricSources(node)) {
+          const exact = exactMetricToken(source);
+          if (exact) return exact;
+          const token = metricToken(source);
+          if (!compactToken && token) compactToken = token;
+        }
       }
     }
-    return '';
+    return compactToken;
   };
   const viewLine = textOf(document.querySelector('main')).split(/\n+/).find(line =>
     /(?:조회수|views?|plays?)/i.test(line) && metricToken(line)
   ) || '';
   const skip = new Set(['about', 'accounts', 'direct', 'explore', 'reel', 'reels', 'stories']);
-  const profiles = [...scope.querySelectorAll('a[href^="/"]')].filter(visible).map(element => ({
+  const profileLinks = root => [...root.querySelectorAll('a[href^="/"]')].filter(visible).map(element => ({
     element, parts: (element.getAttribute('href') || '').split('/').filter(Boolean)
   })).filter(item => item.parts.length === 1 && !skip.has(item.parts[0].toLowerCase()))
     .sort((a, b) => centerDistance(a.element, videoRect) - centerDistance(b.element, videoRect));
+  // On the desktop Reel layout, the author block can be a sibling of the
+  // video article rather than its child. Limit the fallback to ``main`` so
+  // the logged-in account link in Instagram's left sidebar is never selected.
+  const profiles = profileLinks(scope);
+  if (!profiles.length) profiles.push(...profileLinks(document.querySelector('main') || scope));
   const username = profiles[0]?.parts[0] || '';
   const audioAnchor = [...scope.querySelectorAll('a[href*="/audio/"]')].filter(visible)
     .sort((a, b) => centerDistance(a, videoRect) - centerDistance(b, videoRect))[0];
@@ -2344,8 +2732,9 @@ EXTRACT_VISIBLE_REEL_SCRIPT = r"""() => {
     currentUrl: location.href, activeHref: activeLink?.href || '', username, title: captions[0]?.text || '',
     hashtagTexts: [...scope.querySelectorAll('a[href*="/explore/tags/"]')].filter(visible).map(textOf).filter(text => text.startsWith('#')),
     audioName, locationName, ad, uploadedAt,
-    viewText: metricFrom(viewControls) || metricToken(viewLine),
-    likeText: metricFrom(likeControls), commentText: metricFrom(commentControls), repostText: metricFrom(repostControls)
+    viewText: metricFrom(viewControls) || exactMetricToken(viewLine) || metricToken(viewLine),
+    likeText: metricFrom(likeControls), likeControlPresent: likeControls.length > 0,
+    commentText: metricFrom(commentControls), repostText: metricFrom(repostControls)
   };
 }"""
 
@@ -2354,6 +2743,41 @@ async def extract_visible_reel(page: Any) -> dict[str, Any] | None:
     browser_data = await page.evaluate(EXTRACT_VISIBLE_REEL_SCRIPT)
     normalized = normalize_reel_url(browser_data.get("currentUrl")) or normalize_reel_url(browser_data.get("activeHref"))
     return {**browser_data, **normalized} if normalized else None
+
+
+def exact_visible_reel_count(value: Any) -> int | None:
+    """Accept only a fully rendered integer, never a compact metric label."""
+    text = str(value or "").replace("\u00a0", " ").strip()
+    if not re.fullmatch(r"\d+|\d{1,3}(?:,\d{3})+", text):
+        return None
+    try:
+        return int(text.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def metadata_from_visible_reel(record: dict[str, Any] | None) -> dict[str, Any]:
+    """Use exact count labels already rendered for the active Reel as page data."""
+    visible = record or {}
+    view_count = exact_visible_reel_count(visible.get("viewText"))
+    return {
+        "userId": "",
+        "username": str(visible.get("username") or "").strip().lstrip("@"),
+        "caption": "",
+        "audioName": "",
+        "locationName": "",
+        "ad": False,
+        "uploadedAt": "",
+        "videoDurationSeconds": None,
+        "viewCount": view_count,
+        "viewSourceField": "visible_dom" if view_count is not None else None,
+        "followerCount": None,
+        "followerSourceField": None,
+        "likeCount": exact_visible_reel_count(visible.get("likeText")),
+        "commentCount": exact_visible_reel_count(visible.get("commentText")),
+        "repostCount": exact_visible_reel_count(visible.get("repostText")),
+        "isReel": True,
+    }
 
 
 async def read_active_reel_identity(page: Any) -> dict[str, str] | None:
@@ -2406,13 +2830,206 @@ def next_transition_stall_state(previous_count: Any, changed: bool) -> dict[str,
     return {"consecutive": consecutive, "shouldRecycle": consecutive >= REEL_UNPRODUCTIVE_RECYCLE_THRESHOLD}
 
 
-async def wait_for_reel_metadata(shortcode: str, reel_metadata: dict[str, dict[str, Any]], timeout_milliseconds: int = 1_000) -> dict[str, Any]:
+async def wait_for_reel_metadata(shortcode: str, reel_metadata: dict[str, dict[str, Any]], timeout_milliseconds: int = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_milliseconds / 1000
     while time.monotonic() < deadline:
         if shortcode in reel_metadata:
             return reel_metadata[shortcode]
         await asyncio.sleep(0.1)
     return reel_metadata.get(shortcode, {})
+
+
+def has_complete_page_reel_metrics(shortcode: str, metadata: dict[str, Any] | None) -> bool:
+    """Return whether page data contains every exact metric required by this collector."""
+    return bool(
+        has_exact_engagement_metadata(metadata)
+        and exact_view_counts_from_metadata(shortcode, metadata)
+        and exact_follower_result_from_metadata(metadata) is not None
+    )
+
+
+async def wait_for_complete_page_reel_metadata(
+    shortcode: str,
+    reel_metadata: dict[str, dict[str, Any]],
+    timeout_milliseconds: int = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS,
+) -> dict[str, Any]:
+    """Wait only for responses the current page has already initiated itself."""
+    deadline = time.monotonic() + timeout_milliseconds / 1_000
+    latest = reel_metadata.get(shortcode, {})
+    while time.monotonic() < deadline:
+        latest = reel_metadata.get(shortcode, latest)
+        if has_complete_page_reel_metrics(shortcode, latest):
+            return latest
+        await asyncio.sleep(0.1)
+    return reel_metadata.get(shortcode, latest)
+
+
+async def open_reel_from_creator_profile(page: Any, username: str, shortcode: str) -> dict[str, Any]:
+    """Inspect a target profile-grid card and open it only when its view label is compact.
+
+    Navigating directly to ``/reel/<shortcode>/`` is redirected by Instagram
+    to the plural route in some sessions. If the grid card itself renders a
+    full integer (for example ``6591``), that DOM value is already exact. A
+    compact label (such as ``1.5만``) instead requires clicking the card so the
+    normal UI response exposes its raw ``play_count``.
+    """
+    result: dict[str, Any] = {"found": False, "opened": False, "viewText": ""}
+    normalized_username = str(username or "").strip().lstrip("@")
+    target = str(shortcode or "").strip()
+    if not (
+        INSTAGRAM_USERNAME_PATTERN.fullmatch(normalized_username)
+        and re.fullmatch(r"[A-Za-z0-9_-]+", target)
+    ):
+        return result
+    await navigate_with_retries(
+        page,
+        f"https://www.instagram.com/{quote(normalized_username, safe='')}/reels/",
+    )
+    await page.wait_for_timeout(PROFILE_REEL_VIEW_SETTLE_MILLISECONDS)
+    try:
+        attempts = max(1, int(PROFILE_REEL_VIEW_SCROLL_ATTEMPTS))
+        for attempt in range(attempts):
+            card = await page.evaluate(
+                r"""shortcode => {
+              const visible = element => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+              };
+              const target = [...document.querySelectorAll('a[href]')].find(anchor => {
+                try {
+                  const path = new URL(anchor.href, location.href).pathname;
+                  // Profile grids use /<username>/reel/<shortcode>/ rather
+                  // than the standalone /reel/<shortcode>/ permalink.
+                  return new RegExp(`^/(?:[A-Za-z0-9._]{1,30}/)?(?:reels?|p)/${shortcode}/?$`, 'i').test(path) && visible(anchor);
+                } catch (_) {
+                  return false;
+                }
+              });
+              if (!target) return {found: false, viewText: '', href: ''};
+              target.scrollIntoView({block: 'center', inline: 'nearest'});
+              const text = [
+                target.getAttribute('aria-label') || '', target.getAttribute('title') || '',
+                target.innerText || '', target.textContent || ''
+              ].join(' ').replace(/\u00a0/g, ' ');
+              const exact = [...text.matchAll(/(?<![\d.,/])(?:\d{1,3}(?:,\d{3})+|\d+)(?![\d.,/\s]*(?:천|만|억|[KMB]))/gi)]
+                .map(match => match[0]).sort((a, b) => b.length - a.length)[0] || '';
+              return {found: true, viewText: exact, href: target.href};
+            }""",
+                target,
+            )
+            if not isinstance(card, dict):
+                card = result
+            if card.get("found"):
+                result = {**result, **card}
+            if result.get("found") and exact_visible_reel_count(result.get("viewText")) is not None:
+                return result
+            if result.get("found") and result.get("href"):
+                # Scheduling the DOM click after this evaluation returns avoids
+                # treating Instagram's immediate navigation as an execution-
+                # context error. The click remains a normal UI action, not a
+                # direct media-info request.
+                scheduled = await page.evaluate(
+                    r"""href => {
+                      const target = [...document.querySelectorAll('a[href]')]
+                        .find(anchor => anchor.href === href);
+                      if (!target) return false;
+                      setTimeout(() => target.click(), 0);
+                      return true;
+                    }""",
+                    str(result["href"]),
+                )
+                if scheduled:
+                    result["opened"] = True
+                else:
+                    result["href"] = ""
+            if result.get("opened"):
+                await page.wait_for_timeout(PROFILE_REEL_VIEW_SETTLE_MILLISECONDS)
+                return result
+            if attempt + 1 < attempts:
+                await page.mouse.wheel(0, 1_500)
+                await page.wait_for_timeout(PROFILE_REEL_VIEW_SCROLL_MILLISECONDS)
+    except Exception:
+        return result
+    return result
+
+
+async def resolve_page_first_reel_metadata(
+    page: Any,
+    record: dict[str, Any],
+    passive_response_metadata: dict[str, dict[str, Any]],
+    timeout_milliseconds: int = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS,
+) -> tuple[dict[str, Any], bool]:
+    """Prefer active-page embedded/DOM data before using passive responses.
+
+    After 20 seconds without a complete response, open the Reel through its
+    creator's profile grid and retry passive observation. This uses normal
+    browser navigation and clicks only; it never calls the direct media-info
+    API.
+    """
+    shortcode = str(record.get("shortcode") or "")
+    embedded_metadata: dict[str, dict[str, Any]] = {}
+    await collect_embedded_reel_metadata(page, embedded_metadata, include_follower_count=True)
+    page_metadata = merge_reel_metadata(
+        embedded_metadata.get(shortcode),
+        metadata_from_visible_reel(record),
+    )
+    if has_complete_page_reel_metrics(shortcode, page_metadata):
+        return page_metadata, False
+    passive_metadata = await wait_for_complete_page_reel_metadata(
+        shortcode,
+        passive_response_metadata,
+        timeout_milliseconds,
+    )
+    resolved_metadata = merge_reel_metadata(page_metadata, passive_metadata)
+    if has_complete_page_reel_metrics(shortcode, resolved_metadata) or timeout_milliseconds <= 0:
+        return resolved_metadata, True
+
+    # A target Reel's JSON owner is authoritative. The rendered author link
+    # is used only when that response has not arrived yet; never fall back to
+    # a generic document/sidebar profile link.
+    username = str(resolved_metadata.get("username") or "").strip().lstrip("@")
+    if not INSTAGRAM_USERNAME_PATTERN.fullmatch(username):
+        try:
+            refreshed_record = await extract_visible_reel(page)
+            username = str((refreshed_record or {}).get("username") or "").strip().lstrip("@")
+        except Exception:
+            username = ""
+    if not INSTAGRAM_USERNAME_PATTERN.fullmatch(username):
+        username = str(record.get("username") or "").strip().lstrip("@")
+    print(
+        "필수 지표 응답이 "
+        f"{timeout_milliseconds / 1_000:g}초 내 도착하지 않아 작성자 프로필의 릴스 탭에서 해당 영상을 연 뒤 "
+        f"{PASSIVE_RESPONSE_EXTENDED_WAIT_MILLISECONDS / 1_000:g}초 더 기다립니다: {shortcode}"
+    )
+    if INSTAGRAM_USERNAME_PATTERN.fullmatch(username):
+        print(f"작성자 프로필 릴스 탭으로 이동: https://www.instagram.com/{username}/reels/")
+    else:
+        print(f"작성자 username을 찾지 못해 프로필 릴스 탭으로 이동할 수 없습니다: {shortcode}")
+    profile_card = await open_reel_from_creator_profile(page, username, shortcode)
+    profile_view_count = exact_visible_reel_count(profile_card.get("viewText"))
+    profile_metadata = {
+        "viewCount": profile_view_count,
+        "viewSourceField": "profile_grid_dom" if profile_view_count is not None else None,
+    }
+    if profile_view_count is not None:
+        print(f"프로필 릴스 카드의 정확 조회수를 사용합니다: {shortcode} = {profile_view_count}")
+    elif not profile_card.get("opened"):
+        print(f"작성자 프로필에서 대상 릴 카드를 찾지 못해 현재 페이지 응답을 계속 관찰합니다: {shortcode}")
+    detail_embedded_metadata: dict[str, dict[str, Any]] = {}
+    await collect_embedded_reel_metadata(page, detail_embedded_metadata, include_follower_count=True)
+    detail_page_metadata = merge_reel_metadata(
+        merge_reel_metadata(resolved_metadata, profile_metadata),
+        detail_embedded_metadata.get(shortcode),
+    )
+    if has_complete_page_reel_metrics(shortcode, detail_page_metadata):
+        return detail_page_metadata, True
+    detail_passive_metadata = await wait_for_complete_page_reel_metadata(
+        shortcode,
+        passive_response_metadata,
+        PASSIVE_RESPONSE_EXTENDED_WAIT_MILLISECONDS,
+    )
+    return merge_reel_metadata(detail_page_metadata, detail_passive_metadata), True
 
 
 async def request_initial_reel_info_metadata(
@@ -2432,110 +3049,155 @@ async def request_reel_info_metadata(
     shortcode: str,
     diagnostic: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    def report(status: str, error: str = "") -> None:
-        if diagnostic is not None:
-            diagnostic.clear()
-            diagnostic.update({"status": status, "error": error})
-
+    if not DIRECT_REEL_INFO_REQUESTS_ENABLED:
+        _set_direct_reel_info_diagnostic(
+            diagnostic,
+            "disabled",
+            "Direct Reel-info requests are disabled; use passive page responses instead.",
+        )
+        return {}
     target = str(shortcode or "").strip()
     media_id = shortcode_to_media_id(target)
     if not media_id:
-        report("invalid_shortcode", "Direct Reel info could not derive a media ID from the shortcode.")
+        _set_direct_reel_info_diagnostic(
+            diagnostic,
+            "invalid_shortcode",
+            "Direct Reel info could not derive a media ID from the shortcode.",
+        )
         return {}
     try:
         endpoint = await asyncio.wait_for(
-            page.evaluate(
-                """async mediaId => {
-                  const controller = new AbortController();
-                  const timeoutId = setTimeout(() => controller.abort(), 4000);
-                  try {
-                    const response = await fetch(`/api/v1/media/${encodeURIComponent(mediaId)}/info/`, {
-                      credentials: 'include',
-                      headers: {'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest'},
-                      signal: controller.signal
-                    });
-                    return {status: response.status, text: await response.text()};
-                  } finally {
-                    clearTimeout(timeoutId);
-                  }
-                }""",
-                media_id,
-            ),
+            page.evaluate(DIRECT_REEL_INFO_REQUEST_SCRIPT, media_id),
             timeout=DIRECT_REEL_INFO_TIMEOUT_SECONDS,
         )
         endpoint_status = int(endpoint.get("status") or 0)
         if endpoint_status != 200:
-            report("http_error", f"Direct Reel info returned HTTP {endpoint_status}.")
+            _set_direct_reel_info_diagnostic(diagnostic, "http_error", f"Direct Reel info returned HTTP {endpoint_status}.")
             return {}
-        try:
-            payload = json.loads(str(endpoint.get("text") or ""))
-        except json.JSONDecodeError:
-            report("invalid_json", "Direct Reel info returned an invalid JSON response.")
+        media = endpoint.get("media") if isinstance(endpoint.get("media"), dict) else None
+        if media is None and "text" in endpoint:
+            payload = _parse_direct_reel_info_payload(endpoint.get("text"))
+            items = payload.get("items") if payload else None
+            media = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else None
+        if media is None:
+            content_type = str(endpoint.get("contentType") or "").casefold()
+            status = "html_response" if "text/html" in content_type else "invalid_json"
+            _set_direct_reel_info_diagnostic(
+                diagnostic,
+                status,
+                _direct_reel_info_invalid_json_error(endpoint),
+            )
             return {}
-        items = payload.get("items") if isinstance(payload, dict) else None
-        media = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
         observed_shortcode = str(media.get("code") or media.get("shortcode") or "").strip()
         observed_media_id = str(media.get("pk") or media.get("id") or "").strip()
         if (observed_shortcode and observed_shortcode != target) or (
             not observed_shortcode and observed_media_id != media_id
         ):
-            report("identity_mismatch", "Direct Reel info did not identify the requested Reel.")
+            _set_direct_reel_info_diagnostic(diagnostic, "identity_mismatch", "Direct Reel info did not identify the requested Reel.")
             return {}
-        report("success")
+        _set_direct_reel_info_diagnostic(diagnostic, "success")
         return metadata_from_media(media, include_follower_count=True) if media else {}
     except asyncio.TimeoutError:
-        report("timeout", f"Direct Reel info timed out after {DIRECT_REEL_INFO_TIMEOUT_SECONDS:g} seconds.")
+        _set_direct_reel_info_diagnostic(diagnostic, "timeout", f"Direct Reel info timed out after {DIRECT_REEL_INFO_TIMEOUT_SECONDS:g} seconds.")
         return {}
     except Exception as error:
         message = str(error).strip()
         if "abort" in message.casefold():
-            report("timeout", "Direct Reel info was aborted after 4 seconds.")
+            _set_direct_reel_info_diagnostic(
+                diagnostic,
+                "timeout",
+                f"Direct Reel info was aborted after {DIRECT_REEL_INFO_FETCH_TIMEOUT_MILLISECONDS / 1_000:g} seconds.",
+            )
         else:
-            report("request_error", f"Direct Reel info request failed: {message[:300] or type(error).__name__}")
+            _set_direct_reel_info_diagnostic(
+                diagnostic,
+                "request_error",
+                f"Direct Reel info request failed: {message[:300] or type(error).__name__}",
+            )
         return {}
+
+
+async def request_reel_info_metadata_from_reel_page(
+    page: Any,
+    shortcode: str,
+    diagnostic: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Retry the direct media endpoint from a freshly navigated Reel page.
+
+    Instagram occasionally returns a non-JSON body from the media-info
+    endpoint even though it reports HTTP 200.  Reopening the target Reel in
+    the dedicated background page refreshes the page session before the retry,
+    without disturbing the collector's active discovery tab.
+    """
+    target = str(shortcode or "").strip()
+    if not shortcode_to_media_id(target):
+        _set_direct_reel_info_diagnostic(
+            diagnostic,
+            "invalid_shortcode",
+            "Direct Reel info could not validate the shortcode for a fresh-page retry.",
+        )
+        return {}
+    try:
+        await navigate_with_retries(
+            page,
+            f"https://www.instagram.com/reels/{quote(target, safe='')}/",
+            attempts=2,
+        )
+        await page.wait_for_timeout(DIRECT_REEL_INFO_FRESH_PAGE_SETTLE_MILLISECONDS)
+    except asyncio.CancelledError:
+        raise
+    except CrawlerAccessError as error:
+        if error.code == "rate_limited":
+            _set_direct_reel_info_diagnostic(diagnostic, "http_error", "Direct Reel fallback page returned HTTP 429.")
+        else:
+            _set_direct_reel_info_diagnostic(
+                diagnostic,
+                "request_error",
+                f"Direct Reel fallback page was unavailable: {str(error)[:300]}",
+            )
+        return {}
+    except Exception as error:
+        _set_direct_reel_info_diagnostic(
+            diagnostic,
+            "request_error",
+            f"Direct Reel fallback page could not be opened: {str(error)[:300] or type(error).__name__}",
+        )
+        return {}
+    return await request_reel_info_metadata(page, target, diagnostic)
 
 
 async def read_reel_detail_metadata(
     page: Any,
     shortcode: str,
     existing_metadata: dict[str, Any] | None = None,
+    *,
+    require_exact_view: bool = False,
 ) -> dict[str, Any]:
-    """Wait for a Reel detail response to fill missing exact engagement integers."""
+    """Wait for a Reel detail response to fill missing exact metric integers."""
     target = str(shortcode or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", target):
         return dict(existing_metadata or {})
     metadata: dict[str, dict[str, Any]] = {target: dict(existing_metadata or {})}
     response_tasks: set[asyncio.Task[None]] = set()
 
-    async def collect_response(response: Any) -> None:
-        try:
-            parsed = urlparse(response.url)
-            content_type = response.headers.get("content-type", "")
-            if not parsed.hostname or not parsed.hostname.endswith("instagram.com") or "json" not in content_type:
-                return
-            collect_reel_metadata(json.loads(await response.text()), metadata)
-        except Exception:
-            return
-
     def on_response(response: Any) -> None:
-        task = asyncio.create_task(collect_response(response))
+        task = asyncio.create_task(_collect_reel_metadata_from_response(response, metadata))
         response_tasks.add(task)
         task.add_done_callback(response_tasks.discard)
 
     def current_metadata() -> dict[str, Any]:
         return metadata.get(target, {})
 
-    async def cancel_pending_response_tasks() -> None:
-        pending_tasks = [task for task in response_tasks if not task.done()]
-        for task in pending_tasks:
-            task.cancel()
-        if pending_tasks:
-            done, _ = await asyncio.wait(pending_tasks, timeout=0.5)
-            if done:
-                await asyncio.gather(*done, return_exceptions=True)
+    def has_required_metadata() -> bool:
+        candidate = current_metadata()
+        return has_exact_engagement_metadata(candidate) and (
+            not require_exact_view or bool(exact_view_counts_from_metadata(target, candidate))
+        )
 
-    page.on("response", on_response)
+    listener_attached = False
     try:
+        page.on("response", on_response)
+        listener_attached = True
         for page_attempt in range(EXACT_REEL_DETAIL_PAGE_ATTEMPTS):
             try:
                 response = await page.goto(
@@ -2548,20 +3210,24 @@ async def read_reel_detail_metadata(
             except Exception:
                 if page_attempt + 1 >= EXACT_REEL_DETAIL_PAGE_ATTEMPTS:
                     return current_metadata()
-                await cancel_pending_response_tasks()
+                await _cancel_pending_response_tasks(response_tasks)
                 await page.wait_for_timeout(EXACT_REEL_DETAIL_RETRY_DELAY_MILLISECONDS * (page_attempt + 1))
                 continue
             if _response_status(response) == 429 or re.search(r"/(?:accounts/login|challenge|checkpoint)/", page.url, re.I):
                 return current_metadata()
             await page.wait_for_timeout(EXACT_REEL_DETAIL_SETTLE_MILLISECONDS)
+            # The target payload can be hydrated into an application/json
+            # script without a separate GraphQL response. This is especially
+            # common for older Reels whose play_count is far down the creator
+            # profile and therefore expensive or impossible to reach by scroll.
+            await collect_embedded_reel_metadata(page, metadata)
             deadline = time.monotonic() + EXACT_REEL_DETAIL_TIMEOUT_MILLISECONDS / 1000
             while time.monotonic() < deadline:
-                candidate = current_metadata()
-                if has_exact_engagement_metadata(candidate):
-                    return candidate
+                if has_required_metadata():
+                    return current_metadata()
                 await page.wait_for_timeout(EXACT_REEL_DETAIL_POLL_MILLISECONDS)
             if page_attempt + 1 < EXACT_REEL_DETAIL_PAGE_ATTEMPTS:
-                await cancel_pending_response_tasks()
+                await _cancel_pending_response_tasks(response_tasks)
                 await page.wait_for_timeout(EXACT_REEL_DETAIL_RETRY_DELAY_MILLISECONDS * (page_attempt + 1))
         return current_metadata()
     except asyncio.CancelledError:
@@ -2569,11 +3235,12 @@ async def read_reel_detail_metadata(
     except Exception:
         return current_metadata()
     finally:
-        try:
-            page.remove_listener("response", on_response)
-        except Exception:
-            pass
-        await cancel_pending_response_tasks()
+        if listener_attached:
+            try:
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
+        await _cancel_pending_response_tasks(response_tasks)
 
 
 async def read_profile_reel_view_counts(page: Any, username: str, shortcodes: set[str]) -> dict[str, int]:
@@ -2585,18 +3252,8 @@ async def read_profile_reel_view_counts(page: Any, username: str, shortcodes: se
     metadata: dict[str, dict[str, Any]] = {}
     response_tasks: set[asyncio.Task[None]] = set()
 
-    async def collect_response(response: Any) -> None:
-        try:
-            parsed = urlparse(response.url)
-            content_type = response.headers.get("content-type", "")
-            if not parsed.hostname or not parsed.hostname.endswith("instagram.com") or "json" not in content_type:
-                return
-            collect_reel_metadata(json.loads(await response.text()), metadata)
-        except Exception:
-            return
-
     def on_response(response: Any) -> None:
-        task = asyncio.create_task(collect_response(response))
+        task = asyncio.create_task(_collect_reel_metadata_from_response(response, metadata))
         response_tasks.add(task)
         task.add_done_callback(response_tasks.discard)
 
@@ -2609,17 +3266,10 @@ async def read_profile_reel_view_counts(page: Any, username: str, shortcodes: se
                 found[shortcode] = count
         return found
 
-    async def cancel_pending_response_tasks() -> None:
-        pending_tasks = [task for task in response_tasks if not task.done()]
-        for task in pending_tasks:
-            task.cancel()
-        if pending_tasks:
-            done, _ = await asyncio.wait(pending_tasks, timeout=0.5)
-            if done:
-                await asyncio.gather(*done, return_exceptions=True)
-
-    page.on("response", on_response)
+    listener_attached = False
     try:
+        page.on("response", on_response)
+        listener_attached = True
         found: dict[str, int] = {}
         for page_attempt in range(PROFILE_REEL_VIEW_PAGE_ATTEMPTS):
             try:
@@ -2633,12 +3283,16 @@ async def read_profile_reel_view_counts(page: Any, username: str, shortcodes: se
             except Exception:
                 if page_attempt + 1 >= PROFILE_REEL_VIEW_PAGE_ATTEMPTS:
                     return found
-                await cancel_pending_response_tasks()
+                await _cancel_pending_response_tasks(response_tasks)
                 await page.wait_for_timeout(PROFILE_REEL_VIEW_RETRY_DELAY_MILLISECONDS)
                 continue
             if _response_status(response) == 429 or re.search(r"/(?:accounts/login|challenge|checkpoint)/", page.url, re.I):
                 return {}
             await page.wait_for_timeout(PROFILE_REEL_VIEW_SETTLE_MILLISECONDS)
+            # Some account pages hydrate their first Reels payload directly
+            # into an application/json script instead of emitting a separate
+            # GraphQL response.  It contains the same raw play_count value.
+            await collect_embedded_reel_metadata(page, metadata)
             for attempt in range(PROFILE_REEL_VIEW_SCROLL_ATTEMPTS):
                 found = exact_target_counts()
                 if len(found) == len(targets):
@@ -2646,11 +3300,12 @@ async def read_profile_reel_view_counts(page: Any, username: str, shortcodes: se
                 if attempt + 1 < PROFILE_REEL_VIEW_SCROLL_ATTEMPTS:
                     await page.mouse.wheel(0, 1_500)
                     await page.wait_for_timeout(PROFILE_REEL_VIEW_SCROLL_MILLISECONDS)
+                    await collect_embedded_reel_metadata(page, metadata)
             found = exact_target_counts()
             if len(found) == len(targets):
                 return found
             if page_attempt + 1 < PROFILE_REEL_VIEW_PAGE_ATTEMPTS:
-                await cancel_pending_response_tasks()
+                await _cancel_pending_response_tasks(response_tasks)
                 await page.wait_for_timeout(PROFILE_REEL_VIEW_RETRY_DELAY_MILLISECONDS)
         return found
     except asyncio.CancelledError:
@@ -2658,21 +3313,23 @@ async def read_profile_reel_view_counts(page: Any, username: str, shortcodes: se
     except Exception:
         return {}
     finally:
-        try:
-            page.remove_listener("response", on_response)
-        except Exception:
-            pass
-        await cancel_pending_response_tasks()
+        if listener_attached:
+            try:
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
+        await _cancel_pending_response_tasks(response_tasks)
 
 
 async def resolve_exact_reel_metrics(
     active_page: Any,
     shortcode: str,
     existing_metadata: dict[str, Any] | None,
-    fallback_page_factory: Callable[[], Any],
+    fallback_page_factory: Callable[[], Awaitable[Any]],
     *,
     direct_metadata: dict[str, Any] | None = None,
     direct_diagnostic: dict[str, str] | None = None,
+    fallback_username: str = "",
     max_direct_attempts: int = EXACT_METRIC_MAX_ATTEMPTS,
     retry_delay_seconds: float = EXACT_METRIC_RETRY_DELAY_SECONDS,
 ) -> tuple[dict[str, Any], dict[str, int]]:
@@ -2688,53 +3345,82 @@ async def resolve_exact_reel_metrics(
         observed_direct,
     )
 
-    # The first media-info response can arrive before Instagram has exposed
-    # every raw metric. Keep this *initial* collection attempt alive for a
-    # bounded retry sequence before switching to page-based fallbacks. Access
-    # denials and rate limits are deliberately not retried here.
-    attempts = max(1, min(5, int(max_direct_attempts)))
-    retry_delay_milliseconds = max(0, round(float(retry_delay_seconds) * 1_000))
-    for attempt in range(1, attempts):
-        if is_direct_reel_info_access_denied(initial_diagnostic):
-            break
-        if has_exact_engagement_metadata(metadata) and exact_view_counts_from_metadata(shortcode, metadata):
-            break
-        if retry_delay_milliseconds:
-            await active_page.wait_for_timeout(retry_delay_milliseconds * attempt)
-        retry_diagnostic: dict[str, str] = {}
-        retry_metadata = await request_reel_info_metadata(
-            active_page,
-            shortcode,
-            retry_diagnostic,
-        )
-        last_direct_diagnostic = retry_diagnostic
-        metadata = merge_direct_reel_metadata(metadata, retry_metadata)
-        if is_direct_reel_info_access_denied(retry_diagnostic):
-            break
-    if is_direct_reel_info_access_denied(last_direct_diagnostic):
-        return metadata, exact_view_counts_from_metadata(shortcode, metadata)
     fallback_page: Any = None
 
     async def get_fallback_page() -> Any:
         nonlocal fallback_page
-        if fallback_page is None:
+        is_closed = getattr(fallback_page, "is_closed", None)
+        if fallback_page is None or (callable(is_closed) and is_closed()):
             fallback_page = await fallback_page_factory()
         return fallback_page
 
-    if not has_exact_engagement_metadata(metadata):
+    def sync_direct_diagnostic() -> None:
+        _set_direct_reel_info_diagnostic(
+            direct_diagnostic,
+            str(last_direct_diagnostic.get("status") or ""),
+            str(last_direct_diagnostic.get("error") or ""),
+        )
+
+    # The legacy media-info endpoint is disabled in production.  Do not open
+    # extra detail pages for its retry loop when it is disabled: that would add
+    # browser navigations without yielding any new page data.  Normal
+    # collection continues below through the target page DOM and responses
+    # initiated by Instagram while it renders that page.
+    attempts = max(1, min(5, int(max_direct_attempts)))
+    retry_delay_milliseconds = max(0, round(float(retry_delay_seconds) * 1_000))
+    if DIRECT_REEL_INFO_REQUESTS_ENABLED:
+        # This compatibility branch is never entered by the normal collector.
+        # Retain it only for explicit diagnostic runs; regular collection is
+        # DOM/passive-response based.
+        for attempt in range(1, attempts):
+            if is_direct_reel_info_access_denied(last_direct_diagnostic):
+                break
+            if has_exact_engagement_metadata(metadata) and exact_view_counts_from_metadata(shortcode, metadata):
+                break
+            retry_page = await get_fallback_page()
+            if retry_delay_milliseconds:
+                try:
+                    await retry_page.wait_for_timeout(retry_delay_milliseconds * attempt)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    fallback_page = None
+                    continue
+            retry_diagnostic: dict[str, str] = {}
+            retry_metadata = await request_reel_info_metadata_from_reel_page(
+                retry_page,
+                shortcode,
+                retry_diagnostic,
+            )
+            last_direct_diagnostic = retry_diagnostic
+            metadata = merge_direct_reel_metadata(metadata, retry_metadata)
+            # An HTML response from the active discovery page gets one fresh-page
+            # retry. If the dedicated Reel page returns HTML too, further calls in
+            # the same session are unlikely to help and only increase rate-limit
+            # pressure, so continue with response/embedded/profile fallbacks.
+            if is_direct_reel_info_access_denied(retry_diagnostic) or is_direct_reel_info_html_response(retry_diagnostic):
+                break
+    if is_direct_reel_info_access_denied(last_direct_diagnostic):
+        sync_direct_diagnostic()
+        return metadata, exact_view_counts_from_metadata(shortcode, metadata)
+
+    view_counts = exact_view_counts_from_metadata(shortcode, metadata)
+    if not has_exact_engagement_metadata(metadata) or not view_counts:
         metadata = await read_reel_detail_metadata(
             await get_fallback_page(),
             shortcode,
             metadata,
+            require_exact_view=not bool(view_counts),
         )
-    view_counts = exact_view_counts_from_metadata(shortcode, metadata)
-    username = str(metadata.get("username") or "").strip().lstrip("@")
+    view_counts = view_counts or exact_view_counts_from_metadata(shortcode, metadata)
+    username = str(metadata.get("username") or fallback_username or "").strip().lstrip("@")
     if not view_counts and INSTAGRAM_USERNAME_PATTERN.fullmatch(username):
         view_counts = await read_profile_reel_view_counts(
             await get_fallback_page(),
             username,
             {shortcode},
         )
+    sync_direct_diagnostic()
     return metadata, view_counts
 
 
@@ -2765,10 +3451,24 @@ async def enrich_missing_profile_reel_view_counts(
 
 
 async def request_web_follower_count(page: Any, username: str) -> dict[str, Any]:
+    """Use a profile page's own GraphQL responses before falling back to DOM."""
     normalized = str(username or "").strip().lstrip("@")
     if not INSTAGRAM_USERNAME_PATTERN.fullmatch(normalized):
         return {"status": "profile_unavailable", "error": "Invalid Instagram username.", "source": "instagram_web"}
+    passive_snapshot: dict[str, Any] = {}
+    response_tasks: set[asyncio.Task[None]] = set()
+    listener_attached = False
+
+    def on_response(observed: Any) -> None:
+        response_tasks.add(asyncio.create_task(
+            _collect_profile_snapshot_from_response(observed, normalized, passive_snapshot)
+        ))
+
     try:
+        add_listener = getattr(page, "on", None)
+        if callable(add_listener):
+            add_listener("response", on_response)
+            listener_attached = True
         response = await page.goto(f"https://www.instagram.com/{quote(normalized, safe='')}/", wait_until="domcontentloaded", timeout=30_000)
         if _response_status(response) == 429:
             return {"status": "rate_limited", "error": "Instagram returned HTTP 429.", "source": "instagram_web"}
@@ -2777,104 +3477,69 @@ async def request_web_follower_count(page: Any, username: str) -> dict[str, Any]
             return {"status": "login_required", "error": "Instagram login is required.", "source": "instagram_web"}
         if re.search(r"/(?:challenge|checkpoint)/", page.url, re.I):
             return {"status": "challenge_required", "error": "Instagram requested an account check.", "source": "instagram_web"}
-        endpoint = await page.evaluate(
-            """async expected => {
-              const profile = document.querySelector('main header') || document.querySelector('header') || document.querySelector('main');
-              const visible = node => {
-                const rect = node.getBoundingClientRect();
-                const style = getComputedStyle(node);
-                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-              };
-              const profileText = profile?.innerText || '';
-              const profileTexts = profile ? [...new Set([...profile.querySelectorAll('span, a, div')]
-                .filter(visible)
-                .map(node => String(node.innerText || '').trim())
-                .filter(text => text && text.length <= 120))] : [];
-              const response = await fetch(`/api/v1/users/web_profile_info/?username=${encodeURIComponent(expected)}`, {
-                credentials: 'include',
-                headers: {'X-IG-App-ID': '936619743392459', 'X-Requested-With': 'XMLHttpRequest'}
-              });
-              return {status: response.status, text: await response.text(), profileText, profileTexts};
-            }""",
-            normalized,
-        )
-        visible_profile_text = [endpoint.get("profileText", ""), *(endpoint.get("profileTexts") or [])]
-        visible_follower_count = exact_visible_profile_follower_count(visible_profile_text)
-        visible_post_count = exact_visible_profile_post_count(visible_profile_text)
-        visible_category = profile_category_from_visible_text(visible_profile_text)
-
-        def visible_follower_result(
-            error: str,
-            *,
-            biography: str = "",
-            profile_category: str = "",
-            post_count: int | None = None,
-        ) -> dict[str, Any]:
-            category = profile_category or visible_category
-            resolved_post_count = visible_post_count if post_count is None else post_count
-            if visible_follower_count is not None:
-                return {
-                    **follower_count_success(visible_follower_count, "profile_header_text"),
-                    "biography": biography,
-                    "profile_category": category,
-                    "postCount": resolved_post_count,
-                }
-            return {
-                "status": "web_error",
-                "error": error,
-                "source": "instagram_web",
-                "biography": biography,
-                "profile_category": category,
-                "postCount": resolved_post_count,
-            }
-
-        endpoint_status = int(endpoint.get("status") or 0)
-        if endpoint_status == 429:
-            if visible_follower_count is not None:
-                return visible_follower_result("Instagram returned HTTP 429 for web_profile_info.")
-            return {"status": "rate_limited", "error": "Instagram returned HTTP 429 for web_profile_info.", "source": "instagram_web", "profile_category": visible_category, "postCount": visible_post_count}
-        if endpoint_status in {401, 403}:
-            if visible_follower_count is not None:
-                return visible_follower_result("Instagram login is required for web_profile_info.")
-            return {"status": "login_required", "error": "Instagram login is required for web_profile_info.", "source": "instagram_web", "profile_category": visible_category, "postCount": visible_post_count}
-        if endpoint_status == 404:
-            if visible_follower_count is not None:
-                return visible_follower_result("Instagram profile is unavailable.")
-            return {"status": "profile_unavailable", "error": "Instagram profile is unavailable.", "source": "instagram_web", "profile_category": visible_category, "postCount": visible_post_count}
-        if endpoint_status != 200:
-            return visible_follower_result(f"Instagram web_profile_info returned HTTP {endpoint_status}.")
-        try:
-            payload = json.loads(str(endpoint.get("text") or ""))
-        except json.JSONDecodeError:
-            return visible_follower_result("Instagram web_profile_info returned invalid JSON.")
-        user = _dict(_dict(payload.get("data")).get("user"))
-        response_username = str(user.get("username") or "").strip().lstrip("@")
-        if response_username.casefold() != normalized.casefold():
-            return visible_follower_result("Instagram web_profile_info returned a different username.")
-        biography = str(user.get("biography") or "")
-        profile_category = profile_category_from_data(user) or visible_category
-        post_count = exact_profile_post_count(user)
-        if post_count is None:
-            post_count = visible_post_count
-        count = exact_nonnegative_integer(_dict(user.get("edge_followed_by")).get("count"))
-        if count is None:
-            visible_result = visible_follower_result(
-                "Exact follower count was absent from web_profile_info.",
-                biography=biography,
-                profile_category=profile_category,
-                post_count=post_count,
+        if response_tasks:
+            await asyncio.wait(response_tasks, timeout=0.5)
+        passive_count = exact_nonnegative_integer(passive_snapshot.get("followerCount"))
+        passive_post_count = exact_nonnegative_integer(passive_snapshot.get("postCount"))
+        passive_following_count = exact_nonnegative_integer(passive_snapshot.get("followingCount"))
+        visible_follower_count = visible_post_count = visible_following_count = None
+        visible_category = ""
+        if passive_count is None or passive_post_count is None or passive_following_count is None:
+            snapshot = await page.evaluate(
+                """() => {
+                  const profile = document.querySelector('main header') || document.querySelector('header') || document.querySelector('main');
+                  const visible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = getComputedStyle(node);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                  };
+                  const profileText = profile?.innerText || '';
+                  const profileTexts = profile ? [...new Set([...profile.querySelectorAll('span, a, div')]
+                    .filter(visible)
+                    .map(node => String(node.innerText || '').trim())
+                    .filter(text => text && text.length <= 120))] : [];
+                  return {profileText, profileTexts};
+                }""",
+                normalized,
             )
-            if visible_result["status"] == "success":
-                return visible_result
-            return {**visible_result, "status": "web_unavailable"}
-        return {
-            **follower_count_success(count, "edge_followed_by.count"),
-            "biography": biography,
-            "profile_category": profile_category,
-            "postCount": post_count,
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            visible_profile_text = [snapshot.get("profileText", ""), *(snapshot.get("profileTexts") or [])]
+            visible_follower_count = exact_visible_profile_follower_count(visible_profile_text)
+            visible_post_count = exact_visible_profile_post_count(visible_profile_text)
+            visible_following_count = exact_visible_profile_following_count(visible_profile_text)
+            visible_category = profile_category_from_visible_text(visible_profile_text)
+        follower_count = passive_count if passive_count is not None else visible_follower_count
+        post_count = passive_post_count if passive_post_count is not None else visible_post_count
+        following_count = passive_following_count if passive_following_count is not None else visible_following_count
+        profile_result = {
+            "biography": str(passive_snapshot.get("biography") or ""),
+            "profile_category": str(passive_snapshot.get("profile_category") or "") or visible_category,
         }
+        if post_count is not None:
+            profile_result["postCount"] = post_count
+        if following_count is not None:
+            profile_result["followingCount"] = following_count
+        if follower_count is None:
+            return {
+                "status": "web_unavailable",
+                "error": "The rendered profile header did not expose an exact follower count.",
+                "source": "instagram_web",
+                **profile_result,
+            }
+        source_field = "passive_profile_response.follower_count" if passive_count is not None else "profile_header_text"
+        return {**follower_count_success(follower_count, source_field), **profile_result}
     except Exception as error:
         return {"status": "web_error", "error": str(error)[:500], "source": "instagram_web"}
+    finally:
+        if listener_attached:
+            remove_listener = getattr(page, "remove_listener", None)
+            if callable(remove_listener):
+                try:
+                    remove_listener("response", on_response)
+                except Exception:
+                    pass
+        await _cancel_pending_response_tasks(response_tasks)
 
 
 async def request_anonymous_follower_count(page: Any, username: str) -> dict[str, Any]:
@@ -2962,6 +3627,7 @@ class FollowerRuntime:
 
 
 async def create_background_follower_runtime(chromium: Any, source_context: Any, executable_path: str) -> FollowerRuntime:
+    """Create the isolated headless runtime used only for follower enrichment."""
     storage_state = await source_context.storage_state()
     browser = await chromium.launch(executable_path=executable_path, headless=True)
     context = await browser.new_context(storage_state=storage_state, viewport={"width": 1440, "height": 1000})
@@ -3035,6 +3701,8 @@ async def launch_collection_context(
     executable_path: str,
     options: argparse.Namespace,
 ) -> tuple[Any, Any]:
+    # --background must be genuinely headless. Exact Reel metrics are parsed
+    # inside the page context, so they do not require a visible Edge window.
     browser_args = [] if options.background else ["--start-maximized"]
     viewport = {"width": 1440, "height": 1000} if options.background else None
     if options.no_login:
@@ -3085,9 +3753,10 @@ async def run_collector(
     context: Any = None
     page: Any = None
     follower_runtime: FollowerRuntime | None = None
-    view_runtime: FollowerRuntime | None = None
+    view_page: Any = None
     playwright_runtime: Any = None
     follower_enricher: FollowerEnricher | None = None
+    rate_limit_state: InstagramRateLimitState | None = None
     exit_code = 0
     owns_collection_context = shared_context is None
 
@@ -3170,6 +3839,7 @@ async def run_collector(
             chromium = playwright_runtime.chromium
             browser = shared_browser
             context = shared_context
+        rate_limit_state = rate_limit_state_for_context(context)
 
         async def ensure_follower_runtime() -> SequentialWebFollowerLookup:
             nonlocal follower_runtime
@@ -3185,11 +3855,12 @@ async def run_collector(
                 follower_enricher.set_lookup_impl(lookup)
             return lookup
 
-        async def ensure_view_runtime() -> FollowerRuntime:
-            nonlocal view_runtime
-            if view_runtime is None:
-                view_runtime = await create_background_follower_runtime(chromium, context, executable_path)
-            return view_runtime
+        async def ensure_view_page() -> Any:
+            nonlocal view_page
+            is_closed = getattr(view_page, "is_closed", None)
+            if view_page is None or (callable(is_closed) and is_closed()):
+                view_page = await context.new_page()
+            return view_page
 
         async def start_follower_enricher(defer_runtime: bool = False) -> FollowerEnricher:
             nonlocal follower_enricher
@@ -3267,22 +3938,32 @@ async def run_collector(
             background=options.background,
             no_login=options.no_login,
         )
-        try:
-            page = await create_collection_page(
-                context,
-                initial_page_url,
-                reel_metadata,
-                allow_login=not options.background and not options.no_login,
-                keep_open_on_navigation_failure=not options.background and not options.no_login,
-            )
-        except CrawlerAccessError as error:
-            if options.no_login and error.code == "login_required":
-                raise CrawlerAccessError(
-                    "anonymous_access_blocked",
-                    "Instagram requires login for this request. Anonymous collection can only continue for public Reel pages that Instagram exposes without login.",
-                ) from error
-            raise
-        if options.no_login:
+        if options.no_login and refresh_urls:
+            # Do not make the first saved URL a gate for the entire anonymous
+            # refresh. Each URL is checked in the direct-refresh loop so a
+            # login-walled Reel can be skipped and the remaining public URLs
+            # can still be collected.
+            page = await context.new_page()
+            attach_reel_metadata_collector(page, reel_metadata, rate_limit_state)
+            print("로그인 프로필을 사용하지 않는 임시 브라우저로 공개 릴스를 URL별 확인합니다.")
+        else:
+            try:
+                page = await create_collection_page(
+                    context,
+                    initial_page_url,
+                    reel_metadata,
+                    allow_login=not options.background and not options.no_login,
+                    keep_open_on_navigation_failure=not options.background and not options.no_login,
+                    rate_limit_state=rate_limit_state,
+                )
+            except CrawlerAccessError as error:
+                if options.no_login and error.code == "login_required":
+                    raise CrawlerAccessError(
+                        "anonymous_access_blocked",
+                        "Instagram requires login for this request. Anonymous collection can only continue for public Reel pages that Instagram exposes without login.",
+                    ) from error
+                raise
+        if options.no_login and not refresh_urls:
             expected_surface = is_instagram_hashtag_surface(page.url) if options.hashtags else is_instagram_reels_surface(page.url)
             if not expected_surface:
                 raise CrawlerAccessError(
@@ -3294,7 +3975,7 @@ async def run_collector(
             expected_surface = is_instagram_hashtag_surface(page.url) if options.hashtags else is_instagram_reels_surface(page.url)
             if not expected_surface:
                 raise CrawlerAccessError("login_required", "Background mode needs a saved Instagram login. Run without --background, sign in once, and retry.")
-            print("저장된 Instagram 브라우저 프로필로 백그라운드 모드를 시작했습니다.")
+            print("저장된 Instagram 브라우저 프로필로 창 없이 백그라운드 수집을 시작했습니다.")
         else:
             print("브라우저에서 Instagram에 로그인하고 릴스 화면을 연 뒤 이 창으로 돌아오세요.")
             if not await wait_for_login_confirmation("준비가 끝났으면 Enter를 누르세요: ", stop_event):
@@ -3308,7 +3989,7 @@ async def run_collector(
         if anonymous_refresh:
             print("무로그인 재수집: 기존 정적 정보는 보존하고, 새 공개 지표만 추가합니다.")
         else:
-            follower_enricher = await start_follower_enricher()
+            print("릴스 페이지의 embedded/DOM 데이터와 같은 페이지의 수동 응답 관찰만 사용합니다.")
 
         captured = duplicate_count = missing_count = filtered_count = 0
         cooldown_skipped_count = page_recycle_count = transition_stall_count = recovery_failure_count = 0
@@ -3329,12 +4010,14 @@ async def run_collector(
         async def capture_current_reel(
             target_page: Any = None,
             target_metadata: dict[str, dict[str, Any]] | None = None,
-            metadata_timeout_milliseconds: int = 1_000,
+            metadata_timeout_milliseconds: int = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS,
         ) -> dict[str, Any] | None:
             nonlocal next_delay_seconds
             active_page = target_page or page
             metadata = target_metadata if target_metadata is not None else reel_metadata
             next_delay_seconds = options.interval_seconds
+            if rate_limit_state is not None:
+                rate_limit_state.raise_if_limited()
             await expand_visible_caption(active_page)
             # Instagram occasionally exposes the options button to the caption
             # expander as a hidden "more" label. Escape closes that transient
@@ -3346,20 +4029,22 @@ async def run_collector(
             if record["shortcode"] in seen:
                 next_delay_seconds = REEL_SUCCESS_INTERVAL_SECONDS
                 return {**record, "duplicateInRun": True}
-            response_metadata = await wait_for_reel_metadata(record["shortcode"], metadata, metadata_timeout_milliseconds)
-            if not response_metadata.get("userId") or not response_metadata.get("username"):
-                await collect_embedded_reel_metadata(active_page, metadata)
-                response_metadata = metadata.get(record["shortcode"], response_metadata)
-            direct_reel_info_diagnostic: dict[str, str] = {}
-            direct_metadata = await request_initial_reel_info_metadata(
+            response_metadata, used_passive_response = await resolve_page_first_reel_metadata(
                 active_page,
-                record["shortcode"],
-                direct_reel_info_diagnostic,
-                settle_milliseconds=round(options.direct_reel_info_wait_seconds * 1_000),
+                record,
+                metadata,
+                metadata_timeout_milliseconds,
             )
-            response_metadata = merge_direct_reel_metadata(response_metadata, direct_metadata)
+            if rate_limit_state is not None:
+                rate_limit_state.raise_if_limited()
             collected = build_collected_record(record, response_metadata)
             metadata.pop(record["shortcode"], None)
+            like_count_unavailable = should_mark_like_count_unavailable(
+                record,
+                response_metadata,
+            )
+            if like_count_unavailable:
+                collected["like_count"] = UNAVAILABLE_LIKE_COUNT_MARKER
             if options.max_upload_age_days > 0 and not parse_datetime(collected.get("uploaded_at")):
                 seen.add(record["shortcode"])
                 return {**record, "uploadDateUnavailable": True}
@@ -3367,20 +4052,7 @@ async def run_collector(
                 seen.add(record["shortcode"])
                 return {**record, "uploadAgeFilteredOut": True, "uploadAgeDays": collected["days_since_upload"]}
 
-            async def exact_fallback_page() -> Any:
-                return (await ensure_view_runtime()).page
-
-            response_metadata, exact_views = await resolve_exact_reel_metrics(
-                active_page,
-                record["shortcode"],
-                response_metadata,
-                exact_fallback_page,
-                direct_metadata=direct_metadata,
-                direct_diagnostic=direct_reel_info_diagnostic,
-                max_direct_attempts=options.exact_metric_attempts,
-                retry_delay_seconds=options.exact_metric_retry_delay_seconds,
-            )
-            collected = build_collected_record(record, response_metadata)
+            exact_views = exact_view_counts_from_metadata(record["shortcode"], response_metadata)
             if anonymous_refresh:
                 anonymous_probe = build_anonymous_refresh_from_history(reel_store.rows, collected)
                 if anonymous_probe is None:
@@ -3393,20 +4065,17 @@ async def run_collector(
                     }
                 username = str(anonymous_probe.get("username") or "").strip().lstrip("@")
                 follower_key = str(anonymous_probe.get("user_id") or "") or username.casefold()
-
-                async def anonymous_profile_lookup() -> dict[str, Any]:
-                    return (
-                        await request_anonymous_follower_count(await exact_fallback_page(), username)
-                        if INSTAGRAM_USERNAME_PATTERN.fullmatch(username)
-                        else {"status": "profile_unavailable", "error": "Previous Reel history has no valid username.", "source": "instagram_web"}
-                    )
-
-                follower_result = await resolve_follower_result(
-                    direct_metadata,
-                    follower_key,
-                    exact_follower_cache,
-                    anonymous_profile_lookup,
-                )
+                follower_result = exact_follower_result_from_metadata(response_metadata)
+                if follower_result is not None and follower_key:
+                    exact_follower_cache[follower_key] = follower_result
+                elif follower_key in exact_follower_cache:
+                    follower_result = exact_follower_cache[follower_key]
+                else:
+                    follower_result = {
+                        "status": "profile_unavailable",
+                        "error": "Exact follower_count was not present in the current Reel page or its responses.",
+                        "source": "instagram_page",
+                    }
                 anonymous_collected = build_anonymous_refresh_from_exact_metrics(
                     reel_store.rows,
                     collected,
@@ -3427,53 +4096,54 @@ async def run_collector(
                 if not stored.get("skipped"):
                     collected_shortcodes.add(record["shortcode"])
                 seen.add(record["shortcode"])
-                public_metric_fields = ["view_count", "like_count", "comment_count", "repost_count"]
+                public_metric_fields = ["view_count", "comment_count"]
                 return {
                     **record,
                     "snapshotLabel": stored["label"],
                     "cooldownSkipped": bool(stored.get("skipped")),
                     "cooldownLabel": stored.get("cooldownLabel", ""),
                     "nextCollectionAt": stored.get("nextCollectionAt", ""),
-                    "collectionComplete": all(exact_nonnegative_integer(anonymous_collected.get(field)) is not None for field in public_metric_fields),
+                    "collectionComplete": (
+                        all(exact_nonnegative_integer(anonymous_collected.get(field)) is not None for field in public_metric_fields)
+                        and (
+                            exact_nonnegative_integer(anonymous_collected.get("like_count")) is not None
+                            or is_like_count_marked_unavailable(anonymous_collected.get("like_count"))
+                        )
+                    ),
+                    "likeCountUnavailable": like_count_unavailable,
                 }
             missing_engagement_field = next(
                 (
                     field
-                    for field in ["like_count", "comment_count"]
+                    for field in ["comment_count"]
                     if exact_nonnegative_integer(collected.get(field)) is None
                 ),
                 "",
             )
             if missing_engagement_field:
                 seen.add(record["shortcode"])
-                direct_message = direct_reel_info_diagnostic_message(
-                    direct_reel_info_diagnostic,
-                    missing_engagement_field,
-                )
                 return {
                     **record,
                     "exactMetricUnavailable": True,
                     "exactMetricStatus": f"exact_{missing_engagement_field}_unavailable",
-                    "exactMetricError": " ".join(part for part in [
-                        f"Exact Network integer was unavailable for {missing_engagement_field} after the Reel detail response wait.",
-                        direct_message,
-                    ] if part),
+                    "exactMetricError": (
+                        f"Exact {missing_engagement_field} was not present in the embedded/DOM page data"
+                        + (" or the page's passive JSON responses." if used_passive_response else ".")
+                    ),
                 }
             follower_payload = {"user_id": str(collected["user_id"]), "username": str(collected["username"]), "seen_at": str(collected["collected_at"])}
             follower_key = follower_payload["user_id"] or follower_payload["username"].casefold()
-
-            async def profile_lookup() -> dict[str, Any]:
-                await ensure_follower_runtime()
-                if follower_enricher is None:
-                    raise RuntimeError("Follower enricher is unavailable.")
-                return await follower_enricher.lookup_user_now(**follower_payload)
-
-            follower_result = await resolve_follower_result(
-                direct_metadata,
-                follower_key,
-                exact_follower_cache,
-                profile_lookup,
-            )
+            follower_result = exact_follower_result_from_metadata(response_metadata)
+            if follower_result is not None and follower_key:
+                exact_follower_cache[follower_key] = follower_result
+            elif follower_key in exact_follower_cache:
+                follower_result = exact_follower_cache[follower_key]
+            else:
+                follower_result = {
+                    "status": "profile_unavailable",
+                    "error": "Exact follower_count was not present in the current Reel page or its responses.",
+                    "source": "instagram_page",
+                }
             exact_result = apply_exact_metric_results(
                 collected,
                 record["shortcode"],
@@ -3482,16 +4152,11 @@ async def run_collector(
             )
             if exact_result["status"] != "success":
                 seen.add(record["shortcode"])
-                direct_message = (
-                    direct_reel_info_diagnostic_message(direct_reel_info_diagnostic, "view_count")
-                    if exact_result["status"] == "exact_view_unavailable"
-                    else ""
-                )
                 return {
                     **record,
                     "exactMetricUnavailable": True,
                     "exactMetricStatus": exact_result["status"],
-                    "exactMetricError": " ".join(part for part in [exact_result["error"], direct_message] if part),
+                    "exactMetricError": exact_result["error"],
                 }
             if not has_complete_reel_core_data(collected):
                 seen.add(record["shortcode"])
@@ -3499,7 +4164,7 @@ async def run_collector(
                     **record,
                     "exactMetricUnavailable": True,
                     "exactMetricStatus": "exact_core_data_unavailable",
-                    "exactMetricError": "Required exact Network fields or Reel identity fields were unavailable.",
+                    "exactMetricError": "Required exact page fields or Reel identity fields were unavailable.",
                 }
             if follower_enricher is not None:
                 await follower_enricher.track_user(**follower_payload)
@@ -3515,6 +4180,7 @@ async def run_collector(
                 "cooldownLabel": stored.get("cooldownLabel", ""),
                 "nextCollectionAt": stored.get("nextCollectionAt", ""),
                 "collectionComplete": has_complete_reel_core_data(collected),
+                "likeCountUnavailable": like_count_unavailable,
             }
 
         direct_urls = refresh_urls
@@ -3555,6 +4221,12 @@ async def run_collector(
             print(f"수집 실패: {url} ({error})", file=sys.stderr)
             await update_status({**progress_patch(url), "last_error": str(error)[:500]})
 
+        async def report_anonymous_login_skip(index: int, url: str, error: CrawlerAccessError) -> None:
+            nonlocal missing_count
+            missing_count += 1
+            print(f"무로그인 접근 불가로 건너뜀: {url} ({error})", file=sys.stderr)
+            await update_status({**progress_patch(url), "last_error": str(error)[:500]})
+
         if options.hashtags:
             attempted_hashtag_urls: set[str] = set()
 
@@ -3568,6 +4240,7 @@ async def run_collector(
                         reel_metadata,
                         should_stop=lambda: stop_requested,
                         candidates_per_keyword=options.hashtag_candidates_per_keyword,
+                        rate_limit_state=rate_limit_state,
                     )
                 except CrawlerAccessError as error:
                     if options.max_items == 0 and error.code == "hashtag_reels_not_found":
@@ -3604,7 +4277,7 @@ async def run_collector(
                         break
                     attempted_hashtag_urls.add(url)
                     try:
-                        await navigate_with_retries(page, url)
+                        await navigate_with_retries(page, reel_detail_page_url(url))
                         if options.manual:
                             await async_input("현재 릴스를 다시 수집하려면 Enter를 누르세요: ")
                         else:
@@ -3640,7 +4313,7 @@ async def run_collector(
                     worker_metadata = reel_metadata if worker_number == 0 else {}
                     worker_page = page if worker_number == 0 else await context.new_page()
                     if worker_number:
-                        attach_reel_metadata_collector(worker_page, worker_metadata)
+                        attach_reel_metadata_collector(worker_page, worker_metadata, rate_limit_state)
                     processed = 0
                     try:
                         while not fatal_errors:
@@ -3649,13 +4322,16 @@ async def run_collector(
                             except asyncio.QueueEmpty:
                                 return
                             try:
-                                await navigate_with_retries(worker_page, url)
+                                await navigate_with_retries(worker_page, reel_detail_page_url(url))
                                 await worker_page.wait_for_timeout(DIRECT_REEL_SETTLE_MILLISECONDS)
                                 record = await capture_current_reel(worker_page, worker_metadata, DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS)
                                 await report_direct_result(index, url, record)
                             except CrawlerAccessError as error:
-                                fatal_errors.append(error)
-                                return
+                                if can_skip_anonymous_refresh_access_error(error, no_login=options.no_login):
+                                    await report_anonymous_login_skip(index, url, error)
+                                else:
+                                    fatal_errors.append(error)
+                                    return
                             except Exception as error:
                                 await report_direct_error(index, url, error)
                             finally:
@@ -3665,7 +4341,7 @@ async def run_collector(
                                 await safe_close(worker_page)
                                 worker_metadata.clear()
                                 worker_page = await context.new_page()
-                                attach_reel_metadata_collector(worker_page, worker_metadata)
+                                attach_reel_metadata_collector(worker_page, worker_metadata, rate_limit_state)
                                 processed = 0
                                 page_recycle_count += 1
                                 await update_status({**progress_patch(), "state": "collecting", "recycle_reason": "direct refresh worker"}, True)
@@ -3684,7 +4360,7 @@ async def run_collector(
                     if options.hashtags and options.max_items and captured >= options.max_items:
                         break
                     try:
-                        await navigate_with_retries(page, url)
+                        await navigate_with_retries(page, reel_detail_page_url(url))
                         if options.manual:
                             await async_input("현재 릴스를 다시 수집하려면 Enter를 누르세요: ")
                         else:
@@ -3694,7 +4370,10 @@ async def run_collector(
                             url,
                             await capture_current_reel(),
                         )
-                    except CrawlerAccessError:
+                    except CrawlerAccessError as error:
+                        if can_skip_anonymous_refresh_access_error(error, no_login=options.no_login):
+                            await report_anonymous_login_skip(index, url, error)
+                            continue
                         raise
                     except Exception as error:
                         await report_direct_error(index, url, error)
@@ -3711,7 +4390,13 @@ async def run_collector(
                 nonlocal page, page_recycle_count, items_since_recycle, views_since_recycle
                 nonlocal consecutive_unproductive, consecutive_transition_stalls, last_reels_url
                 print(f"수집 탭 재생성 ({reason}): 진행={captured}, 중복={duplicate_count}, 누락={missing_count}", file=sys.stderr)
-                page = await recycle_collection_page(context, page, options.start_url, reel_metadata)
+                page = await recycle_collection_page(
+                    context,
+                    page,
+                    options.start_url,
+                    reel_metadata,
+                    rate_limit_state,
+                )
                 page_recycle_count += 1
                 items_since_recycle = views_since_recycle = consecutive_unproductive = consecutive_transition_stalls = 0
                 last_reels_url = page.url
@@ -3825,7 +4510,7 @@ async def run_collector(
                 ensure_user_history(options.data_dir),
             )
         else:
-            print("Follower web: 무로그인 재수집에서는 각 릴스별 직접 조회 결과만 사용했습니다.")
+            print("Follower web: 별도 프로필 조회 없이 현재 Reel 페이지에서 확인된 정확값만 사용했습니다.")
         if merged:
             reel_store.dirty = True
             await reel_store.flush()
@@ -3836,8 +4521,8 @@ async def run_collector(
         output_paths = await reel_store.export_outputs()
         await safe_close(follower_runtime.browser if follower_runtime else None)
         follower_runtime = None
-        await safe_close(view_runtime.browser if view_runtime else None)
-        view_runtime = None
+        await safe_close(view_page)
+        view_page = None
         print(
             "저장 완료: "
             + ", ".join(f"{kind.upper()}={path}" for kind, path in output_paths.items())
@@ -3865,12 +4550,13 @@ async def run_collector(
             stop_watcher.cancel()
             await asyncio.gather(stop_watcher, return_exceptions=True)
         if owns_collection_context:
+            await safe_close(view_page)
             await safe_close(context)
             await safe_close(browser)
         else:
             await safe_close(page)
+            await safe_close(view_page)
         await safe_close(follower_runtime.browser if follower_runtime else None)
-        await safe_close(view_runtime.browser if view_runtime else None)
         if owns_collection_context and playwright_runtime:
             try:
                 await playwright_runtime.stop()

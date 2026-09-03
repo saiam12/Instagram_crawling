@@ -122,6 +122,11 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
         action="store_true",
         help="Fashion+Beauty preset: 6 hours of new-only collection, 365-day uploads, and the standard reels.* and users.* outputs.",
     )
+    parser.add_argument(
+        "--test-single-hashtag",
+        action="store_true",
+        help="Testing only: collect the first configured hashtag for each active domain, without keyword rotation.",
+    )
     parser.add_argument("--fashion-hashtag-query")
     parser.add_argument("--beauty-hashtag-query")
     options = parser.parse_args(arguments)
@@ -177,6 +182,14 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
 
     if not fashion_keywords or not beauty_keywords:
         parser.error("custom hashtag queries must contain at least one hashtag")
+    if options.test_single_hashtag:
+        # Keep the reduced scope opt-in so normal scheduled collection still
+        # rotates five keywords per discovery window.
+        if "fashion" in domains:
+            fashion_keywords = fashion_keywords[:1]
+        if "beauty" in domains:
+            beauty_keywords = beauty_keywords[:1]
+        keywords_per_window = 1
 
     return RunConfig(
         data_root=options.data_dir.resolve(),

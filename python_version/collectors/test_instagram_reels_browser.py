@@ -8,7 +8,7 @@ import time
 import unittest
 import zipfile
 from xml.etree import ElementTree
-from unittest.mock import patch
+from unittest.mock import call, patch
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -145,8 +145,8 @@ class CollectorUtilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             (data_dir / "users.csv").write_text(
-                "user_id,username,biography,profile_category,post_count,follower_count,collected_at\n"
-                "987654321,profile_user,영상은 릴스탭 눌러주세요~,의류(브랜드),2078,37293,2026-01-01T00:00:00.000Z\n",
+                "user_id,username,biography,profile_category,post_count,follower_count,following_count,collected_at\n"
+                "987654321,profile_user,영상은 릴스탭 눌러주세요~,의류(브랜드),2078,37293,348,2026-01-01T00:00:00.000Z\n",
                 encoding="utf-8",
             )
             output = writer(data_dir)
@@ -166,14 +166,16 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertIn("영상은 릴스탭 눌러주세요~", worksheet_xml)
         self.assertEqual(public_fields, [
             "collection_number", "days_since_previous", "user_id", "username", "biography",
-            "profile_category", "post_count", "follower_count", "follower_count_change", "collected_at",
+            "profile_category", "post_count", "follower_count", "following_count", "follower_count_change", "collected_at",
         ])
         self.assertEqual(xlsx_header, public_fields)
         self.assertEqual(public_rows[0]["follower_count_change"], "")
+        self.assertEqual(public_rows[0]["following_count"], "348")
         self.assertEqual(history_fields, [
-            "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at",
+            "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "following_count", "collected_at",
         ])
         self.assertEqual(history_rows[0]["follower_count"], "37293")
+        self.assertEqual(history_rows[0]["following_count"], "348")
         self.assertEqual(history_rows[0]["profile_category"], "의류(브랜드)")
         self.assertEqual(history_rows[0]["post_count"], "2078")
 
@@ -204,6 +206,24 @@ class CollectorUtilityTests(unittest.TestCase):
             entry_url("https://www.instagram.com/reels/custom/", background=True, no_login=False),
             "https://www.instagram.com/reels/custom/",
         )
+
+    def test_individual_reel_navigation_uses_the_singular_detail_route(self) -> None:
+        self.assertEqual(
+            reels_browser.reel_detail_page_url("https://www.instagram.com/reels/DbvAYbzp-87/"),
+            "https://www.instagram.com/reel/DbvAYbzp-87/",
+        )
+        self.assertEqual(
+            reels_browser.reel_detail_page_url("https://www.instagram.com/reel/DbvAYbzp-87/"),
+            "https://www.instagram.com/reel/DbvAYbzp-87/",
+        )
+
+    def test_anonymous_refresh_skips_login_walls_but_not_rate_limits_or_logged_in_errors(self) -> None:
+        skip = reels_browser.can_skip_anonymous_refresh_access_error
+
+        self.assertTrue(skip(reels_browser.CrawlerAccessError("login_required", "sign in"), no_login=True))
+        self.assertFalse(skip(reels_browser.CrawlerAccessError("rate_limited", "429"), no_login=True))
+        self.assertFalse(skip(reels_browser.CrawlerAccessError("challenge_required", "challenge"), no_login=True))
+        self.assertFalse(skip(reels_browser.CrawlerAccessError("login_required", "sign in"), no_login=False))
 
     def test_hashtag_or_and_metric_parsing(self) -> None:
         self.assertEqual(parse_hashtag_query('"맛집" OR "서울맛집" OR #맛집'), ["맛집", "서울맛집"])
@@ -307,6 +327,80 @@ class CollectorUtilityTests(unittest.TestCase):
 
         self.assertIsNone(metadata["BA"].get("followerCount"))
         self.assertIsNone(metadata["BA"].get("followerSourceField"))
+
+    def test_visible_reel_metrics_accepts_only_complete_integer_labels(self) -> None:
+        metadata = reels_browser.metadata_from_visible_reel({
+            "username": "example",
+            "viewText": "24,585",
+            "likeText": "321",
+            "commentText": "45",
+            "repostText": "1.2K",
+        })
+
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(metadata["viewSourceField"], "visible_dom")
+        self.assertEqual(metadata["likeCount"], 321)
+        self.assertEqual(metadata["commentCount"], 45)
+        self.assertIsNone(metadata["repostCount"])
+
+    def test_visible_reel_script_limits_author_fallback_to_main_content_not_the_sidebar(self) -> None:
+        self.assertIn("document.querySelector('main') || scope", reels_browser.EXTRACT_VISIBLE_REEL_SCRIPT)
+        self.assertNotIn("profileLinks(document));", reels_browser.EXTRACT_VISIBLE_REEL_SCRIPT)
+
+    def test_profile_reel_card_selector_accepts_the_username_prefixed_grid_href(self) -> None:
+        script_constants = [
+            value for value in reels_browser.open_reel_from_creator_profile.__code__.co_consts
+            if isinstance(value, str)
+        ]
+        self.assertTrue(any("(?:[A-Za-z0-9._]{1,30}/)?(?:reels?|p)" in value for value in script_constants))
+
+    def test_visible_like_control_without_a_count_is_marked_unavailable_after_response_wait(self) -> None:
+        visible_record = {"likeControlPresent": True, "likeText": ""}
+
+        self.assertTrue(
+            reels_browser.should_mark_like_count_unavailable(visible_record, {"likeCount": None})
+        )
+        self.assertFalse(
+            reels_browser.should_mark_like_count_unavailable(visible_record, {"likeCount": 321})
+        )
+        self.assertFalse(
+            reels_browser.should_mark_like_count_unavailable({"likeControlPresent": False}, {"likeCount": None})
+        )
+
+    def test_unavailable_like_count_is_saved_as_x_without_blocking_other_exact_metrics(self) -> None:
+        record = reel_record(1)
+        record.update({
+            "like_count": "X",
+            "view_count": 24_585,
+            "comment_count": 45,
+            "follower_count": 37_293,
+        })
+
+        result = reels_browser.apply_exact_metric_results(
+            record,
+            "target",
+            {"target": 24_585},
+            {"status": "success", "sourceField": "follower_count", "followerCount": 37_293},
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(record["like_count"], "X")
+        self.assertTrue(has_complete_reel_core_data(record))
+
+    def test_rate_limit_state_stops_after_any_instagram_429_response(self) -> None:
+        class Response:
+            url = "https://www.instagram.com/ajax/bulk-route-definitions/"
+            status = 429
+            headers = {"retry-after": "120"}
+
+        state = reels_browser.InstagramRateLimitState()
+        state.observe(Response())
+
+        self.assertTrue(state.limited)
+        self.assertEqual(state.retry_after_seconds, 120)
+        with self.assertRaisesRegex(reels_browser.CrawlerAccessError, "429") as error:
+            state.raise_if_limited()
+        self.assertEqual(error.exception.code, "rate_limited")
 
     def test_visible_reel_date_selector_searches_rendered_main_time_without_network_fallback(self) -> None:
         """The displayed timestamp can be outside the narrow active-Reel scope."""
@@ -509,7 +603,7 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(refreshed["location_name"], "original location")
         self.assertEqual(refreshed["ad"], "true")
         self.assertEqual(refreshed["uploaded_at"], "2025-12-20T00:00:00.000Z")
-        self.assertEqual(refreshed["video_duration_seconds"], 13.25)
+        self.assertEqual(refreshed["video_duration_seconds"], 12.5)
         self.assertEqual(refreshed["days_since_upload"], 14)
         self.assertEqual(refreshed["view_count"], 1_100)
         self.assertEqual(refreshed["like_count"], 111)
@@ -685,8 +779,8 @@ class CollectorUtilityTests(unittest.TestCase):
             "ad": "false",
         }))
 
-    def test_reel_core_data_rejects_an_unnormalized_missing_repost_count(self) -> None:
-        self.assertFalse(has_complete_reel_core_data({
+    def test_reel_core_data_allows_an_unavailable_optional_repost_count(self) -> None:
+        self.assertTrue(has_complete_reel_core_data({
             "url": "https://www.instagram.com/reels/DA55rVCNIrp/",
             "user_id": "52988919621",
             "username": "kzby.kr",
@@ -748,7 +842,7 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(result, {"status": "success", "error": ""})
         self.assertEqual(record["follower_count"], 37_293)
 
-    def test_exact_metric_results_normalize_a_missing_repost_count_to_zero(self) -> None:
+    def test_exact_metric_results_leaves_an_unavailable_repost_count_blank(self) -> None:
         record = {
             "view_count": None,
             "like_count": 564,
@@ -769,7 +863,7 @@ class CollectorUtilityTests(unittest.TestCase):
         )
 
         self.assertEqual(result, {"status": "success", "error": ""})
-        self.assertEqual(record["repost_count"], 0)
+        self.assertIsNone(record["repost_count"])
         self.assertEqual(record["view_count"], 24_585)
         self.assertEqual(record["follower_count"], 37_293)
 
@@ -861,7 +955,456 @@ class CollectorUtilityTests(unittest.TestCase):
         )
 
 
+class DirectReelInfoDisabledTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_reel_info_request_is_disabled_without_evaluating_the_page(self) -> None:
+        class Page:
+            calls = 0
+
+            async def evaluate(self, *_args: object) -> dict[str, object]:
+                self.calls += 1
+                return {}
+
+        page = Page()
+        diagnostic: dict[str, str] = {}
+
+        metadata = await reels_browser.request_reel_info_metadata(page, "BA", diagnostic)
+
+        self.assertEqual(metadata, {})
+        self.assertEqual(page.calls, 0)
+        self.assertEqual(diagnostic["status"], "disabled")
+
+    async def test_disabled_reel_info_skips_its_legacy_retry_navigation(self) -> None:
+        class Page:
+            url = "about:blank"
+
+            def __init__(self) -> None:
+                self.gotos: list[str] = []
+
+            async def goto(self, url: str, **_kwargs: object) -> None:
+                self.url = url
+                self.gotos.append(url)
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        page = Page()
+
+        async def fallback_page() -> Page:
+            return page
+
+        async def passive_detail(
+            _page: object,
+            _shortcode: str,
+            existing_metadata: dict[str, object] | None = None,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                **(existing_metadata or {}),
+                "likeCount": 321,
+                "commentCount": 45,
+                "viewCount": 24_585,
+                "viewSourceField": "play_count",
+            }
+
+        with (
+            patch.object(reels_browser, "DIRECT_REEL_INFO_REQUESTS_ENABLED", False),
+            patch.object(reels_browser, "read_reel_detail_metadata", passive_detail),
+        ):
+            metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
+                Page(),
+                "BA",
+                {},
+                fallback_page,
+                max_direct_attempts=3,
+            )
+
+        self.assertEqual(page.gotos, [])
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(view_counts, {"BA": 24_585})
+
+
 class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        direct_request_toggle = patch.object(
+            reels_browser,
+            "DIRECT_REEL_INFO_REQUESTS_ENABLED",
+            True,
+        )
+        direct_request_toggle.start()
+        self.addCleanup(direct_request_toggle.stop)
+
+    async def test_passive_collector_reads_xhr_json_even_when_content_type_is_not_json(self) -> None:
+        class Request:
+            resource_type = "fetch"
+
+        class Response:
+            url = "https://www.instagram.com/graphql/query"
+            headers = {"content-type": "text/plain; charset=utf-8"}
+            request = Request()
+
+            async def text(self) -> str:
+                return "for (;;);" + json.dumps({"data": {"media": {
+                    "code": "target",
+                    "product_type": "clips",
+                    "play_count": 24_585,
+                }}})
+
+        metadata: dict[str, dict[str, object]] = {}
+
+        await reels_browser._collect_reel_metadata_from_response(Response(), metadata)
+
+        self.assertEqual(metadata["target"]["viewCount"], 24_585)
+        self.assertEqual(metadata["target"]["viewSourceField"], "play_count")
+
+    async def test_profile_reel_fallback_opens_the_creator_reels_tab_then_clicks_the_target_card(self) -> None:
+        class Response:
+            status = 200
+
+        class Page:
+            url = ""
+
+            def __init__(self) -> None:
+                self.gotos: list[str] = []
+                self.waits: list[int] = []
+                self.clicked_shortcode = ""
+                self.clicked_href = ""
+
+            async def goto(self, url: str, **_kwargs: object) -> Response:
+                self.gotos.append(url)
+                self.url = url
+                return Response()
+
+            async def wait_for_timeout(self, milliseconds: int) -> None:
+                self.waits.append(milliseconds)
+
+            async def evaluate(self, _script: str, value: str) -> dict[str, object] | bool:
+                if value == "target":
+                    self.clicked_shortcode = value
+                    return {"found": True, "viewText": "1.5만", "href": "https://www.instagram.com/reel/target/"}
+                self.clicked_href = value
+                return True
+
+        page = Page()
+
+        opened = await reels_browser.open_reel_from_creator_profile(page, "example", "target")
+
+        self.assertTrue(opened["opened"])
+        self.assertEqual(page.gotos, ["https://www.instagram.com/example/reels/"])
+        self.assertEqual(page.clicked_shortcode, "target")
+        self.assertEqual(page.clicked_href, "https://www.instagram.com/reel/target/")
+        self.assertEqual(
+            page.waits,
+            [
+                reels_browser.PROFILE_REEL_VIEW_SETTLE_MILLISECONDS,
+                reels_browser.PROFILE_REEL_VIEW_SETTLE_MILLISECONDS,
+            ],
+        )
+
+    async def test_profile_reel_fallback_scrolls_until_the_target_card_is_loaded(self) -> None:
+        class Response:
+            status = 200
+
+        class Mouse:
+            def __init__(self) -> None:
+                self.wheels: list[tuple[int, int]] = []
+
+            async def wheel(self, x: int, y: int) -> None:
+                self.wheels.append((x, y))
+
+        class Page:
+            url = ""
+
+            def __init__(self) -> None:
+                self.mouse = Mouse()
+                self.inspections = 0
+
+            async def goto(self, url: str, **_kwargs: object) -> Response:
+                self.url = url
+                return Response()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+            async def evaluate(self, _script: str, value: str) -> dict[str, object] | bool:
+                if value != "target":
+                    return True
+                self.inspections += 1
+                return (
+                    {"found": False, "viewText": "", "href": ""}
+                    if self.inspections == 1
+                    else {"found": True, "viewText": "1.5만", "href": "https://www.instagram.com/reel/target/"}
+                )
+
+        page = Page()
+        with patch.object(reels_browser, "PROFILE_REEL_VIEW_SCROLL_ATTEMPTS", 2):
+            opened = await reels_browser.open_reel_from_creator_profile(page, "example", "target")
+
+        self.assertTrue(opened["opened"])
+        self.assertEqual(page.inspections, 2)
+        self.assertEqual(page.mouse.wheels, [(0, 1_500)])
+
+    async def test_page_first_metadata_waits_twenty_seconds_by_default(self) -> None:
+        class Locator:
+            async def all_text_contents(self) -> list[str]:
+                return []
+
+        class Page:
+            def locator(self, _selector: str) -> Locator:
+                return Locator()
+
+        observed_timeouts: list[int] = []
+
+        async def wait_for_response(
+            _shortcode: str,
+            _metadata: dict[str, dict[str, object]],
+            timeout_milliseconds: int,
+        ) -> dict[str, object]:
+            observed_timeouts.append(timeout_milliseconds)
+            return reels_browser.metadata_from_media(
+                {
+                    "play_count": 24_585,
+                    "like_count": 321,
+                    "comment_count": 45,
+                    "user": {"follower_count": 37_293},
+                },
+                include_follower_count=True,
+            )
+
+        with patch.object(reels_browser, "wait_for_complete_page_reel_metadata", wait_for_response):
+            await reels_browser.resolve_page_first_reel_metadata(
+                Page(),
+                {"shortcode": "target", "username": "example"},
+                {},
+            )
+
+        self.assertEqual(observed_timeouts, [20_000])
+        self.assertEqual(
+            reels_browser.DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS,
+            reels_browser.PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS,
+        )
+
+    async def test_incomplete_passive_metadata_opens_the_reel_through_its_creator_profile_for_another_minute(self) -> None:
+        class Locator:
+            async def all_text_contents(self) -> list[str]:
+                return []
+
+        class Page:
+            def locator(self, _selector: str) -> Locator:
+                return Locator()
+
+        observed_timeouts: list[int] = []
+        opened_profile_reels: list[tuple[str, str]] = []
+
+        async def wait_for_response(
+            _shortcode: str,
+            _metadata: dict[str, dict[str, object]],
+            timeout_milliseconds: int,
+        ) -> dict[str, object]:
+            observed_timeouts.append(timeout_milliseconds)
+            if len(observed_timeouts) == 2:
+                return reels_browser.metadata_from_media(
+                    {
+                        "play_count": 24_585,
+                        "like_count": 321,
+                        "comment_count": 45,
+                        "user": {"follower_count": 37_293},
+                    },
+                    include_follower_count=True,
+                )
+            return {}
+
+        async def open_from_profile(_page: object, username: str, shortcode: str) -> dict[str, object]:
+            opened_profile_reels.append((username, shortcode))
+            return {"found": True, "opened": True, "viewText": ""}
+
+        with (
+            patch.object(reels_browser, "wait_for_complete_page_reel_metadata", wait_for_response),
+            patch.object(reels_browser, "open_reel_from_creator_profile", open_from_profile),
+            patch("builtins.print") as print_mock,
+        ):
+            metadata, used_passive_response = await reels_browser.resolve_page_first_reel_metadata(
+                Page(),
+                {
+                    "shortcode": "target",
+                    "username": "example",
+                    "url": "https://www.instagram.com/reels/target/",
+                },
+                {},
+            )
+
+        self.assertTrue(used_passive_response)
+        self.assertEqual(
+            observed_timeouts,
+            [
+                reels_browser.PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS,
+                reels_browser.PASSIVE_RESPONSE_EXTENDED_WAIT_MILLISECONDS,
+            ],
+        )
+        self.assertEqual(opened_profile_reels, [("example", "target")])
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(
+            print_mock.call_args_list,
+            [
+                call(
+                    "필수 지표 응답이 20초 내 도착하지 않아 작성자 프로필의 릴스 탭에서 해당 영상을 연 뒤 60초 더 기다립니다: target"
+                ),
+                call("작성자 프로필 릴스 탭으로 이동: https://www.instagram.com/example/reels/"),
+            ],
+        )
+
+    async def test_profile_reel_fallback_uses_the_username_found_in_passive_metadata(self) -> None:
+        class Locator:
+            async def all_text_contents(self) -> list[str]:
+                return []
+
+        class Page:
+            def locator(self, _selector: str) -> Locator:
+                return Locator()
+
+        observed_timeouts: list[int] = []
+        opened_profile_reels: list[tuple[str, str]] = []
+
+        async def wait_for_response(
+            _shortcode: str,
+            _metadata: dict[str, dict[str, object]],
+            _timeout_milliseconds: int,
+        ) -> dict[str, object]:
+            observed_timeouts.append(1)
+            return reels_browser.metadata_from_media(
+                {
+                    "like_count": 321,
+                    "comment_count": 45,
+                    "user": {"username": "response_creator", "follower_count": 37_293},
+                    **({"play_count": 24_585} if len(observed_timeouts) == 2 else {}),
+                },
+                include_follower_count=True,
+            )
+
+        async def open_from_profile(_page: object, username: str, shortcode: str) -> dict[str, object]:
+            opened_profile_reels.append((username, shortcode))
+            return {"found": True, "opened": True, "viewText": ""}
+
+        with (
+            patch.object(reels_browser, "wait_for_complete_page_reel_metadata", wait_for_response),
+            patch.object(reels_browser, "open_reel_from_creator_profile", open_from_profile),
+            patch("builtins.print"),
+        ):
+            await reels_browser.resolve_page_first_reel_metadata(
+                Page(),
+                {"shortcode": "target", "username": ""},
+                {},
+            )
+
+        self.assertEqual(opened_profile_reels, [("response_creator", "target")])
+
+    async def test_profile_grid_exact_view_count_avoids_opening_the_card_or_waiting_for_play_count(self) -> None:
+        class Locator:
+            async def all_text_contents(self) -> list[str]:
+                return []
+
+        class Page:
+            def locator(self, _selector: str) -> Locator:
+                return Locator()
+
+        observed_timeouts: list[int] = []
+
+        async def wait_for_response(
+            _shortcode: str,
+            _metadata: dict[str, dict[str, object]],
+            timeout_milliseconds: int,
+        ) -> dict[str, object]:
+            observed_timeouts.append(timeout_milliseconds)
+            return reels_browser.metadata_from_media(
+                {
+                    "like_count": 321,
+                    "comment_count": 45,
+                    "user": {"follower_count": 37_293},
+                },
+                include_follower_count=True,
+            )
+
+        async def exact_profile_card(_page: object, _username: str, _shortcode: str) -> dict[str, object]:
+            return {"found": True, "opened": False, "viewText": "6591"}
+
+        with (
+            patch.object(reels_browser, "wait_for_complete_page_reel_metadata", wait_for_response),
+            patch.object(reels_browser, "open_reel_from_creator_profile", exact_profile_card),
+            patch("builtins.print"),
+        ):
+            metadata, _ = await reels_browser.resolve_page_first_reel_metadata(
+                Page(),
+                {"shortcode": "target", "username": "example"},
+                {},
+            )
+
+        self.assertEqual(observed_timeouts, [reels_browser.PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS])
+        self.assertEqual(metadata["viewCount"], 6_591)
+        self.assertEqual(metadata["viewSourceField"], "profile_grid_dom")
+
+    async def test_page_first_metadata_uses_embedded_json_without_waiting_for_responses(self) -> None:
+        class Locator:
+            async def all_text_contents(self) -> list[str]:
+                return [json.dumps({"items": [{
+                    "code": "target",
+                    "product_type": "clips",
+                    "user": {"pk": "123", "username": "example", "follower_count": 37_293},
+                    "play_count": 24_585,
+                    "like_count": 321,
+                    "comment_count": 45,
+                }]})]
+
+        class Page:
+            def locator(self, _selector: str) -> Locator:
+                return Locator()
+
+        metadata, used_passive_response = await reels_browser.resolve_page_first_reel_metadata(
+            Page(),
+            {"shortcode": "target", "username": "example"},
+            {},
+            timeout_milliseconds=0,
+        )
+
+        self.assertFalse(used_passive_response)
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(metadata["likeCount"], 321)
+        self.assertEqual(metadata["commentCount"], 45)
+        self.assertEqual(metadata["followerCount"], 37_293)
+
+    async def test_page_first_metadata_uses_passive_response_only_when_page_data_is_incomplete(self) -> None:
+        class Locator:
+            async def all_text_contents(self) -> list[str]:
+                return [json.dumps({"items": [{
+                    "code": "target",
+                    "product_type": "clips",
+                    "like_count": 321,
+                }]})]
+
+        class Page:
+            def locator(self, _selector: str) -> Locator:
+                return Locator()
+
+        passive: dict[str, dict[str, object]] = {}
+        reels_browser.collect_reel_metadata({
+            "code": "target",
+            "product_type": "clips",
+            "user": {"pk": "123", "username": "example", "follower_count": 37_293},
+            "play_count": 24_585,
+            "like_count": 321,
+            "comment_count": 45,
+        }, passive, include_follower_count=True)
+
+        metadata, used_passive_response = await reels_browser.resolve_page_first_reel_metadata(
+            Page(),
+            {"shortcode": "target", "username": "example"},
+            passive,
+            timeout_milliseconds=0,
+        )
+
+        self.assertTrue(used_passive_response)
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(metadata["commentCount"], 45)
+        self.assertEqual(metadata["followerCount"], 37_293)
+
     async def test_default_cooldown_skips_nearby_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = await LongReelStore.create(Path(directory) / "reels_rows.csv")
@@ -1008,6 +1551,55 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["followerCount"], 37_293)
         self.assertEqual(metadata["followerSourceField"], "follower_count")
         self.assertEqual(metadata["uploadedAt"], "2026-03-31T00:00:00.000Z")
+
+    async def test_direct_reel_info_parses_json_in_the_browser_and_returns_only_metric_fields(self) -> None:
+        class Page:
+            async def evaluate(self, script: str, media_id: str) -> dict[str, object]:
+                self.script = script
+                self.media_id = media_id
+                return {
+                    "status": 200,
+                    "contentType": "application/json; charset=utf-8",
+                    "media": {
+                        "code": "BA",
+                        "pk": "64",
+                        "product_type": "clips",
+                        "play_count": 24_585,
+                        "like_count": 321,
+                        "comment_count": 45,
+                        "media_repost_count": 6,
+                    },
+                    "jsonError": False,
+                }
+
+        page = Page()
+        metadata = await reels_browser.request_reel_info_metadata(page, "BA")
+
+        self.assertEqual(page.media_id, "64")
+        self.assertNotIn("fetch(", page.script)
+        self.assertNotIn("/api/", page.script)
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(metadata["repostCount"], 6)
+
+    async def test_direct_reel_info_request_accepts_a_json_body_with_an_xssi_prefix(self) -> None:
+        class Page:
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                return {
+                    "status": 200,
+                    "contentType": "application/json; charset=utf-8",
+                    "text": "for (;;);" + json.dumps({"items": [{
+                        "code": "BA",
+                        "product_type": "clips",
+                        "play_count": 24_585,
+                        "like_count": 321,
+                        "comment_count": 45,
+                    }]}),
+                }
+
+        metadata = await reels_browser.request_reel_info_metadata(Page(), "BA")
+
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(metadata["viewSourceField"], "play_count")
 
     async def test_direct_reel_info_does_not_trust_owner_follower_count(self) -> None:
         class Page:
@@ -1198,6 +1790,298 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["repostCount"], 6)
         self.assertEqual(view_counts, {"BA": 24_585})
 
+    async def test_invalid_direct_json_retries_from_a_fresh_reel_page(self) -> None:
+        """A malformed HTTP-200 body must not discard a valid play_count retry."""
+        class ActivePage:
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                return {"status": 200, "text": "<!doctype html><html></html>"}
+
+        class FallbackPage:
+            def __init__(self) -> None:
+                self.url = "about:blank"
+                self.gotos: list[str] = []
+                self.waits: list[int] = []
+                self.requests = 0
+
+            async def goto(self, url: str, **_kwargs: object) -> None:
+                self.url = url
+                self.gotos.append(url)
+
+            async def wait_for_timeout(self, milliseconds: int) -> None:
+                self.waits.append(milliseconds)
+
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                self.requests += 1
+                return {
+                    "status": 200,
+                    "text": json.dumps({"items": [{
+                        "code": "BA",
+                        "product_type": "clips",
+                        "user": {"pk": "123", "username": "example", "follower_count": 37_293},
+                        "play_count": 24_585,
+                        "like_count": 321,
+                        "comment_count": 45,
+                        "media_repost_count": 6,
+                    }]}),
+                }
+
+        fallback = FallbackPage()
+
+        async def fallback_page() -> FallbackPage:
+            return fallback
+
+        diagnostic: dict[str, str] = {}
+        metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
+            ActivePage(),
+            "BA",
+            {},
+            fallback_page,
+            direct_diagnostic=diagnostic,
+            max_direct_attempts=2,
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(fallback.gotos, ["https://www.instagram.com/reels/BA/"])
+        self.assertEqual(fallback.requests, 1)
+        self.assertIn(reels_browser.DIRECT_REEL_INFO_FRESH_PAGE_SETTLE_MILLISECONDS, fallback.waits)
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(metadata["followerCount"], 37_293)
+        self.assertEqual(metadata["followerSourceField"], "follower_count")
+        self.assertEqual(view_counts, {"BA": 24_585})
+        self.assertEqual(diagnostic, {"status": "success", "error": ""})
+
+    async def test_html_direct_response_gets_one_fresh_page_retry_before_profile_reels(self) -> None:
+        """An API web document gets one new-page retry, not a blocked-endpoint loop."""
+        class ActivePage:
+            calls = 0
+
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                self.calls += 1
+                return {
+                    "status": 200,
+                    "contentType": "text/html; charset=utf-8",
+                    "text": "<!doctype html><html><body>Instagram</body></html>",
+                }
+
+        class FallbackPage:
+            def __init__(self) -> None:
+                self.url = "about:blank"
+                self.gotos: list[str] = []
+                self.requests = 0
+
+            async def goto(self, url: str, **_kwargs: object) -> None:
+                self.url = url
+                self.gotos.append(url)
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                self.requests += 1
+                return {
+                    "status": 200,
+                    "contentType": "text/html; charset=utf-8",
+                    "text": "<!doctype html><html><body>Instagram</body></html>",
+                }
+
+        fallback = FallbackPage()
+        fallback_calls = 0
+        profile_calls: list[tuple[object, str, set[str]]] = []
+
+        async def fallback_page() -> FallbackPage:
+            nonlocal fallback_calls
+            fallback_calls += 1
+            return fallback
+
+        async def profile_reels(page: object, username: str, shortcodes: set[str]) -> dict[str, int]:
+            profile_calls.append((page, username, shortcodes))
+            return {"BA": 24_585}
+
+        async def detail_reel(
+            _page: object,
+            _shortcode: str,
+            existing_metadata: dict[str, object] | None = None,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return dict(existing_metadata or {})
+
+        diagnostic: dict[str, str] = {}
+        active = ActivePage()
+        with (
+            patch.object(reels_browser, "read_reel_detail_metadata", detail_reel),
+            patch.object(reels_browser, "read_profile_reel_view_counts", profile_reels),
+        ):
+            metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
+                active,
+                "BA",
+                {"likeCount": 321, "commentCount": 45},
+                fallback_page,
+                direct_diagnostic=diagnostic,
+                fallback_username="visible_creator",
+                max_direct_attempts=3,
+                retry_delay_seconds=0,
+            )
+
+        self.assertEqual(active.calls, 1)
+        self.assertEqual(fallback_calls, 1)
+        self.assertEqual(fallback.requests, 1)
+        self.assertEqual(fallback.gotos, ["https://www.instagram.com/reels/BA/"])
+        self.assertEqual(profile_calls, [(fallback, "visible_creator", {"BA"})])
+        self.assertEqual(metadata["likeCount"], 321)
+        self.assertEqual(view_counts, {"BA": 24_585})
+        self.assertEqual(diagnostic["status"], "html_response")
+
+    async def test_missing_play_count_uses_target_detail_before_creator_profile_scroll(self) -> None:
+        class ActivePage:
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                return {
+                    "status": 200,
+                    "text": json.dumps({"items": [{
+                        "code": "BA",
+                        "product_type": "clips",
+                        "user": {"username": "visible_creator"},
+                        "like_count": 321,
+                        "comment_count": 45,
+                    }]}),
+                }
+
+        fallback = object()
+        detail_calls: list[tuple[object, str, bool]] = []
+
+        async def fallback_page() -> object:
+            return fallback
+
+        async def detail_reel(
+            page: object,
+            shortcode: str,
+            existing_metadata: dict[str, object] | None = None,
+            *,
+            require_exact_view: bool = False,
+        ) -> dict[str, object]:
+            detail_calls.append((page, shortcode, require_exact_view))
+            return {
+                **(existing_metadata or {}),
+                "viewCount": 24_585,
+                "viewSourceField": "play_count",
+            }
+
+        async def profile_reels(_page: object, _username: str, _shortcodes: set[str]) -> dict[str, int]:
+            raise AssertionError("Target detail recovered play_count, so profile scrolling is unnecessary")
+
+        with (
+            patch.object(reels_browser, "read_reel_detail_metadata", detail_reel),
+            patch.object(reels_browser, "read_profile_reel_view_counts", profile_reels),
+        ):
+            metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
+                ActivePage(),
+                "BA",
+                {},
+                fallback_page,
+                max_direct_attempts=1,
+            )
+
+        self.assertEqual(detail_calls, [(fallback, "BA", True)])
+        self.assertEqual(metadata["viewCount"], 24_585)
+        self.assertEqual(view_counts, {"BA": 24_585})
+
+    async def test_closed_fallback_page_does_not_abort_the_next_reel_attempt(self) -> None:
+        class ActivePage:
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                return {"status": 200, "text": "not json"}
+
+        class ClosedFallbackPage:
+            def is_closed(self) -> bool:
+                return True
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                raise RuntimeError("Target page, context or browser has been closed")
+
+        class HealthyFallbackPage:
+            url = "about:blank"
+
+            def is_closed(self) -> bool:
+                return False
+
+            async def goto(self, url: str, **_kwargs: object) -> None:
+                self.url = url
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                return {"status": 200, "text": json.dumps({"items": [{
+                    "code": "BA",
+                    "product_type": "clips",
+                    "play_count": 24_585,
+                    "like_count": 321,
+                    "comment_count": 45,
+                    "media_repost_count": 6,
+                }]})}
+
+        pages = [ClosedFallbackPage(), HealthyFallbackPage()]
+
+        async def fallback_page() -> object:
+            return pages.pop(0)
+
+        _metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
+            ActivePage(),
+            "BA",
+            {},
+            fallback_page,
+            max_direct_attempts=3,
+            retry_delay_seconds=0.01,
+        )
+
+        self.assertEqual(view_counts, {"BA": 24_585})
+
+    async def test_direct_reel_retry_reports_its_last_failure(self) -> None:
+        """The caller must receive the retry result, not a stale first success."""
+        class ActivePage:
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                return {
+                    "status": 200,
+                    "text": json.dumps({"items": [{
+                        "code": "BA",
+                        "product_type": "clips",
+                        "like_count": 321,
+                        "comment_count": 45,
+                    }]}),
+                }
+
+        class FallbackPage:
+            url = "about:blank"
+
+            async def goto(self, url: str, **_kwargs: object) -> None:
+                self.url = url
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+            async def evaluate(self, _script: str, _media_id: str) -> dict[str, object]:
+                return {"status": 200, "text": "not json"}
+
+        fallback = FallbackPage()
+
+        async def fallback_page() -> FallbackPage:
+            return fallback
+
+        diagnostic: dict[str, str] = {}
+        _metadata, view_counts = await reels_browser.resolve_exact_reel_metrics(
+            ActivePage(),
+            "BA",
+            {},
+            fallback_page,
+            direct_diagnostic=diagnostic,
+            max_direct_attempts=2,
+            retry_delay_seconds=0,
+        )
+
+        self.assertEqual(view_counts, {})
+        self.assertEqual(diagnostic, {
+            "status": "invalid_json",
+            "error": "Direct Reel info returned an invalid JSON response (8 bytes).",
+        })
+
     async def test_missing_repost_count_does_not_block_an_exact_metric_response(self) -> None:
         class Page:
             def __init__(self) -> None:
@@ -1234,7 +2118,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(page.requests, 1)
         self.assertEqual(page.waits, [])
-        self.assertEqual(metadata["repostCount"], 0)
+        self.assertIsNone(metadata["repostCount"])
         self.assertEqual(view_counts, {"BA": 24_585})
 
     async def test_follower_web_lookup_retries_transient_errors_three_times(self) -> None:
@@ -1785,6 +2669,54 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["commentCount"], 15)
         self.assertEqual(detail["repostCount"], 18)
 
+    async def test_reel_detail_recovers_play_count_from_embedded_target_json(self) -> None:
+        class Response:
+            status = 200
+
+        class Locator:
+            async def all_text_contents(self) -> list[str]:
+                return [json.dumps({"items": [{
+                    "code": "target",
+                    "product_type": "clips",
+                    "play_count": 24_585,
+                    "like_count": 564,
+                    "comment_count": 15,
+                }]})]
+
+        class Page:
+            url = ""
+
+            def __init__(self) -> None:
+                self.response_handler: object | None = None
+
+            def on(self, event: str, handler: object) -> None:
+                if event == "response":
+                    self.response_handler = handler
+
+            def remove_listener(self, event: str, handler: object) -> None:
+                if event == "response" and self.response_handler is handler:
+                    self.response_handler = None
+
+            def locator(self, _selector: str) -> Locator:
+                return Locator()
+
+            async def goto(self, url: str, **_kwargs: object) -> Response:
+                self.url = url
+                return Response()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                await asyncio.sleep(0)
+
+        detail = await reels_browser.read_reel_detail_metadata(
+            Page(),
+            "target",
+            {"likeCount": 564, "commentCount": 15},
+            require_exact_view=True,
+        )
+
+        self.assertEqual(detail["viewCount"], 24_585)
+        self.assertEqual(detail["viewSourceField"], "play_count")
+
     async def test_reel_detail_retries_a_fresh_navigation_when_engagement_is_missing_first(self) -> None:
         """Catch a detail lookup that gives up before a later response provides exact counts."""
         class Response:
@@ -1997,53 +2929,115 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["commentCount"], 15)
         self.assertIsNone(detail["repostCount"])
 
-    async def test_follower_lookup_uses_web_profile_info_exact_integer_instead_of_compact_label(self) -> None:
-        class Response:
+    async def test_follower_lookup_uses_the_profile_page_passive_graphql_response(self) -> None:
+        class NavigationResponse:
             status = 200
+
+        class Request:
+            resource_type = "fetch"
+
+        class ProfileResponse:
+            url = "https://www.instagram.com/api/graphql"
+            headers = {"content-type": "application/json"}
+            request = Request()
+
+            async def text(self) -> str:
+                return json.dumps({"data": {"user": {
+                    "username": "example",
+                    "biography": "🌟 영상은 릴스탭 눌러주세요🌟\n💗 누구보다 빠르게 이쁘고 트렌디한 신상템 소개해요 💕",
+                    "category_name": "의류(브랜드)",
+                    "media_count": 2_078,
+                    "follower_count": 37_293,
+                    "following_count": 348,
+                }}})
 
         class Page:
             url = ""
 
-            async def goto(self, url: str, **_kwargs: object) -> Response:
+            def __init__(self) -> None:
+                self.response_handler: object | None = None
+
+            def on(self, event: str, handler: object) -> None:
+                if event == "response":
+                    self.response_handler = handler
+
+            def remove_listener(self, event: str, handler: object) -> None:
+                if event == "response" and self.response_handler is handler:
+                    self.response_handler = None
+
+            async def goto(self, url: str, **_kwargs: object) -> NavigationResponse:
                 self.url = url
-                return Response()
+                if callable(self.response_handler):
+                    self.response_handler(ProfileResponse())
+                return NavigationResponse()
 
             async def wait_for_timeout(self, _milliseconds: int) -> None:
-                return None
+                await asyncio.sleep(0)
 
-            async def evaluate(self, _script: str, _username: str) -> dict[str, object]:
-                return {
-                    "status": 200,
-                    "text": json.dumps({
-                        "data": {
-                            "user": {
-                                "username": "example",
-                                "biography": "🌟 영상은 릴스탭 눌러주세요🌟\n💗 누구보다 빠르게 이쁘고 트렌디한 신상템 소개해요 💕",
-                                "category_name": "의류(브랜드)",
-                                "media_count": 2_078,
-                                "edge_followed_by": {"count": 37_293},
-                            }
-                        }
-                    }),
-                    "values": ["1.6만 followers"],
-                    "descriptions": [],
-                    "profileMatches": True,
-                    "body": "",
-                    "login": False,
-                }
+            async def evaluate(self, *_args: object) -> dict[str, object]:
+                raise AssertionError("The exact passive profile response must be preferred over DOM fallback")
 
         output = StringIO()
         with redirect_stdout(output):
             result = await request_web_follower_count(Page(), "example")
 
         self.assertEqual(result["followerCount"], 37_293)
-        self.assertEqual(
-            result.get("biography"),
-            "🌟 영상은 릴스탭 눌러주세요🌟\n💗 누구보다 빠르게 이쁘고 트렌디한 신상템 소개해요 💕",
-        )
+        self.assertEqual(result["sourceField"], "passive_profile_response.follower_count")
+        self.assertEqual(result["followingCount"], 348)
         self.assertEqual(result.get("profile_category"), "의류(브랜드)")
         self.assertEqual(result.get("postCount"), 2_078)
         self.assertEqual(output.getvalue(), "")
+
+    async def test_follower_lookup_uses_visible_profile_counts_when_passive_counts_are_compact(self) -> None:
+        class NavigationResponse:
+            status = 200
+
+        class Request:
+            resource_type = "fetch"
+
+        class ProfileResponse:
+            url = "https://www.instagram.com/api/graphql"
+            headers = {"content-type": "application/json"}
+            request = Request()
+
+            async def text(self) -> str:
+                return json.dumps({"data": {"user": {
+                    "username": "example",
+                    "follower_count": 37_293,
+                    "media_count": "2.1K",
+                    "following_count": "3.2K",
+                }}})
+
+        class Page:
+            url = ""
+
+            def __init__(self) -> None:
+                self.response_handler: object | None = None
+
+            def on(self, event: str, handler: object) -> None:
+                if event == "response":
+                    self.response_handler = handler
+
+            def remove_listener(self, _event: str, _handler: object) -> None:
+                return None
+
+            async def goto(self, url: str, **_kwargs: object) -> NavigationResponse:
+                self.url = url
+                if callable(self.response_handler):
+                    self.response_handler(ProfileResponse())
+                return NavigationResponse()
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                await asyncio.sleep(0)
+
+            async def evaluate(self, *_args: object) -> dict[str, object]:
+                return {"profileText": "게시물 2078 팔로워 37293 팔로우 5111", "profileTexts": []}
+
+        result = await request_web_follower_count(Page(), "example")
+
+        self.assertEqual(result["followerCount"], 37_293)
+        self.assertEqual(result["postCount"], 2_078)
+        self.assertEqual(result["followingCount"], 5_111)
 
     async def test_follower_lookup_uses_an_exact_visible_profile_header_when_the_endpoint_fails(self) -> None:
         class Response:
@@ -2072,18 +3066,23 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["followerCount"], 3_230)
         self.assertEqual(result["sourceField"], "profile_header_text")
+        self.assertEqual(result["followingCount"], 5_111)
         self.assertEqual(result["profile_category"], "의류(브랜드)")
         self.assertEqual(result["postCount"], 2_078)
 
     def test_visible_profile_follower_parser_rejects_compact_labels(self) -> None:
         parser = getattr(reels_browser, "exact_visible_profile_follower_count", None)
         post_parser = getattr(reels_browser, "exact_visible_profile_post_count", None)
+        following_parser = getattr(reels_browser, "exact_visible_profile_following_count", None)
         self.assertIsNotNone(parser)
         self.assertIsNotNone(post_parser)
+        self.assertIsNotNone(following_parser)
         self.assertEqual(parser("게시물 2078 팔로워 3230 팔로우 5111"), 3_230)
         self.assertEqual(post_parser("게시물 2078 팔로워 3230 팔로우 5111"), 2_078)
+        self.assertEqual(following_parser("게시물 2078 팔로워 3230 팔로우 5111"), 5_111)
         self.assertEqual(parser("1.6만 followers"), None)
         self.assertEqual(post_parser("게시물 2.1만"), None)
+        self.assertEqual(following_parser("팔로우 3.2K"), None)
         self.assertEqual(parser("followers 3.2K"), None)
 
     async def test_anonymous_follower_retry_stops_after_three_transient_errors(self) -> None:
@@ -2131,6 +3130,68 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(launched_context, context)
             self.assertFalse(profile_dir.exists())
             self.assertFalse(chromium.launch_options["headless"])
+
+    async def test_follower_runtime_uses_an_isolated_headless_browser(self) -> None:
+        page = object()
+
+        class Context:
+            async def new_page(self) -> object:
+                return page
+
+        class Browser:
+            async def new_context(self, **kwargs: object) -> Context:
+                self.context_options = kwargs
+                return Context()
+
+        class SourceContext:
+            async def storage_state(self) -> dict[str, object]:
+                return {"cookies": [{"name": "sessionid"}], "origins": []}
+
+        class Chromium:
+            def __init__(self) -> None:
+                self.launch_options: dict[str, object] = {}
+                self.browser = Browser()
+
+            async def launch(self, **kwargs: object) -> Browser:
+                self.launch_options = kwargs
+                return self.browser
+
+        chromium = Chromium()
+        runtime = await reels_browser.create_background_follower_runtime(
+            chromium,
+            SourceContext(),
+            "browser.exe",
+        )
+
+        self.assertIs(runtime.page, page)
+        self.assertTrue(chromium.launch_options["headless"])
+        self.assertEqual(chromium.browser.context_options["storage_state"]["cookies"][0]["name"], "sessionid")
+
+    async def test_background_collection_uses_a_headless_persistent_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile_dir = Path(directory) / "profile"
+
+            class Context:
+                pages: list[object] = []
+
+            class Chromium:
+                def __init__(self) -> None:
+                    self.launch_options: dict[str, object] = {}
+                    self.context = Context()
+
+                async def launch_persistent_context(self, _profile_dir: str, **kwargs: object) -> Context:
+                    self.launch_options = kwargs
+                    return self.context
+
+            chromium = Chromium()
+            options = parse_args(["--background", "--profile-dir", str(profile_dir)])
+            browser, context = await launch_collection_context(chromium, "browser.exe", options)
+
+            self.assertIsNone(browser)
+            self.assertIs(context, chromium.context)
+            self.assertTrue(chromium.launch_options["headless"])
+            self.assertEqual(chromium.launch_options["args"], [])
+            self.assertEqual(chromium.launch_options["viewport"], {"width": 1440, "height": 1000})
 
     async def test_reel_navigation_waits_for_shortcode_change(self) -> None:
         identities = [
@@ -2397,8 +3458,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             fields, rows = read_csv_objects(user_history_path(directory))
             self.assertEqual(rows[0]["2nd collect_follower_count"], "123")
             self.assertEqual(fields, [
-                "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at",
-                "2nd collect_post_count", "2nd collect_follower_count", "2nd collect_collected_at",
+                "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "following_count", "collected_at",
+                "2nd collect_post_count", "2nd collect_follower_count", "2nd collect_following_count", "2nd collect_collected_at",
             ])
 
     async def test_follower_enricher_does_not_requery_a_fresh_user_without_biography(self) -> None:
@@ -2515,7 +3576,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["followerCount"], 48_000)
             self.assertEqual(result["sourceField"], "edge_followed_by.count")
             self.assertEqual(rows[0]["2nd collect_follower_count"], "48000")
-            self.assertEqual(fields[-2:], ["2nd collect_follower_count", "2nd collect_collected_at"])
+            self.assertEqual(fields[-2:], ["2nd collect_following_count", "2nd collect_collected_at"])
 
     async def test_immediate_follower_lookup_accepts_a_full_visible_profile_header_count(self) -> None:
         async def lookup(_payload: dict[str, str]) -> dict[str, object]:
@@ -2638,7 +3699,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             await enricher.ready()
             fields, rows = read_csv_objects(user_history_path(directory))
 
-            self.assertEqual(fields, ["user_id", "username", "biography", "profile_category", "post_count", "follower_count", "collected_at"])
+            self.assertEqual(fields, ["user_id", "username", "biography", "profile_category", "post_count", "follower_count", "following_count", "collected_at"])
             self.assertEqual(rows[0]["collected_at"], "2026-01-01T00:00:00Z")
 
     async def test_follower_queue_stops_after_five_web_errors(self) -> None:

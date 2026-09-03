@@ -12,6 +12,14 @@ backups/
 tests/
 __pycache__/
 *.pyc
+android_emulator_version/.venv/
+android_emulator_version/.android/
+android_emulator_version/.adb/
+android_emulator_version/data_android/
+!android_emulator_version/tests/
+!android_emulator_version/tests/**
+android_emulator_version/tests/__pycache__/
+android_emulator_version/tests/**/*.pyc
 targets_new_test.csv
 skill.md
 AGENTS.md
@@ -22,3 +30,4 @@ outputs/
 .tmp_*/
 .codex_tmp/
 *.inspect.ndjson
+.codex*

@@ -53,7 +53,10 @@ _PUBLIC_SOURCES = {
 _LOCK_READ_ATTEMPTS = 3
 _LOCK_READ_RETRY_SECONDS = 0.05
 _LOCK_MALFORMED_GRACE_SECONDS = 2.0
-_DUE_RETRY_MAX_SECONDS = 30.0
+_COLLECTOR_RETRY_BASE_SECONDS = 5 * 60.0
+_COLLECTOR_RETRY_MAX_SECONDS = 30 * 60.0
+_COLLECTOR_RETRY_MAX_ATTEMPTS = 5
+_RATE_LIMIT_RETRY_SECONDS = 30 * 60.0
 _RECOLLECTION_BATCH_SIZE = 50
 
 
@@ -65,8 +68,22 @@ class WorkDecision:
 
 
 def _due_retry_delay(attempt: int) -> float:
-    exponent = min(max(0, attempt - 1), 5)
-    return min(float(2**exponent), _DUE_RETRY_MAX_SECONDS)
+    """Back off failed Instagram work enough to avoid amplifying HTTP 429s."""
+    exponent = min(max(0, attempt - 1), 3)
+    return min(_COLLECTOR_RETRY_BASE_SECONDS * float(2**exponent), _COLLECTOR_RETRY_MAX_SECONDS)
+
+
+def _collector_access_failure(dataset: DatasetConfig) -> str:
+    """Read the access failure recorded by the most recent child collector."""
+    try:
+        payload = json.loads((dataset.data_root / "collector_status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    for key in ("failure_code", "follower_last_status"):
+        status = str(payload.get(key) or "").strip().casefold()
+        if status in {"rate_limited", "login_required", "challenge_required"}:
+            return status
+    return ""
 
 
 def utc_now() -> datetime:
@@ -734,6 +751,8 @@ async def run_fashion_beauty_collection(
     collector_failures = {name: 0 for name in config.domains}
     retry_attempts: dict[tuple[str, str, datetime], int] = {}
     retry_not_before: dict[tuple[str, str, datetime], datetime] = {}
+    discovery_retry_attempts: dict[tuple[str, datetime], int] = {}
+    discovery_retry_not_before: dict[tuple[str, datetime], datetime] = {}
     completed_new_only_windows: set[tuple[str, datetime]] = set()
     exit_code = 0
     interrupt_count = 0
@@ -811,17 +830,50 @@ async def run_fashion_beauty_collection(
                     for recollection_jobs, result, error in outcomes:
                         dataset_name = recollection_jobs[0].dataset
                         if result:
+                            access_failure = _collector_access_failure(
+                                dataset_by_name(config, dataset_name)
+                            )
                             if exit_code == 0:
                                 exit_code = result
                             last_errors[dataset_name] = error
                             collector_failures[dataset_name] += 1
                             wait_seconds = 0.0
+                            rate_limit_retry_at: datetime | None = None
+                            if access_failure == "rate_limited":
+                                rate_limit_retry_at = min(
+                                    clock() + timedelta(seconds=_RATE_LIMIT_RETRY_SECONDS),
+                                    ends_at,
+                                )
+                                last_errors[dataset_name] = (
+                                    f"{error}; Instagram rate limit detected, all due work paused for 30 minutes"
+                                )
+                                for pending_job in pending:
+                                    pending_key = (
+                                        pending_job.dataset,
+                                        pending_job.url,
+                                        pending_job.due_at,
+                                    )
+                                    current_retry_at = retry_not_before.get(pending_key)
+                                    if current_retry_at is None or current_retry_at < rate_limit_retry_at:
+                                        retry_not_before[pending_key] = rate_limit_retry_at
                             for job in recollection_jobs:
                                 job_key = (job.dataset, job.url, job.due_at)
                                 attempt = retry_attempts.get(job_key, 0) + 1
                                 retry_attempts[job_key] = attempt
                                 retry_delay = _due_retry_delay(attempt)
-                                retry_not_before[job_key] = clock() + timedelta(seconds=retry_delay)
+                                if rate_limit_retry_at is not None:
+                                    retry_not_before[job_key] = rate_limit_retry_at
+                                    retry_delay = max(
+                                        0.0,
+                                        (rate_limit_retry_at - clock()).total_seconds(),
+                                    )
+                                elif attempt >= _COLLECTOR_RETRY_MAX_ATTEMPTS:
+                                    retry_not_before[job_key] = ends_at
+                                    last_errors[dataset_name] = (
+                                        f"{error}; retry deferred for the rest of this run after {attempt} failures"
+                                    )
+                                else:
+                                    retry_not_before[job_key] = clock() + timedelta(seconds=retry_delay)
                                 wait_seconds = max(wait_seconds, retry_delay)
                         else:
                             for job in recollection_jobs:
@@ -842,6 +894,11 @@ async def run_fashion_beauty_collection(
                 elif now < discovery_ends_at:
                     selected = dataset_by_name(config, active_dataset_name(config, started_at, now))
                     window_start = _active_window_start(started_at, now, config.discovery_interval_minutes)
+                    window_end = min(
+                        window_start + timedelta(minutes=config.discovery_interval_minutes),
+                        discovery_ends_at,
+                        ends_at,
+                    )
                     decision = decide_next_work(
                         config,
                         histories[selected.name],
@@ -850,13 +907,12 @@ async def run_fashion_beauty_collection(
                         window_start=window_start,
                     )
                     window_key = (selected.name, window_start)
-                    if decision.discover and (not config.new_only or window_key not in completed_new_only_windows):
+                    retry_at = discovery_retry_not_before.get(window_key)
+                    if retry_at is not None and retry_at > now:
+                        wait_seconds = min(30.0, max(0.0, (retry_at - now).total_seconds()))
+                    elif decision.discover and (not config.new_only or window_key not in completed_new_only_windows):
                         batch_size = min(config.new_items_per_window, decision.remaining_capacity)
-                        invocation_deadline = min(
-                            window_start + timedelta(minutes=config.discovery_interval_minutes),
-                            discovery_ends_at,
-                            ends_at,
-                        )
+                        invocation_deadline = window_end
                         invoked = True
                         result, error = await _invoke_before_deadline(
                             invoke,
@@ -880,15 +936,37 @@ async def run_fashion_beauty_collection(
                             stop_event=stop_event,
                         )
                         if result:
+                            access_failure = _collector_access_failure(selected)
                             if exit_code == 0:
                                 exit_code = result
                             last_errors[selected.name] = error
                             collector_failures[selected.name] += 1
+                            attempt = discovery_retry_attempts.get(window_key, 0) + 1
+                            discovery_retry_attempts[window_key] = attempt
+                            if access_failure == "rate_limited":
+                                retry_at = window_end
+                                last_errors[selected.name] = (
+                                    f"{error}; Instagram rate limit detected, retry deferred until the next discovery window"
+                                )
+                            else:
+                                retry_at = min(
+                                    clock() + timedelta(seconds=_due_retry_delay(attempt)),
+                                    window_end,
+                                )
+                                if attempt >= _COLLECTOR_RETRY_MAX_ATTEMPTS:
+                                    retry_at = window_end
+                                    last_errors[selected.name] = (
+                                        f"{error}; retry deferred until the next discovery window after {attempt} failures"
+                                    )
+                            discovery_retry_not_before[window_key] = retry_at
                         elif config.new_only:
                             # One pass deliberately examines every candidate from this
                             # keyword group.  Do not rescan the same group merely
                             # because fewer than the requested number qualified.
                             completed_new_only_windows.add(window_key)
+                        else:
+                            discovery_retry_attempts.pop(window_key, None)
+                            discovery_retry_not_before.pop(window_key, None)
 
                 finish_after_iteration = (
                     not config.new_only
