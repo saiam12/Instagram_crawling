@@ -12,9 +12,10 @@ Runs the Python Instagram collector with this project's virtual environment.
 .\collector.ps1 -fashion --background
 #>
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
-    [Parameter(ValueFromRemainingArguments = $true)]
+    [string]$Avd = 'Pixel_8_clean',
+    [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$CollectorArguments
 )
 
@@ -44,6 +45,11 @@ try {
     }
     elseif ($argumentsToPass.Count -eq 0 -or $argumentsToPass[0].StartsWith("-")) {
         $argumentsToPass = @("collect") + $argumentsToPass
+    }
+    $androidCommands = @('collect', 'refresh', 'android-worker', 'hashtag-posts', 'fashion', 'beauty', 'fashion-beauty')
+    if ($androidCommands -contains $argumentsToPass[0].ToLowerInvariant()) {
+        $androidNoWindow = $argumentsToPass -contains '--background'
+        & (Join-Path $projectRoot 'start-android.ps1') -Avd $Avd -NoWindow:$androidNoWindow
     }
     & $python $launcher @argumentsToPass
     exit $LASTEXITCODE

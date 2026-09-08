@@ -37,13 +37,9 @@ BEAUTY_KEYWORDS: Sequence[str] = (
     "레티놀", "비타민C", "glassskin", "grwm", "cleanbeauty", "skincare",
 )
 
-SNAPSHOT_OFFSETS: Sequence[timedelta] = (
-    timedelta(),
-    timedelta(minutes=30),
-    timedelta(hours=1),
-    timedelta(hours=2),
-    timedelta(hours=4),
-    timedelta(hours=8),
+RECOLLECTION_INTERVAL = timedelta(hours=4)
+SNAPSHOT_OFFSETS: Sequence[timedelta] = tuple(
+    RECOLLECTION_INTERVAL * index for index in range(4)
 )
 
 
@@ -159,10 +155,9 @@ def due_jobs(dataset: DatasetConfig, rows: list[dict[str, Any]], now: datetime) 
     result: list[DueJob] = []
     for url, snapshots in _rows_grouped_by_normalized_url(rows).items():
         snapshots.sort(key=lambda snapshot: snapshot[1])
-        if len(snapshots) < len(SNAPSHOT_OFFSETS):
-            due_at = snapshots[0][1] + SNAPSHOT_OFFSETS[len(snapshots)]
-            if due_at <= current:
-                result.append(DueJob(dataset.name, url, due_at))
+        due_at = snapshots[0][1] + RECOLLECTION_INTERVAL * len(snapshots)
+        if due_at <= current:
+            result.append(DueJob(dataset.name, url, due_at))
     return sorted(result, key=lambda job: (job.due_at, job.dataset, job.url))
 
 
@@ -238,6 +233,7 @@ __all__ = [
     "BEAUTY_KEYWORDS",
     "FASHION_KEYWORDS",
     "KEYWORDS_PER_WINDOW",
+    "RECOLLECTION_INTERVAL",
     "SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW",
     "SNAPSHOT_OFFSETS",
     "DatasetConfig",

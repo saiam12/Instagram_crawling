@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import calendar
+import ctypes
 import csv
 import json
 import math
@@ -41,7 +42,9 @@ if __package__:
     from .android_reel_metrics import (
         AndroidMetricResult,
         AndroidReelMetricsEnricher,
+        apply_metric_visibility_rules,
         merge_android_metrics,
+        needs_android_metric_fallback,
         write_hashtag_post_counts,
     )
     from .instagram_follower_enricher import (
@@ -54,7 +57,9 @@ else:
     from collectors.android_reel_metrics import (  # type: ignore[no-redef]
         AndroidMetricResult,
         AndroidReelMetricsEnricher,
+        apply_metric_visibility_rules,
         merge_android_metrics,
+        needs_android_metric_fallback,
         write_hashtag_post_counts,
     )
     from collectors.instagram_follower_enricher import (  # type: ignore[no-redef]
@@ -136,13 +141,12 @@ FOLLOWER_SUCCESS_INTERVAL_SECONDS = 0.3
 # audio, and location may be genuinely absent from a public Reel; an empty
 # value for those optional fields is not evidence that Python failed.
 #
-# The three excluded counts are Android-owned in the hybrid pipeline.  Python
-# values are still retained when available, but they never delay an Android
-# URL handoff.
+# The two excluded counts are Android-owned in the hybrid pipeline and never
+# delay an Android URL handoff.  repost_count is Python-owned and therefore
+# remains part of the handoff completeness check.
 PYTHON_TO_ANDROID_EXCLUDED_COUNT_FIELDS = frozenset({
     "view_count",
     "share_count",
-    "repost_count",
 })
 PYTHON_TO_ANDROID_REQUIRED_FIELDS = (
     "url",
@@ -154,12 +158,15 @@ PYTHON_TO_ANDROID_REQUIRED_FIELDS = (
     "days_since_upload",
     "like_count",
     "comment_count",
+    "repost_count",
 )
 PYTHON_TO_ANDROID_RETRY_DELAY_SECONDS = 3.0
 ANDROID_METRIC_QUEUE_DIRECTORY = "android_metric_queue"
 ANDROID_METRIC_QUEUE_IDLE_SECONDS = 12.0
 ANDROID_METRIC_QUEUE_EXPORT_BATCH_SIZE = 20
 ANDROID_METRIC_MAX_ATTEMPTS_PER_REEL = 3
+ANDROID_DEVICE_RECONNECT_SECONDS = 30.0
+ANDROID_METRIC_FAILURE_BACKOFF_SECONDS = 30.0
 COLLECTION_MAX_CONSECUTIVE_FAILURES = 5
 COLLECTION_STOP_FILENAME = "collection_stop.json"
 ANDROID_METRIC_FIELDS = (
@@ -167,7 +174,6 @@ ANDROID_METRIC_FIELDS = (
     "view_count",
     "comment_count",
     "share_count",
-    "repost_count",
     "saved_count",
     "audio_name",
 )
@@ -176,8 +182,15 @@ PYTHON_ANDROID_COMPARISON_COUNT_FIELDS = (
     "like_count",
     "comment_count",
     "share_count",
-    "repost_count",
     "saved_count",
+)
+ANDROID_TERMINAL_METRIC_FIELDS = (
+    "like_count",
+    "comment_count",
+    "repost_count",
+    "share_count",
+    "saved_count",
+    "view_count",
 )
 HASHTAG_REDISCOVERY_INTERVAL_SECONDS = 60
 HASHTAG_GRID_INITIAL_LOAD_MILLISECONDS = 2_500
@@ -205,6 +218,7 @@ DIRECT_REEL_SETTLE_MILLISECONDS = 250
 # initiated. This is deliberately a passive wait: it must not make a second
 # Instagram request simply because a metric arrives late.
 PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS = 20_000
+PYTHON_REPOST_METADATA_TIMEOUT_MILLISECONDS = 3_000
 PASSIVE_RESPONSE_EXTENDED_WAIT_MILLISECONDS = 60_000
 DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS
 # The legacy media-info fetch is retained for compatibility and diagnostics,
@@ -272,6 +286,43 @@ def append_collection_log(data_dir: Path | str, source: str, event: str, **value
         # a transient log-file lock must not make the data capture fail.
         pass
     return path
+
+
+async def relay_new_collection_log_lines(data_dir: Path | str, source: str) -> None:
+    """Print log lines written by a detached collector process to this terminal."""
+    path = collection_log_path(data_dir, source)
+    position = path.stat().st_size if path.exists() else 0
+    while True:
+        await asyncio.sleep(0.25)
+        try:
+            if not path.exists():
+                continue
+            size = path.stat().st_size
+            if size < position:
+                position = 0
+            if size == position:
+                continue
+            with path.open("r", encoding="utf-8", errors="replace") as file:
+                file.seek(position)
+                lines = file.readlines()
+                position = file.tell()
+            for line in lines:
+                terminal_line = collection_log_terminal_line(source, line)
+                if terminal_line is not None:
+                    print(terminal_line, flush=True)
+        except OSError:
+            continue
+
+
+def collection_log_terminal_line(source: str, line: str) -> str | None:
+    """Keep detailed Android diagnostics in its file, but relay only Reel summaries."""
+    rendered = line.rstrip()
+    if source != "android":
+        return rendered
+    marker = " | terminal_line="
+    if marker not in rendered:
+        return None
+    return rendered.split(marker, 1)[1]
 ANONYMOUS_FOLLOWER_MAX_ATTEMPTS = 3
 ANONYMOUS_FOLLOWER_RETRY_SECONDS = 1.0
 FOLLOWER_WEB_MAX_ATTEMPTS = 3
@@ -1366,14 +1417,14 @@ def missing_python_to_android_handoff_fields(record: dict[str, Any] | None) -> t
     A value may be deliberately empty for a public Reel (for example a
     caption, audio track, or location), so only the identity/static fields
     that make the handoff meaningful and the two web-readable engagement
-    counts are required here.  Android remains the source of view, share,
-    and repost counts; they are explicitly outside this decision.
+    counts are required here.  Android remains the source of view and share
+    counts; repost_count is collected by Python from the Reel detail response.
     """
     candidate = record or {}
     missing: list[str] = []
     for field in PYTHON_TO_ANDROID_REQUIRED_FIELDS:
         value = candidate.get(field)
-        if field in {"like_count", "comment_count"}:
+        if field in {"like_count", "comment_count", "repost_count"}:
             present = exact_nonnegative_integer(value) is not None
         elif field in {"video_duration_seconds", "days_since_upload"}:
             present = exact_nonnegative_number(value) is not None
@@ -2330,7 +2381,10 @@ class AndroidMetricPipeline:
                         error="The browser Reel snapshot disappeared before Android metric enrichment.",
                     )
                 try:
-                    await self.on_result(handoff.record, result)
+                    await self.on_result(
+                        {**handoff.record, "_android_attempt_count": attempts},
+                        result,
+                    )
                 except Exception as error:
                     # A reporting failure must not strand the remaining
                     # Android queue items after Python has moved on.
@@ -2379,6 +2433,19 @@ class AndroidMetricPipeline:
 def process_is_alive(pid: int) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        process = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            # Access denied means the process exists but cannot be queried.
+            return ctypes.get_last_error() == 5
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                return True
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(process)
     try:
         os.kill(pid, 0)
         return True
@@ -2495,6 +2562,7 @@ def _android_metric_queue_paths(data_dir: Path | str) -> dict[str, Path]:
         "working": root / "working",
         "completed": root / "completed",
         "hashtag_completed": root / "hashtag_completed",
+        "worker_starting": root / "worker.starting.json",
         "worker_lock": root / "worker.lock.json",
         "history_lock": root / "history.lock.json",
         "status": root / "status.json",
@@ -2518,6 +2586,8 @@ def enqueue_android_metric_job(
     adb_path: Path | str | None = None,
     device_id: str | None = None,
     ui_delay_seconds: float = 0.35,
+    collection_run_id: str = "",
+    python_index: int = 0,
 ) -> str:
     """Atomically persist a URL for the independent Android worker."""
     url = str(record.get("url", "")).strip()
@@ -2533,10 +2603,12 @@ def enqueue_android_metric_job(
         "target": {"url": url, "collected_at": collected_at},
         "python_metrics": {
             field: record.get(field, "")
-            for field in PYTHON_ANDROID_COMPARISON_COUNT_FIELDS
+            for field in (*PYTHON_ANDROID_COMPARISON_COUNT_FIELDS, "repost_count", "ad")
         },
         "missing_python_fields": list(missing_python_fields),
         "delay_seconds": max(0.0, float(delay_seconds)),
+        "collection_run_id": str(collection_run_id),
+        "python_index": max(0, int(python_index)),
         "android": {
             "adb_path": str(adb_path) if adb_path else "",
             "device_id": str(device_id or ""),
@@ -2713,11 +2785,106 @@ def _write_android_metric_completion(
         "metrics": dict(result.metrics),
         "audio_name": result.audio_name,
         "like_count_private": result.like_count_private,
+        "comment_count_disabled": result.comment_count_disabled,
         "status": result.status,
         "error": result.error[:500],
     }
     write_json_atomic(paths["completed"] / working_path.name, payload)
     working_path.unlink(missing_ok=True)
+
+
+def android_metric_terminal_line(
+    result: AndroidMetricResult,
+    attempts: int,
+    *,
+    current: int,
+    total: int,
+    python_metrics: dict[str, Any] | None = None,
+) -> str:
+    """Format the only per-Reel Android line shown in the collector terminal."""
+    python_values = python_metrics or {}
+    combined_values: dict[str, object] = {**python_values, **result.metrics}
+    if result.like_count_private is True:
+        combined_values["like_count"] = UNAVAILABLE_LIKE_COUNT_MARKER
+    combined_values = apply_metric_visibility_rules(
+        combined_values,
+        comment_count_disabled=result.comment_count_disabled is True,
+    )
+    fields: list[str] = []
+    for field in ANDROID_TERMINAL_METRIC_FIELDS:
+        value = combined_values.get(field, "")
+        rendered = f"{value:,}" if isinstance(value, int) else str(value or "unavailable")
+        fields.append(f"{field}={rendered}")
+    fields.append(f"attempt_count={max(0, int(attempts))}")
+    return f"[Android {max(1, int(current))}/{max(1, int(total))}] " + ", ".join(fields)
+
+
+def android_reel_progress(
+    paths: dict[str, Path],
+    job: dict[str, Any],
+    *,
+    fallback_current: int,
+) -> tuple[int, int]:
+    """Return this Python handoff's ordinal and the latest ordinal queued for its run."""
+    try:
+        current = max(1, int(job.get("python_index", 0) or fallback_current))
+    except (TypeError, ValueError):
+        current = max(1, int(fallback_current))
+    run_id = str(job.get("collection_run_id", ""))
+    if not run_id:
+        pending_reels = sum(
+            1
+            for path in paths["pending"].glob("*.json")
+            if not str((_read_android_metric_job(path) or {}).get("kind", ""))
+        ) if paths["pending"].exists() else 0
+        return current, current + pending_reels
+    total = current
+    for queue_name in ("pending", "working"):
+        if not paths[queue_name].exists():
+            continue
+        for path in paths[queue_name].glob("*.json"):
+            queued = _read_android_metric_job(path) or {}
+            if str(queued.get("collection_run_id", "")) != run_id:
+                continue
+            try:
+                total = max(total, int(queued.get("python_index", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+    return current, total
+
+
+def _is_android_device_connection_error(error: Any) -> bool:
+    message = str(error or "").casefold()
+    return any(
+        marker in message
+        for marker in (
+            "device offline",
+            "device still authorizing",
+            "device unauthorized",
+            "device not found",
+            "no devices/emulators found",
+            "no online android emulator was found",
+            "has not finished booting",
+            "error: closed",
+            "adb command timed out",
+            "adb_utils.cpp",
+            "cannot mkdir",
+            "can't find service:",
+        )
+    ) or ("device '" in message and "' not found" in message)
+
+
+def _requeue_android_metric_job(
+    paths: dict[str, Path],
+    working_path: Path,
+    job: dict[str, Any],
+    error: str,
+) -> None:
+    """Preserve a Reel job when ADB temporarily loses its emulator."""
+    job["last_device_error"] = str(error)[:500]
+    write_json_atomic(working_path, job)
+    paths["pending"].mkdir(parents=True, exist_ok=True)
+    os.replace(working_path, paths["pending"] / working_path.name)
 
 
 def _merge_external_android_metrics(
@@ -2736,6 +2903,11 @@ def _merge_external_android_metrics(
         for field in ANDROID_METRIC_FIELDS:
             value = external.get(field, "")
             if value in (None, "") or str(row.get(field, "")) == str(value):
+                continue
+            if field == "audio_name":
+                if str(row.get(field, "") or "").strip():
+                    continue
+            elif not needs_android_metric_fallback(row.get(field)):
                 continue
             row[field] = value
             changed += 1
@@ -2819,16 +2991,32 @@ def apply_completed_android_metric_jobs(
                 continue
             metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
             for field in ANDROID_METRIC_FIELDS[:-1]:
-                if field not in metrics or row.get(field) == metrics[field]:
+                if (
+                    field not in metrics
+                    or row.get(field) == metrics[field]
+                    or not needs_android_metric_fallback(row.get(field))
+                ):
                     continue
                 row[field] = metrics[field]
                 updated += 1
             audio_name = str(result.get("audio_name", "") or "")
-            if audio_name and row.get("audio_name") != audio_name:
+            if audio_name and not str(row.get("audio_name", "") or "").strip():
                 row["audio_name"] = audio_name
                 updated += 1
-            if result.get("like_count_private") is True and "like_count" not in metrics and row.get("like_count") != UNAVAILABLE_LIKE_COUNT_MARKER:
+            if (
+                result.get("like_count_private") is True
+                and row.get("like_count") != UNAVAILABLE_LIKE_COUNT_MARKER
+            ):
                 row["like_count"] = UNAVAILABLE_LIKE_COUNT_MARKER
+                updated += 1
+            resolved = apply_metric_visibility_rules(
+                row,
+                comment_count_disabled=result.get("comment_count_disabled") is True,
+            )
+            for field in ANDROID_TERMINAL_METRIC_FIELDS:
+                if row.get(field) == resolved.get(field):
+                    continue
+                row[field] = resolved.get(field, "")
                 updated += 1
             applied_paths.append(completed)
         if applied_paths:
@@ -2858,7 +3046,10 @@ def python_metrics_for_android_job(data_dir: Path | str, job: dict[str, Any]) ->
     """Use the queued browser snapshot, with history fallback for old jobs."""
     queued = job.get("python_metrics")
     if isinstance(queued, dict):
-        return {field: queued.get(field, "") for field in PYTHON_ANDROID_COMPARISON_COUNT_FIELDS}
+        return {
+            field: queued.get(field, "")
+            for field in (*PYTHON_ANDROID_COMPARISON_COUNT_FIELDS, "repost_count", "ad")
+        }
     target = job.get("target") if isinstance(job.get("target"), dict) else {}
     url = str(target.get("url", ""))
     collected_at = str(target.get("collected_at", ""))
@@ -2868,7 +3059,10 @@ def python_metrics_for_android_job(data_dir: Path | str, job: dict[str, Any]) ->
     _fields, rows = read_csv_objects(history_path)
     for row in reversed(rows):
         if str(row.get("url", "")) == url and str(row.get("collected_at", "")) == collected_at:
-            return {field: row.get(field, "") for field in PYTHON_ANDROID_COMPARISON_COUNT_FIELDS}
+            return {
+                field: row.get(field, "")
+                for field in (*PYTHON_ANDROID_COMPARISON_COUNT_FIELDS, "repost_count", "ad")
+            }
     return {}
 
 
@@ -2879,6 +3073,7 @@ def run_android_metric_worker(
     device_id: str | None = None,
     ui_delay_seconds: float = 0.35,
     idle_seconds: float = ANDROID_METRIC_QUEUE_IDLE_SECONDS,
+    attach_existing: bool = True,
 ) -> int:
     """Drain the durable Android queue; safe to relaunch after any interruption."""
     destination = Path(data_dir).resolve()
@@ -2894,7 +3089,38 @@ def run_android_metric_worker(
     paths = _android_metric_queue_paths(destination)
     worker_lock = AtomicProcessLock(paths["worker_lock"])
     if not worker_lock.acquire():
+        owner = _read_android_metric_job(paths["worker_lock"]) or {}
+        owner_pid = int(owner.get("pid", 0) or 0)
         append_collection_log(destination, "android", "worker_not_started", reason="another worker is already running")
+        if not attach_existing:
+            return 0
+        log_path = collection_log_path(destination, "android")
+        position = log_path.stat().st_size if log_path.exists() else 0
+        try:
+            while owner_pid and process_is_alive(owner_pid):
+                time.sleep(0.25)
+                try:
+                    if not log_path.exists():
+                        continue
+                    size = log_path.stat().st_size
+                    if size < position:
+                        position = 0
+                    if size == position:
+                        continue
+                    with log_path.open("r", encoding="utf-8", errors="replace") as file:
+                        file.seek(position)
+                        lines = file.readlines()
+                        position = file.tell()
+                    for line in lines:
+                        terminal_line = collection_log_terminal_line("android", line)
+                        if terminal_line is not None:
+                            print(terminal_line, flush=True)
+                except OSError:
+                    continue
+        except KeyboardInterrupt:
+            if owner_pid and process_is_alive(owner_pid):
+                os.kill(owner_pid, signal.SIGTERM)
+            return 130
         return 0
     _recover_android_metric_working_jobs(paths)
     enricher = AndroidReelMetricsEnricher(
@@ -2902,9 +3128,22 @@ def run_android_metric_worker(
         device_id=device_id,
         ui_delay_seconds=ui_delay_seconds,
     )
-    processed = collected = unavailable = consecutive_failures = 0
+    processed = processed_reels = collected = unavailable = consecutive_failures = 0
     idle_started = time.monotonic()
-    _write_android_metric_worker_status(paths, state="running", pid=os.getpid(), processed=0, collected=0, unavailable=0)
+    pause_reel_when_idle = False
+    idle_pause_attempted = False
+    _write_android_metric_worker_status(
+        paths,
+        state="running",
+        pid=os.getpid(),
+        processed=0,
+        collected=0,
+        unavailable=0,
+        consecutive_failures=0,
+        device_error="",
+        stop_reason="",
+        **android_metric_queue_counts(destination),
+    )
     append_collection_log(
         destination,
         "android",
@@ -2914,8 +3153,32 @@ def run_android_metric_worker(
     )
     try:
         while True:
+            # Wait before claiming a job so an absent device cannot consume
+            # the retry budget of every pending Reel.
+            check_ready = getattr(enricher, "_ready", None)
+            readiness_error = (
+                check_ready()
+                if callable(check_ready) and android_metric_queue_counts(destination)["pending"]
+                else ""
+            )
+            if _is_android_device_connection_error(readiness_error):
+                enricher.reset_connection()
+                _write_android_metric_worker_status(
+                    paths, state="waiting_for_device", device_error=readiness_error,
+                    **android_metric_queue_counts(destination),
+                )
+                time.sleep(max(0.1, ANDROID_DEVICE_RECONNECT_SECONDS))
+                continue
             claimed = _claim_android_metric_job(paths)
             if claimed is None:
+                if pause_reel_when_idle and not idle_pause_attempted:
+                    idle_pause_attempted = True
+                    pause_current_reel = getattr(enricher, "pause_current_reel", None)
+                    reel_paused_for_idle = bool(
+                        callable(pause_current_reel) and pause_current_reel()
+                    )
+                    if reel_paused_for_idle:
+                        append_collection_log(destination, "android", "reel_paused_for_queue_idle")
                 merge = apply_completed_android_metric_jobs(destination)
                 counts = android_metric_queue_counts(destination)
                 _write_android_metric_worker_status(
@@ -2935,6 +3198,8 @@ def run_android_metric_worker(
                 time.sleep(0.5)
                 continue
             idle_started = time.monotonic()
+            pause_reel_when_idle = False
+            idle_pause_attempted = False
             working_path, job = claimed
             tag_job_kind = str(job.get("kind") or "")
             if tag_job_kind in {"related_hashtag_post_counts", "hashtag_post_count"}:
@@ -2942,6 +3207,7 @@ def run_android_metric_worker(
                 is_idle_exact_tag_job = tag_job_kind == "hashtag_post_count"
                 hashtag_status = "collected"
                 hashtag_error = ""
+                hashtag_rows: list[dict[str, object]] = []
                 append_collection_log(
                     destination,
                     "android",
@@ -2956,9 +3222,6 @@ def run_android_metric_worker(
                         else enricher.collect_related_hashtag_post_counts
                     )
                     hashtag_rows = collect_tags([str(value) for value in hashtags])
-                    write_hashtag_post_counts(destination, hashtag_rows)
-                    collected += sum(row.get("status") == "collected" for row in hashtag_rows)
-                    unavailable += sum(row.get("status") != "collected" for row in hashtag_rows)
                     if not any(row.get("status") == "collected" for row in hashtag_rows):
                         hashtag_status = "unavailable"
                         failed_row = next((row for row in hashtag_rows if row.get("error")), {})
@@ -2975,7 +3238,6 @@ def run_android_metric_worker(
                             error=row.get("error", ""),
                         )
                 except Exception as error:
-                    unavailable += len(hashtags)
                     hashtag_status = "unavailable"
                     hashtag_error = str(error)[:500]
                     append_collection_log(
@@ -2987,6 +3249,38 @@ def run_android_metric_worker(
                         error=hashtag_error,
                     )
                     print(f"Android hashtag post-count worker failed: {error}", file=sys.stderr)
+                if _is_android_device_connection_error(hashtag_error):
+                    _requeue_android_metric_job(paths, working_path, job, hashtag_error)
+                    reset_connection = getattr(enricher, "reset_connection", None)
+                    if callable(reset_connection):
+                        reset_connection()
+                    counts = android_metric_queue_counts(destination)
+                    _write_android_metric_worker_status(
+                        paths,
+                        state="waiting_for_device",
+                        processed=processed,
+                        collected=collected,
+                        unavailable=unavailable,
+                        consecutive_failures=0,
+                        device_error=hashtag_error,
+                        **counts,
+                    )
+                    append_collection_log(
+                        destination,
+                        "android",
+                        "worker_waiting_for_device",
+                        job_kind=tag_job_kind,
+                        error=hashtag_error,
+                        retry_seconds=ANDROID_DEVICE_RECONNECT_SECONDS,
+                    )
+                    time.sleep(max(0.1, ANDROID_DEVICE_RECONNECT_SECONDS))
+                    continue
+                if hashtag_rows:
+                    write_hashtag_post_counts(destination, hashtag_rows)
+                    collected += sum(row.get("status") == "collected" for row in hashtag_rows)
+                    unavailable += sum(row.get("status") != "collected" for row in hashtag_rows)
+                elif hashtag_status != "collected":
+                    unavailable += len(hashtags)
                 paths["hashtag_completed"].mkdir(parents=True, exist_ok=True)
                 write_json_atomic(
                     paths["hashtag_completed"] / working_path.name,
@@ -3022,14 +3316,35 @@ def run_android_metric_worker(
                 status="unavailable",
                 error=f"Android retry limit ({ANDROID_METRIC_MAX_ATTEMPTS_PER_REEL}) was already exhausted.",
             )
+            device_connection_error = ""
             while attempts < ANDROID_METRIC_MAX_ATTEMPTS_PER_REEL:
                 attempts += 1
                 job["attempts"] = attempts
                 write_json_atomic(working_path, job)
+                if attempts > 1:
+                    prepare_reel_retry = getattr(enricher, "prepare_reel_retry", None)
+                    if callable(prepare_reel_retry):
+                        try:
+                            prepare_reel_retry()
+                        except Exception as error:
+                            append_collection_log(
+                                destination,
+                                "android",
+                                "reel_retry_reset_failed",
+                                job_id=job.get("job_id", working_path.stem),
+                                url=target.get("url", ""),
+                                attempt=attempts,
+                                error=str(error)[:500],
+                            )
                 try:
                     result = enricher.enrich(str(target.get("url", "")))
                 except Exception as error:
                     result = AndroidMetricResult(status="unavailable", error=str(error)[:500])
+                if _is_android_device_connection_error(result.error):
+                    device_connection_error = result.error
+                    break
+                if result.status == "skipped":
+                    break
                 if result.status == "collected":
                     mismatches = compare_python_and_android_counts(python_metrics, result.metrics)
                     if not mismatches:
@@ -3063,7 +3378,45 @@ def run_android_metric_worker(
                 )
                 if attempts < ANDROID_METRIC_MAX_ATTEMPTS_PER_REEL:
                     time.sleep(max(0.1, float(ui_delay_seconds)))
+            if device_connection_error:
+                _requeue_android_metric_job(paths, working_path, job, device_connection_error)
+                reset_connection = getattr(enricher, "reset_connection", None)
+                if callable(reset_connection):
+                    reset_connection()
+                consecutive_failures = 0
+                _write_android_metric_worker_status(
+                    paths,
+                    state="waiting_for_device",
+                    processed=processed,
+                    collected=collected,
+                    unavailable=unavailable,
+                    consecutive_failures=consecutive_failures,
+                    device_error=device_connection_error,
+                    **android_metric_queue_counts(destination),
+                )
+                append_collection_log(
+                    destination,
+                    "android",
+                    "worker_waiting_for_device",
+                    error=device_connection_error,
+                    retry_seconds=ANDROID_DEVICE_RECONNECT_SECONDS,
+                )
+                time.sleep(max(0.1, ANDROID_DEVICE_RECONNECT_SECONDS))
+                continue
+            progress_current, progress_total = android_reel_progress(
+                paths,
+                job,
+                fallback_current=processed_reels + 1,
+            )
+            terminal_line = android_metric_terminal_line(
+                result,
+                attempts,
+                current=progress_current,
+                total=progress_total,
+                python_metrics=python_metrics,
+            )
             _write_android_metric_completion(paths, working_path, job, result)
+            pause_reel_when_idle = True
             append_collection_log(
                 destination,
                 "android",
@@ -3073,10 +3426,15 @@ def run_android_metric_worker(
                 status=result.status,
                 metrics=result.metrics,
                 audio_name=result.audio_name,
+                like_count_private=result.like_count_private,
+                comment_count_disabled=result.comment_count_disabled,
                 error=result.error,
                 attempts=attempts,
+                terminal_line=terminal_line,
             )
+            print(terminal_line, flush=True)
             processed += 1
+            processed_reels += 1
             collected += int(result.status == "collected")
             unavailable += int(result.status != "collected")
             if result.status == "collected":
@@ -3086,25 +3444,31 @@ def run_android_metric_worker(
             if processed % ANDROID_METRIC_QUEUE_EXPORT_BATCH_SIZE == 0:
                 apply_completed_android_metric_jobs(destination)
             if consecutive_failures >= COLLECTION_MAX_CONSECUTIVE_FAILURES:
-                stop_request = request_collection_stop(
-                    destination,
-                    source="android",
-                    reason=(
-                        f"{COLLECTION_MAX_CONSECUTIVE_FAILURES} consecutive Android Reel metric jobs failed."
-                    ),
-                    consecutive_failures=consecutive_failures,
-                    url=str(target.get("url", "")),
-                )
+                counts = android_metric_queue_counts(destination)
                 _write_android_metric_worker_status(
                     paths,
-                    state="stopped",
+                    state="backing_off",
                     processed=processed,
                     collected=collected,
                     unavailable=unavailable,
                     consecutive_failures=consecutive_failures,
-                    stop_reason=stop_request["reason"],
+                    **counts,
                 )
-                return 2
+                append_collection_log(
+                    destination,
+                    "android",
+                    "worker_backing_off_after_failures",
+                    consecutive_failures=consecutive_failures,
+                    retry_seconds=ANDROID_METRIC_FAILURE_BACKOFF_SECONDS,
+                    pending=counts["pending"],
+                    url=str(target.get("url", "")),
+                )
+                # Android enrichment is optional in the detached worker. A
+                # broken app surface must not publish the shared stop signal
+                # that also terminates an otherwise healthy Python collector.
+                if counts["pending"] or counts["working"]:
+                    time.sleep(max(0.1, ANDROID_METRIC_FAILURE_BACKOFF_SECONDS))
+                consecutive_failures = 0
     finally:
         try:
             merge = apply_completed_android_metric_jobs(destination)
@@ -3154,36 +3518,47 @@ def start_android_metric_worker(
         )
         return False
     paths = _android_metric_queue_paths(data_dir)
-    owner = _read_android_metric_job(paths["worker_lock"])
-    if owner is not None and process_is_alive(int(owner.get("pid", 0) or 0)):
+    starting_lock = AtomicProcessLock(paths["worker_starting"])
+    if not starting_lock.acquire():
         return False
-    launcher = PYTHON_VERSION_ROOT / "scripts" / "instagram_reels_python.py"
-    command = [
-        sys.executable,
-        str(launcher),
-        "android-worker",
-        "--data-dir",
-        str(Path(data_dir).resolve()),
-        "--android-ui-delay-seconds",
-        str(max(0.1, float(ui_delay_seconds))),
-    ]
-    if adb_path:
-        command.extend(["--android-adb-path", str(adb_path)])
-    if device_id:
-        command.extend(["--android-device-id", str(device_id)])
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    log_path = collection_log_path(data_dir, "android")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    append_collection_log(data_dir, "android", "worker_launch_requested", command=command)
-    with log_path.open("a", encoding="utf-8", newline="\n") as log_file:
-        subprocess.Popen(
+    try:
+        owner = _read_android_metric_job(paths["worker_lock"])
+        if owner is not None and process_is_alive(int(owner.get("pid", 0) or 0)):
+            starting_lock.release()
+            return False
+        launcher = PYTHON_VERSION_ROOT / "scripts" / "instagram_reels_python.py"
+        command = [
+            sys.executable,
+            str(launcher),
+            "android-worker",
+            "--detached",
+            "--data-dir",
+            str(Path(data_dir).resolve()),
+            "--android-ui-delay-seconds",
+            str(max(0.1, float(ui_delay_seconds))),
+        ]
+        if adb_path:
+            command.extend(["--android-adb-path", str(adb_path)])
+        if device_id:
+            command.extend(["--android-device-id", str(device_id)])
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        append_collection_log(data_dir, "android", "worker_launch_requested", command=command)
+        process = subprocess.Popen(
             command,
             cwd=PYTHON_VERSION_ROOT,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
             creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-    return True
+        write_json_atomic(
+            paths["worker_starting"],
+            {"pid": process.pid, "started_at": isoformat_utc()},
+        )
+        starting_lock.acquired = False
+        return True
+    except Exception:
+        starting_lock.release()
+        raise
 
 
 class CollectorLock:
@@ -3334,11 +3709,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--direct-concurrency", type=int, default=DIRECT_REEL_CONCURRENCY)
     parser.add_argument("--hashtag-query", default="")
     parser.add_argument(
+        "--collect-hashtag-media-count",
+        action="store_true",
+        help="Collect related hashtag media_count with Android Tags search.",
+    )
+    parser.add_argument(
         "--android-idle-hashtag-query",
         default="",
         help=(
             "Hashtags whose exact Tags post totals Android collects one at a time "
-            "while no Reel metric job is waiting. Defaults to --hashtag-query."
+            "while no Reel metric job is waiting. Used only when explicitly supplied."
         ),
     )
     parser.set_defaults(android_metrics=True)
@@ -3388,8 +3768,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         options.android_idle_hashtags = parse_hashtag_query(options.android_idle_hashtag_query)
     except ValueError as error:
         build_parser().error(str(error))
-    if not options.android_idle_hashtags:
-        options.android_idle_hashtags = list(options.hashtags)
     if options.max_items < 0:
         build_parser().error("--max-items must be a non-negative integer.")
     if options.progress_offset < 0:
@@ -4019,11 +4397,18 @@ EXTRACT_VISIBLE_REEL_SCRIPT = r"""() => {
     element?.querySelector?.('[aria-label]')?.getAttribute('aria-label') || '',
     element?.querySelector?.('title')?.textContent || '', textOf(element),
   ];
+  const metricControlGroups = [viewControls, likeControls, commentControls, repostControls];
+  const containsOtherMetricControl = (node, candidates) => metricControlGroups.some(group =>
+    group !== candidates && group.some(control => node.contains(control))
+  );
   const metricFrom = candidates => {
     let compactToken = '';
     for (const control of candidates) {
       let node = control;
       for (let depth = 0; node && depth < 5; depth++, node = node.parentElement) {
+        // A shared action-rail parent contains several metrics. Reading its
+        // combined text can copy likes into comments/reposts (or vice versa).
+        if (node !== control && containsOtherMetricControl(node, candidates)) break;
         for (const source of metricSources(node)) {
           const exact = exactMetricToken(source);
           if (exact) return exact;
@@ -4187,6 +4572,22 @@ async def wait_for_reel_metadata(shortcode: str, reel_metadata: dict[str, dict[s
     return reel_metadata.get(shortcode, {})
 
 
+async def wait_for_python_repost_metadata(
+    shortcode: str,
+    reel_metadata: dict[str, dict[str, Any]],
+    timeout_milliseconds: int = PYTHON_REPOST_METADATA_TIMEOUT_MILLISECONDS,
+) -> dict[str, Any]:
+    """Wait briefly for the detail-page response that may expose repost_count."""
+    deadline = time.monotonic() + timeout_milliseconds / 1_000
+    latest = reel_metadata.get(shortcode, {})
+    while time.monotonic() < deadline:
+        latest = reel_metadata.get(shortcode, latest)
+        if exact_nonnegative_integer(latest.get("repostCount")) is not None:
+            return latest
+        await asyncio.sleep(0.1)
+    return reel_metadata.get(shortcode, latest)
+
+
 def has_complete_page_reel_metrics(shortcode: str, metadata: dict[str, Any] | None) -> bool:
     """Return whether page data contains every exact metric required by this collector."""
     return bool(
@@ -4337,6 +4738,17 @@ async def resolve_page_first_reel_metadata(
             passive_response_metadata,
             min(max(0, timeout_milliseconds), 750),
         )
+        if exact_nonnegative_integer(
+            merge_reel_metadata(page_metadata, passive_metadata).get("repostCount")
+        ) is None:
+            passive_metadata = merge_reel_metadata(
+                passive_metadata,
+                await wait_for_python_repost_metadata(
+                    shortcode,
+                    passive_response_metadata,
+                    min(max(0, timeout_milliseconds), PYTHON_REPOST_METADATA_TIMEOUT_MILLISECONDS),
+                ),
+            )
         return merge_reel_metadata(page_metadata, passive_metadata), bool(passive_metadata)
     if has_complete_page_reel_metrics(shortcode, page_metadata):
         return page_metadata, False
@@ -5158,6 +5570,7 @@ async def run_collector(
 
     previous_sigint: Any = None
     stop_watcher: asyncio.Task[None] | None = None
+    android_log_relay: asyncio.Task[None] | None = None
     if register_signal_handler:
         previous_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGINT, handle_interrupt)
@@ -5263,6 +5676,10 @@ async def run_collector(
         anonymous_refresh = bool(options.no_login and refresh_urls)
         hybrid_android_metrics = bool(options.android_metrics and not anonymous_refresh)
         detached_android_metrics = hybrid_android_metrics and not options.android_metrics_required
+        if detached_android_metrics:
+            android_log_relay = asyncio.create_task(
+                relay_new_collection_log_lines(options.data_dir, "android")
+            )
         start_url = refresh_urls[0] if refresh_urls else (hashtag_page_url(options.hashtags[0]) if options.hashtags else options.start_url)
         if not options.followers_only:
             reel_store = await LongReelStore.create(
@@ -5452,6 +5869,8 @@ async def run_collector(
 
         captured = duplicate_count = missing_count = filtered_count = 0
         android_metrics_collected = android_metrics_unavailable = android_handoff_deferred = 0
+        android_metrics_processed = 0
+        collection_run_id = uuid.uuid4().hex
         cooldown_skipped_count = page_recycle_count = transition_stall_count = recovery_failure_count = 0
         collected_shortcodes: set[str] = set()
         next_delay_seconds = options.interval_seconds
@@ -5488,20 +5907,24 @@ async def run_collector(
             browser_record: dict[str, Any],
             android_result: AndroidMetricResult,
         ) -> None:
-            nonlocal android_metrics_collected, android_metrics_unavailable
+            nonlocal android_metrics_collected, android_metrics_unavailable, android_metrics_processed
             if android_result.status == "collected":
                 android_metrics_collected += 1
             else:
                 android_metrics_unavailable += 1
-                print(
-                    f"Android metrics unavailable: {browser_record['url']} ({android_result.error})",
-                    file=sys.stderr,
-                )
-            rendered = " | ".join(
-                f"{field}={android_result.display_value(field)}"
-                for field in ("like_count", "view_count", "comment_count", "share_count", "repost_count", "saved_count", "audio_name")
+            current = int(browser_record.get("_android_python_index", 0) or android_metrics_processed + 1)
+            total = max(current, android_pipeline.queued if android_pipeline is not None else current)
+            print(
+                android_metric_terminal_line(
+                    android_result,
+                    int(browser_record.get("_android_attempt_count", 0) or 0),
+                    current=current,
+                    total=total,
+                    python_metrics=browser_record,
+                ),
+                flush=True,
             )
-            print(f"[ANDROID] metrics | {rendered}")
+            android_metrics_processed += 1
             await asyncio.to_thread(
                 append_collection_log,
                 options.data_dir,
@@ -5511,6 +5934,8 @@ async def run_collector(
                 status=android_result.status,
                 metrics=android_result.metrics,
                 audio_name=android_result.audio_name,
+                like_count_private=android_result.like_count_private,
+                comment_count_disabled=android_result.comment_count_disabled,
                 error=android_result.error,
             )
             await update_status(progress_patch(str(browser_record.get("url", ""))))
@@ -5526,49 +5951,6 @@ async def run_collector(
                 data_dir=options.data_dir,
             )
             android_pipeline.start()
-
-        idle_hashtag_post_jobs_enqueued = False
-
-        async def queue_idle_hashtag_post_counts() -> None:
-            """Use an otherwise idle Android worker for exact Tag post totals."""
-            nonlocal idle_hashtag_post_jobs_enqueued
-            if (
-                idle_hashtag_post_jobs_enqueued
-                or not detached_android_metrics
-                or not options.android_idle_hashtags
-                or rate_limit_state.limited
-            ):
-                return
-            job_ids = await asyncio.to_thread(
-                enqueue_android_idle_hashtag_post_count_jobs,
-                options.data_dir,
-                options.android_idle_hashtags,
-                adb_path=options.android_adb_path,
-                device_id=options.android_device_id,
-                ui_delay_seconds=options.android_ui_delay_seconds,
-            )
-            if not job_ids:
-                return
-            idle_hashtag_post_jobs_enqueued = True
-            await asyncio.to_thread(
-                start_android_metric_worker,
-                options.data_dir,
-                adb_path=options.android_adb_path,
-                device_id=options.android_device_id,
-                ui_delay_seconds=options.android_ui_delay_seconds,
-            )
-            await asyncio.to_thread(
-                append_collection_log,
-                options.data_dir,
-                "android",
-                "idle_hashtag_post_jobs_queued",
-                hashtags=options.android_idle_hashtags,
-                job_count=len(job_ids),
-            )
-            print(
-                "[ANDROID] Reel metric queue is idle; queued exact Tags post totals: "
-                f"{len(job_ids)} hashtag(s)."
-            )
 
         async def log_python_reel(
             collected: dict[str, Any],
@@ -5605,9 +5987,8 @@ async def run_collector(
             handoff_delay = python_to_android_handoff_delay_seconds(collected)
             if handoff_delay:
                 android_handoff_deferred += 1
-            # Python does not wait for Android.  This is also used for
-            # hashtag-grid candidates, where opening a second web detail page
-            # would only increase the request rate.
+            # Python does not wait for Android. Exact browser values remain in
+            # the row; the app worker fills only unavailable/compact fields.
             next_delay_seconds = REEL_SUCCESS_INTERVAL_SECONDS
             stored = await reel_store.append(collected)
             seen.add(record["shortcode"])
@@ -5635,7 +6016,10 @@ async def run_collector(
                 if android_pipeline is None:
                     raise RuntimeError("Android metric pipeline was not initialized.")
                 android_pipeline.enqueue(
-                    collected,
+                    {
+                        **collected,
+                        "_android_python_index": captured + options.progress_offset + 1,
+                    },
                     missing_python_fields=handoff_missing,
                     delay_seconds=handoff_delay,
                 )
@@ -5651,6 +6035,8 @@ async def run_collector(
                     adb_path=options.android_adb_path,
                     device_id=options.android_device_id,
                     ui_delay_seconds=options.android_ui_delay_seconds,
+                    collection_run_id=collection_run_id,
+                    python_index=captured + options.progress_offset + 1,
                 )
                 await asyncio.to_thread(
                     start_android_metric_worker,
@@ -5944,7 +6330,7 @@ async def run_collector(
                 nonlocal filtered_count, cooldown_skipped_count
                 android_tag_job_id = ""
                 android_tag_task: asyncio.Task[list[dict[str, object]]] | None = None
-                if hybrid_android_metrics:
+                if hybrid_android_metrics and options.collect_hashtag_media_count:
                     if detached_android_metrics:
                         android_tag_job_id = await asyncio.to_thread(
                             enqueue_android_hashtag_post_count_job,
@@ -5961,7 +6347,6 @@ async def run_collector(
                             device_id=options.android_device_id,
                             ui_delay_seconds=options.android_ui_delay_seconds,
                         )
-                        print(f"[ANDROID] related hashtag collection started: {len(options.hashtags)} query tag(s).")
                     elif android_enricher is not None:
                         android_tag_task = asyncio.create_task(
                             asyncio.to_thread(
@@ -5992,13 +6377,9 @@ async def run_collector(
                     )
                     if tag_result is None:
                         return []
-                    print(
-                        "[ANDROID] related hashtag collection finished: "
-                        f"{tag_result.get('status', 'unavailable')} (hashtags.xlsx/json/csv)"
-                    )
                 elif android_tag_task is not None:
                     hashtag_rows = await android_tag_task
-                    hashtag_paths = await asyncio.to_thread(write_hashtag_post_counts, options.data_dir, hashtag_rows)
+                    await asyncio.to_thread(write_hashtag_post_counts, options.data_dir, hashtag_rows)
                     for hashtag_row in hashtag_rows:
                         await asyncio.to_thread(
                             append_collection_log,
@@ -6011,11 +6392,6 @@ async def run_collector(
                             status=hashtag_row.get("status", ""),
                             error=hashtag_row.get("error", ""),
                         )
-                    collected_tag_count = sum(row.get("status") == "collected" for row in hashtag_rows)
-                    print(
-                        "[ANDROID] related hashtag collection finished: "
-                        f"{collected_tag_count}/{len(hashtag_rows)} ({hashtag_paths['csv'].name})"
-                    )
                 prefiltered = prefilter_hashtag_reel_urls(
                     discovered,
                     reel_metadata,
@@ -6029,8 +6405,6 @@ async def run_collector(
                 if options.new_urls_only:
                     candidates = filter_new_urls(candidates, reel_store.rows)
                 candidates = unattempted_hashtag_urls(candidates, attempted_hashtag_urls)
-                if not candidates:
-                    await queue_idle_hashtag_post_counts()
                 print(
                     "후보 사전 필터: "
                     f"전체={prefiltered['total']}, "
@@ -6045,11 +6419,10 @@ async def run_collector(
                 if await stop_if_shared_failure_limit_reached():
                     break
                 hashtag_urls = await discover_hashtag_urls()
-                captured_before_candidate_batch = captured
                 if hybrid_android_metrics and hashtag_urls:
                     print(
-                        "[PYTHON] Hashtag candidates use already-rendered grid HTML; "
-                        "no Reel detail URLs will be opened."
+                        "[PYTHON] Opening each hashtag candidate Reel detail page so "
+                        "Python can collect repost_count before Android enrichment."
                     )
                 for index, url in enumerate(hashtag_urls):
                     if (
@@ -6060,30 +6433,17 @@ async def run_collector(
                         break
                     attempted_hashtag_urls.add(url)
                     try:
-                        if hybrid_android_metrics:
-                            await report_direct_result(
-                                index,
-                                url,
-                                await capture_hashtag_grid_candidate(url),
-                            )
+                        await navigate_with_retries(page, reel_detail_page_url(url))
+                        if options.manual:
+                            await async_input("현재 릴스를 다시 수집하려면 Enter를 누르세요: ")
                         else:
-                            await navigate_with_retries(page, reel_detail_page_url(url))
-                            if options.manual:
-                                await async_input("현재 릴스를 다시 수집하려면 Enter를 누르세요: ")
-                            else:
-                                await page.wait_for_timeout(next_delay_seconds * 1000)
-                            await report_direct_result(index, url, await capture_current_reel())
+                            await page.wait_for_timeout(next_delay_seconds * 1000)
+                        await report_direct_result(index, url, await capture_current_reel())
                     except CrawlerAccessError:
                         raise
                     except Exception as error:
                         await report_direct_error(index, url, error)
 
-                if not stop_requested and captured == captured_before_candidate_batch:
-                    # Android is genuinely idle only after every candidate in this
-                    # batch has failed to yield a usable Reel.  Starting this work
-                    # on the first skipped URL unnecessarily increased Instagram
-                    # traffic while Python was still visiting the remaining URLs.
-                    await queue_idle_hashtag_post_counts()
                 if stop_requested or (options.max_items and captured >= options.max_items):
                     break
                 if options.max_items:
@@ -6409,6 +6769,9 @@ async def run_collector(
                 pass
         raise
     finally:
+        if android_log_relay is not None:
+            android_log_relay.cancel()
+            await asyncio.gather(android_log_relay, return_exceptions=True)
         if stop_watcher is not None:
             stop_watcher.cancel()
             await asyncio.gather(stop_watcher, return_exceptions=True)

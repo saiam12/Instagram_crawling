@@ -795,7 +795,7 @@ async def run_fashion_beauty_collection(
                             job
                             for dataset in configured_datasets
                             for job in due_jobs(dataset, histories[dataset.name], ends_at)
-                            if job.due_at >= started_at
+                            if started_at <= job.due_at < ends_at
                         ),
                         key=lambda job: (job.due_at, job.dataset, job.url),
                     )

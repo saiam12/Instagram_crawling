@@ -30,6 +30,7 @@ from .fashion_beauty_scheduler import (
     BEAUTY_KEYWORDS,
     FASHION_KEYWORDS,
     KEYWORDS_PER_WINDOW,
+    RECOLLECTION_INTERVAL,
     SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW,
     SNAPSHOT_OFFSETS,
     DatasetConfig,
@@ -153,19 +154,20 @@ class CommandTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
-    def test_due_time_is_anchored_to_first_snapshot(self) -> None:
+    def test_due_time_uses_four_hour_interval_anchored_to_first_snapshot(self) -> None:
         base = datetime(2026, 8, 26, tzinfo=timezone.utc)
         rows = [
             {"url": "https://www.instagram.com/reels/a/", "collection_number": "1", "collected_at": isoformat_utc(base)},
-            {"url": "https://www.instagram.com/reels/a/", "collection_number": "2", "collected_at": isoformat_utc(base + timedelta(minutes=30))},
+            {"url": "https://www.instagram.com/reels/a/", "collection_number": "2", "collected_at": isoformat_utc(base + RECOLLECTION_INTERVAL)},
         ]
-        jobs = due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + timedelta(hours=1))
-        self.assertEqual([(job.url, job.due_at) for job in jobs], [("https://www.instagram.com/reels/a/", base + timedelta(hours=1))])
+        jobs = due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + RECOLLECTION_INTERVAL * 2)
+        self.assertEqual([(job.url, job.due_at) for job in jobs], [("https://www.instagram.com/reels/a/", base + RECOLLECTION_INTERVAL * 2)])
 
-    def test_six_snapshots_produce_no_future_job(self) -> None:
+    def test_four_hour_schedule_continues_after_default_offsets(self) -> None:
         base = datetime(2026, 8, 26, tzinfo=timezone.utc)
-        rows = [{"url": "https://www.instagram.com/reels/a/", "collection_number": str(index + 1), "collected_at": isoformat_utc(base + SNAPSHOT_OFFSETS[index])} for index in range(6)]
-        self.assertEqual(due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + timedelta(days=2)), [])
+        rows = [{"url": "https://www.instagram.com/reels/a/", "collection_number": str(index + 1), "collected_at": isoformat_utc(base + SNAPSHOT_OFFSETS[index])} for index in range(len(SNAPSHOT_OFFSETS))]
+        jobs = due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + RECOLLECTION_INTERVAL * len(SNAPSHOT_OFFSETS))
+        self.assertEqual([(job.url, job.due_at) for job in jobs], [("https://www.instagram.com/reels/a/", base + RECOLLECTION_INTERVAL * len(SNAPSHOT_OFFSETS))])
 
     def test_windows_alternate_and_each_keyword_set_has_48_entries(self) -> None:
         base = datetime(2026, 8, 26, tzinfo=timezone.utc)
@@ -266,7 +268,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_due_jobs_from_both_domains_run_before_active_window_discovery(self) -> None:
         started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
-        initial_at = started_at - timedelta(minutes=30)
+        initial_at = started_at - RECOLLECTION_INTERVAL
         config = RunConfig(
             data_root=self.data_root,
             duration_hours=0.5,
@@ -331,7 +333,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "url": url,
                     "collection_number": 1,
-                    "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
                 }
                 for url in urls
             ],
@@ -373,7 +375,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 [{
                     "url": f"https://www.instagram.com/reels/{dataset}_parallel/",
                     "collection_number": 1,
-                    "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
                 }],
             )
             for dataset in ("fashion", "beauty")
@@ -435,7 +437,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured_url_files, [f"{fashion_url}\n", f"{beauty_url}\n"])
         self.assertTrue(all(not option.urls_file.exists() for option in options))
 
-    async def test_recollection_period_ends_when_current_run_snapshots_complete(self) -> None:
+    async def test_recollection_period_runs_four_hour_snapshots_until_duration_end(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
         config = RunConfig(
             data_root=self.data_root,
@@ -453,7 +455,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                     "collection_number": index,
                     "collected_at": isoformat_utc(started_at),
                 }
-                for index in range(1, 6)
+                for index in range(1, 3)
             ],
         )
         clock = ManualClock(started_at)
@@ -463,7 +465,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         async def fake_invoke(**kwargs: object) -> int:
             calls.append(dict(kwargs))
             with history.open("a", newline="", encoding="utf-8") as file:
-                csv.writer(file).writerow([url, 6, isoformat_utc(clock())])
+                csv.writer(file).writerow([url, len(calls) + 2, isoformat_utc(clock())])
             return 0
 
         async def fake_wait(_event: object, seconds: float) -> bool:
@@ -475,9 +477,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
 
         self.assertEqual(result, 0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(clock(), started_at + timedelta(hours=8))
-        self.assertEqual(waits, [8 * 60 * 60])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(clock(), started_at + timedelta(hours=12))
+        self.assertEqual(waits, [8 * 60 * 60, 4 * 60 * 60])
         status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
         self.assertEqual(status["state"], "completed")
 
@@ -491,7 +493,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             writer.writerow({
                 "url": "https://www.instagram.com/reels/due/",
                 "collection_number": 1,
-                "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
             })
         config = RunConfig(
             data_root=self.data_root,
@@ -734,7 +736,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             [{
                 "url": "https://www.instagram.com/reels/retry/",
                 "collection_number": 1,
-                "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
             }],
         )
         workspace_export = self.data_root / ".datasets" / "fashion" / "reels.csv"
@@ -792,7 +794,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             [{
                 "url": "https://www.instagram.com/reels/rate-limited/",
                 "collection_number": 1,
-                "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
             }],
         )
         clock = ManualClock(started_at)
@@ -828,7 +830,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             [{
                 "url": "https://www.instagram.com/reels/rate-limited/",
                 "collection_number": 1,
-                "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
             }],
         )
         clock = ManualClock(started_at)
@@ -900,7 +902,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 [{
                     "url": "https://www.instagram.com/reels/fashion_retry/",
                     "collection_number": 1,
-                    "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
                 }],
             ),
             "beauty": self.write_history(
@@ -908,7 +910,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 [{
                     "url": "https://www.instagram.com/reels/beauty_due/",
                     "collection_number": 1,
-                    "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
                 }],
             ),
         }
@@ -976,7 +978,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                         writer.writerow({
                             "url": "https://www.instagram.com/reels/negative/",
                             "collection_number": 1,
-                            "collected_at": isoformat_utc(started_at - timedelta(minutes=30)),
+                            "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
                         })
                 clock = ManualClock(started_at)
 
@@ -1026,7 +1028,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             {
                 "url": "https://www.instagram.com/reels/due/",
                 "collection_number": 1,
-                "collected_at": isoformat_utc(now - timedelta(hours=1)),
+                "collected_at": isoformat_utc(now - RECOLLECTION_INTERVAL),
             }
         )
 

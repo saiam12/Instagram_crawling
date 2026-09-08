@@ -111,7 +111,7 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
     )
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data_web")
     parser.add_argument("--duration-hours", type=_finite_positive, default=16)
-    parser.add_argument("--discovery-hours", type=_finite_positive, default=7)
+    parser.add_argument("--discovery-hours", type=_finite_positive)
     parser.add_argument("--new-items-per-window", type=_positive_integer, default=300)
     parser.add_argument("--max-new-items-per-window", type=_positive_integer, default=300)
     parser.add_argument(
@@ -123,6 +123,11 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
     parser.add_argument("--max-upload-age-days", "--maxdays", dest="max_upload_age_days", type=_finite_nonnegative, default=30)
     parser.add_argument("--discovery-interval-minutes", type=_finite_positive, default=30)
     parser.add_argument("--background", action="store_true", help="Use the saved Instagram login without showing a browser window.")
+    parser.add_argument(
+        "--collect-hashtag-media-count",
+        action="store_true",
+        help="Collect hashtag media_count through Android Tags search during discovery.",
+    )
     parser.add_argument("--direct-reel-info-wait-seconds", type=_finite_nonnegative, default=3)
     parser.add_argument("--exact-metric-attempts", type=_positive_integer, default=3)
     parser.add_argument("--exact-metric-retry-delay-seconds", type=_finite_nonnegative, default=2)
@@ -176,8 +181,14 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
         # New-only runs have no post-discovery recollection period, so the
         # complete duration is an active discovery period.
         options.discovery_hours = options.duration_hours
-    elif options.discovery_hours > options.duration_hours - 9:
-        parser.error("--discovery-hours must end at least 9 hours before --duration-hours")
+    else:
+        max_discovery_hours = options.duration_hours - 12
+        if max_discovery_hours <= 0:
+            parser.error("--duration-hours must exceed 12 hours unless --new-only is used")
+        if options.discovery_hours is None:
+            options.discovery_hours = max_discovery_hours
+        elif options.discovery_hours > max_discovery_hours:
+            parser.error("--discovery-hours cannot exceed --duration-hours minus 12 hours")
 
     try:
         fashion_keywords = (
@@ -222,6 +233,7 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
         hashtag_candidates_per_keyword=options.hashtag_candidates_per_keyword,
         max_upload_age_days=options.max_upload_age_days,
         background=options.background,
+        collect_hashtag_media_count=options.collect_hashtag_media_count,
         direct_reel_info_wait_seconds=options.direct_reel_info_wait_seconds,
         exact_metric_attempts=options.exact_metric_attempts,
         exact_metric_retry_delay_seconds=options.exact_metric_retry_delay_seconds,
@@ -287,6 +299,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.add_argument("--android-adb-path", type=Path)
         parser.add_argument("--android-device-id")
         parser.add_argument("--android-ui-delay-seconds", type=float, default=0.35)
+        parser.add_argument("--detached", action="store_true", help=argparse.SUPPRESS)
         worker_options = parser.parse_args(arguments)
         if not math.isfinite(worker_options.android_ui_delay_seconds) or worker_options.android_ui_delay_seconds < 0.1:
             parser.error("--android-ui-delay-seconds must be at least 0.1")
@@ -295,6 +308,7 @@ def main(argv: list[str] | None = None) -> int:
             adb_path=worker_options.android_adb_path,
             device_id=worker_options.android_device_id,
             ui_delay_seconds=worker_options.android_ui_delay_seconds,
+            attach_existing=not worker_options.detached,
         )
     if command == "hashtag-posts":
         parser = argparse.ArgumentParser(prog="instagram_reels_python.py hashtag-posts")

@@ -39,6 +39,13 @@ LIKES_PANEL_XML = """
   <node text="624,267" resource-id="com.instagram.android:id/video_view_count_text" content-desc="624267 views" />
 </hierarchy>
 """
+LIKES_PANEL_WITH_ZERO_LIKES_XML = """
+<hierarchy>
+  <node text="Likes and plays" resource-id="com.instagram.android:id/title_text_view" />
+  <node text="482" resource-id="com.instagram.android:id/video_view_count_text" content-desc="482 views" />
+  <node text="Liked by" resource-id="com.instagram.android:id/header_text" />
+</hierarchy>
+"""
 
 
 class FakeDriver:
@@ -47,6 +54,8 @@ class FakeDriver:
         self.opened_urls: list[str] = []
         self.tapped_bounds: list[str] = []
         self.back_count = 0
+        self.center_tap_count = 0
+        self.dump_count = 0
 
     def ensure_ready(self) -> None:
         return None
@@ -55,17 +64,72 @@ class FakeDriver:
         self.opened_urls.append(url)
 
     def dump_ui(self) -> str:
+        self.dump_count += 1
         return self.xml.pop(0) if len(self.xml) > 1 else self.xml[0]
 
     def tap_bounds(self, bounds: str) -> bool:
         self.tapped_bounds.append(bounds)
         return True
 
+    def tap_screen_center(self) -> None:
+        self.center_tap_count += 1
+
     def press_back(self) -> None:
         self.back_count += 1
 
 
 class AndroidReelMetricTests(unittest.TestCase):
+    @patch.dict("os.environ", {"INSTAGRAM_ANDROID_DEVICE_ID": "emulator-5560"})
+    def test_adb_driver_uses_device_selected_by_launcher(self) -> None:
+        driver = AdbAndroidUiDriver(Path("adb.exe"))
+
+        self.assertEqual(driver.device_id, "emulator-5560")
+
+    def test_reset_connection_recreates_the_builtin_adb_driver(self) -> None:
+        enricher = AndroidReelMetricsEnricher(ui_delay_seconds=0.1)
+        first_driver = object()
+        enricher._driver = first_driver
+
+        enricher.reset_connection()
+
+        self.assertIsNone(enricher._driver)
+
+    def test_device_readiness_is_checked_again_after_a_transient_disconnect(self) -> None:
+        class ReconnectingDriver(FakeDriver):
+            def __init__(self) -> None:
+                super().__init__([REEL_XML, LIKES_PANEL_XML])
+                self.ready_attempts = 0
+
+            def ensure_ready(self) -> None:
+                self.ready_attempts += 1
+                if self.ready_attempts == 1:
+                    raise AndroidMetricsError("adb.exe: device 'emulator-5554' not found")
+
+        driver = ReconnectingDriver()
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        disconnected = enricher.enrich("https://www.instagram.com/reel/CODE123/")
+        reconnected = enricher.enrich("https://www.instagram.com/reel/CODE123/")
+
+        self.assertEqual(disconnected.status, "unavailable")
+        self.assertEqual(reconnected.status, "collected")
+        self.assertEqual(driver.ready_attempts, 2)
+        self.assertEqual(driver.center_tap_count, 1)
+
+    def test_queue_idle_pause_taps_the_visible_reel_once(self) -> None:
+        driver = FakeDriver([REEL_XML])
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        self.assertTrue(enricher.pause_current_reel())
+        self.assertEqual(driver.center_tap_count, 1)
+
+    def test_queue_idle_pause_ignores_non_reel_surfaces(self) -> None:
+        driver = FakeDriver(["<hierarchy><node text=\"Home\" /></hierarchy>"])
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        self.assertFalse(enricher.pause_current_reel())
+        self.assertEqual(driver.center_tap_count, 0)
+
     def test_android_related_hashtag_summary_counts_unique_rendered_tags(self) -> None:
         rows = [
             {"collected_at": "2026-09-01T00:00:00Z", "query_hashtag": "fashion", "hashtag": "fashion", "status": "collected"},
@@ -189,9 +253,20 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(result.metrics["view_count"], 624_267)
         self.assertEqual(result.metrics["comment_count"], 32)
         self.assertEqual(result.metrics["share_count"], 11_300)
-        self.assertEqual(result.metrics["repost_count"], 138)
+        self.assertNotIn("repost_count", result.metrics)
         self.assertEqual(result.metrics["saved_count"], 4)
         self.assertEqual(result.audio_name, "Artist · Track name")
+        self.assertEqual(driver.back_count, 1)
+
+    def test_likes_panel_with_plays_but_no_like_row_is_saved_as_zero(self) -> None:
+        driver = FakeDriver([REEL_XML, LIKES_PANEL_WITH_ZERO_LIKES_XML])
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
+
+        self.assertEqual(result.metrics["view_count"], 482)
+        self.assertEqual(result.metrics["like_count"], 0)
+        self.assertFalse(result.like_count_private)
         self.assertEqual(driver.back_count, 1)
 
     def test_empty_comment_sheet_is_saved_as_zero(self) -> None:
@@ -206,6 +281,21 @@ class AndroidReelMetricTests(unittest.TestCase):
         result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
 
         self.assertEqual(result.metrics["comment_count"], 0)
+        self.assertEqual(driver.back_count, 2)
+
+    def test_disabled_comment_sheet_is_marked_unavailable(self) -> None:
+        reel_without_comment = REEL_XML.replace(
+            '<node text="32" resource-id="com.instagram.android:id/comment_count" bounds="[0,300][100,400]" />',
+            '<node content-desc="View comments" bounds="[0,300][100,400]" />',
+        )
+        comment_xml = '<hierarchy><node text="Comments are turned off" /></hierarchy>'
+        driver = FakeDriver([reel_without_comment, LIKES_PANEL_XML, comment_xml])
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
+
+        self.assertTrue(result.comment_count_disabled)
+        self.assertNotIn("comment_count", result.metrics)
         self.assertEqual(driver.back_count, 2)
 
     def test_metricless_reel_surface_is_reported_as_android_unavailable(self) -> None:
@@ -236,6 +326,68 @@ class AndroidReelMetricTests(unittest.TestCase):
 
         self.assertEqual(result.status, "unavailable")
         self.assertEqual(len(driver.opened_urls), 2)
+        self.assertEqual(driver.back_count, 1)
+
+    def test_unreadable_reel_surface_stops_waiting_after_two_ui_dumps(self) -> None:
+        driver = FakeDriver([""])
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        with (
+            patch("collectors.android_reel_metrics._ANDROID_REEL_READY_TIMEOUT_SECONDS", 5.0),
+            patch("collectors.android_reel_metrics._ANDROID_RETRY_READY_TIMEOUT_SECONDS", 2.0),
+            patch("collectors.android_reel_metrics.time.sleep"),
+        ):
+            result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertIn("empty or unreadable", result.error)
+        self.assertEqual(driver.dump_count, 4)
+        self.assertEqual(driver.back_count, 1)
+
+    def test_dynamic_cta_reel_with_unreadable_hierarchy_is_skipped_once(self) -> None:
+        class DynamicCtaDriver(FakeDriver):
+            def __init__(self) -> None:
+                super().__init__([""])
+                self.reset_count = 0
+
+            def is_dynamic_cta_reel(self) -> bool:
+                return True
+
+            def reset_instagram_surface(self) -> None:
+                self.reset_count += 1
+
+        driver = DynamicCtaDriver()
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        with patch("collectors.android_reel_metrics.time.sleep"):
+            result = enricher.enrich("https://www.instagram.com/reel/SHOP123/")
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("CTA/shop", result.error)
+        self.assertEqual(len(driver.opened_urls), 1)
+        self.assertEqual(driver.reset_count, 1)
+
+    def test_plain_reel_with_unreadable_hierarchy_resets_instagram_before_retry(self) -> None:
+        class UnreadableDriver(FakeDriver):
+            def __init__(self) -> None:
+                super().__init__([""])
+                self.reset_count = 0
+
+            def is_dynamic_cta_reel(self) -> bool:
+                return False
+
+            def reset_instagram_surface(self) -> None:
+                self.reset_count += 1
+
+        driver = UnreadableDriver()
+        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+
+        with patch("collectors.android_reel_metrics.time.sleep"):
+            result = enricher.enrich("https://www.instagram.com/reel/PLAIN123/")
+
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(len(driver.opened_urls), 2)
+        self.assertEqual(driver.reset_count, 1)
 
     def test_hashtag_post_count_accepts_compact_android_display(self) -> None:
         count, raw = parse_hashtag_post_count('<hierarchy><node text="15.6M posts" /></hierarchy>')
@@ -835,7 +987,7 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(saved[1]["hours_since_previous"], "2.5")
         self.assertEqual(saved[1]["media_count_change"], 25)
 
-    def test_merge_overlays_only_android_owned_fields(self) -> None:
+    def test_merge_fills_missing_android_fields_without_overwriting_python_values(self) -> None:
         browser_record = {
             "url": "https://www.instagram.com/reel/CODE123/",
             "title": "browser caption",
@@ -853,9 +1005,19 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(merged["title"], "browser caption")
         self.assertEqual(merged["hashtags"], "#fashion")
         self.assertEqual(merged["location_name"], "Seoul")
-        self.assertEqual(merged["view_count"], 624_267)
+        self.assertEqual(merged["view_count"], 1)
         self.assertEqual(merged["share_count"], 10)
-        self.assertEqual(merged["audio_name"], "Android track")
+        self.assertEqual(merged["audio_name"], "browser audio")
+
+    def test_android_replaces_only_missing_or_compact_python_counts(self) -> None:
+        merged = merge_android_metrics(
+            {"view_count": "1.2K", "like_count": "", "comment_count": "123"},
+            AndroidMetricResult(metrics={"view_count": 1_234, "like_count": 50, "comment_count": 125}),
+        )
+
+        self.assertEqual(merged["view_count"], 1_234)
+        self.assertEqual(merged["like_count"], 50)
+        self.assertEqual(merged["comment_count"], "123")
 
     def test_unavailable_android_result_preserves_python_metrics(self) -> None:
         browser_record = {
@@ -879,6 +1041,52 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(merged["like_count"], 15_691)
         self.assertEqual(merged["comment_count"], 32)
         self.assertEqual(merged["repost_count"], 138)
+
+    def test_author_hidden_like_count_is_saved_as_x(self) -> None:
+        merged = merge_android_metrics(
+            {"like_count": 999, "view_count": 39_240},
+            AndroidMetricResult(
+                metrics={"view_count": 39_240},
+                like_count_private=True,
+            ),
+        )
+
+        self.assertEqual(merged["like_count"], "X")
+        self.assertEqual(merged["view_count"], 39_240)
+
+    def test_low_like_reel_defaults_missing_engagement_counts_to_zero(self) -> None:
+        merged = merge_android_metrics(
+            {
+                "like_count": 12,
+                "comment_count": "",
+                "repost_count": "",
+                "share_count": "",
+                "saved_count": "",
+                "ad": "false",
+            },
+            AndroidMetricResult(),
+        )
+
+        self.assertEqual(
+            {field: merged[field] for field in ("comment_count", "repost_count", "share_count", "saved_count")},
+            {"comment_count": 0, "repost_count": 0, "share_count": 0, "saved_count": 0},
+        )
+
+    def test_ad_without_saved_count_is_marked_x(self) -> None:
+        merged = merge_android_metrics(
+            {"like_count": 12, "saved_count": "", "ad": "true"},
+            AndroidMetricResult(),
+        )
+
+        self.assertEqual(merged["saved_count"], "X")
+
+    def test_disabled_comments_remain_x_even_when_like_count_is_low(self) -> None:
+        merged = merge_android_metrics(
+            {"like_count": 12, "comment_count": "", "ad": "false"},
+            AndroidMetricResult(comment_count_disabled=True),
+        )
+
+        self.assertEqual(merged["comment_count"], "X")
 
 
 if __name__ == "__main__":

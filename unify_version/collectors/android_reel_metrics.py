@@ -31,7 +31,6 @@ ANDROID_OWNED_FIELDS = (
     "view_count",
     "comment_count",
     "share_count",
-    "repost_count",
     "saved_count",
     "audio_name",
 )
@@ -43,6 +42,7 @@ _NO_COMMENTS = re.compile(r"\bno\s+comments\s+yet\b|아직\s*댓글이\s*(없습
 _COMMENTS_DISABLED = re.compile(r"\bcomments?\s+(?:are|is)\s+(?:turned\s+off|disabled)\b|댓글\s*(?:기능이\s*)?(?:꺼져\s*있|사용할\s*수\s*없)", re.I)
 _LIKE_PRIVATE = re.compile(r"only\s+.+?\s+can\s+see\s+the\s+total\s+number\s+of\s+likes|좋아요\s*수는\s*.+?만\s*볼\s*수\s*있", re.I)
 _COMPACT_COUNT = re.compile(r"(?P<number>\d+(?:[.,]\d+)?)\s*(?P<unit>[KMBkmb만천])")
+_EXACT_COUNT = re.compile(r"\d[\d,\s]*")
 _POST_COUNT_PATTERNS = (
     re.compile(r"(?P<count>\d[\d,\s]*)\+\s+posts?\b", re.I),
     re.compile(r"fewer\s+than\s+(?P<count>\d[\d,\s]*)\s+posts?\b", re.I),
@@ -55,6 +55,8 @@ _METRIC_RESOURCE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("view_count", ("video_view_count", "view_count", "play_count")),
     ("comment_count", ("comment_count", "comments_count")),
     ("share_count", ("share_count", "shares_count", "share_number", "send_count")),
+    # Recognize repost nodes so they are not mistaken for audio text. The
+    # result filter intentionally excludes this Python-owned field.
     ("repost_count", ("repost_count", "reposts_count", "reshare_count", "reshare_number")),
     ("saved_count", ("save_count", "saved_count", "saves_count", "bookmark_count")),
 )
@@ -105,6 +107,7 @@ class AndroidMetricResult:
     metrics: dict[str, int] = field(default_factory=dict)
     audio_name: str = ""
     like_count_private: bool | None = None
+    comment_count_disabled: bool | None = None
     status: str = "collected"
     error: str = ""
 
@@ -125,6 +128,8 @@ class AndroidUiDriver(Protocol):
     def dump_ui(self) -> str: ...
 
     def tap_bounds(self, bounds: str) -> bool: ...
+
+    def tap_screen_center(self) -> None: ...
 
     def press_back(self) -> None: ...
 
@@ -232,7 +237,11 @@ class AdbAndroidUiDriver:
 
     def __init__(self, adb_path: Path, device_id: str | None = None) -> None:
         self.adb_path = Path(adb_path)
-        self.device_id = device_id or self._select_online_device()
+        self.device_id = (
+            device_id
+            or os.environ.get("INSTAGRAM_ANDROID_DEVICE_ID", "").strip()
+            or self._select_online_device()
+        )
         self._cached_screen_size: tuple[int, int] | None = None
 
     def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -289,6 +298,11 @@ class AdbAndroidUiDriver:
         return devices[0]
 
     def ensure_ready(self) -> None:
+        boot_completed = self._run("shell", "getprop", "sys.boot_completed")
+        if boot_completed.stdout.strip() != "1":
+            raise AndroidMetricsError(
+                "The Android emulator is online but has not finished booting."
+            )
         package = self._run("shell", "pm", "path", INSTAGRAM_PACKAGE)
         if not package.stdout.strip():
             raise AndroidMetricsError("Instagram is not installed on the selected Android device.")
@@ -313,7 +327,53 @@ class AdbAndroidUiDriver:
 
     def dump_ui(self) -> str:
         command = "uiautomator dump --compressed /sdcard/hybrid_window.xml >/dev/null && cat /sdcard/hybrid_window.xml"
-        return self._run("exec-out", "sh", "-c", command).stdout
+        try:
+            return self._run("exec-out", "sh", "-c", command).stdout
+        except AndroidMetricsError:
+            self.reset_ui_automation()
+            raise
+
+    def reset_ui_automation(self) -> None:
+        """Remove a device-side UIAutomator left behind by a host timeout."""
+        try:
+            subprocess.run(
+                [str(self.adb_path), "-s", self.device_id, "shell", "pkill", "uiautomator"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def is_dynamic_cta_reel(self) -> bool:
+        """Detect View shop and similar CTA Reels without UIAutomator."""
+        try:
+            hierarchy = self._run("shell", "dumpsys", "activity", "top").stdout
+        except AndroidMetricsError:
+            return False
+        return any(
+            "clips_viewer_cta_button" in line and re.search(r"\{[0-9a-f]+\s+V", line, re.I)
+            for line in hierarchy.splitlines()
+        )
+
+    def reset_instagram_surface(self) -> None:
+        """Clear a poisoned accessibility session without stopping Android."""
+        self.reset_ui_automation()
+        try:
+            subprocess.run(
+                [str(self.adb_path), "-s", self.device_id, "shell", "am", "force-stop", INSTAGRAM_PACKAGE],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     def tap_bounds(self, bounds: str) -> bool:
         match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
@@ -322,6 +382,10 @@ class AdbAndroidUiDriver:
         left, top, right, bottom = (int(value) for value in match.groups())
         self._run("shell", "input", "tap", str((left + right) // 2), str((top + bottom) // 2))
         return True
+
+    def tap_screen_center(self) -> None:
+        width, height = self._screen_size()
+        self._run("shell", "input", "tap", str(width // 2), str(height // 2))
 
     def press_back(self) -> None:
         self._run("shell", "input", "keyevent", "4")
@@ -763,7 +827,8 @@ class AndroidReelMetricsEnricher:
         self._device_id = device_id or None
         self._delay = max(0.1, float(ui_delay_seconds))
         self._driver = driver
-        self._preflight_error = ""
+        self._driver_is_external = driver is not None
+        self._reel_paused_for_collection = False
 
     @property
     def driver(self) -> AndroidUiDriver:
@@ -772,30 +837,62 @@ class AndroidReelMetricsEnricher:
         return self._driver
 
     def _ready(self) -> str:
-        if self._preflight_error:
-            return self._preflight_error
         try:
             self.driver.ensure_ready()
         except AndroidMetricsError as error:
-            self._preflight_error = str(error)
-        return self._preflight_error
+            return str(error)
+        return ""
+
+    def reset_connection(self) -> None:
+        """Discard ADB state after an emulator/server disconnect.
+
+        Recreating the built-in driver reruns device discovery and clears
+        device-scoped caches. Tests and callers that inject their own driver
+        retain ownership, but may expose the same hook if they need it.
+        """
+        if self._driver_is_external:
+            reset = getattr(self._driver, "reset_connection", None)
+            if callable(reset):
+                reset()
+            return
+        self._driver = None
 
     def _wait_for_surface(
         self,
         predicate: object,
         attempts: int = 4,
         timeout_seconds: float | None = None,
+        max_consecutive_unreadable: int | None = None,
     ) -> str:
         if timeout_seconds is not None:
             attempts = max(attempts, int(timeout_seconds / self._delay) + 1)
         xml = ""
+        consecutive_unreadable = 0
         for attempt in range(attempts):
             if attempt:
                 time.sleep(self._delay)
             xml = self.driver.dump_ui()
             if callable(predicate) and predicate(xml):
                 return xml
+            if max_consecutive_unreadable is not None:
+                consecutive_unreadable = consecutive_unreadable + 1 if not parse_ui_xml(xml) else 0
+                if consecutive_unreadable >= max(1, max_consecutive_unreadable):
+                    break
         return xml
+
+    def prepare_reel_retry(self) -> None:
+        """Leave the stuck Reel so reopening the same deep link redraws it."""
+        self.driver.press_back()
+        time.sleep(self._delay)
+
+    def _reset_unreadable_instagram_surface(self) -> None:
+        reset_surface = getattr(self.driver, "reset_instagram_surface", None)
+        if callable(reset_surface):
+            reset_surface()
+            return
+        reset_ui_automation = getattr(self.driver, "reset_ui_automation", None)
+        if callable(reset_ui_automation):
+            reset_ui_automation()
 
     def _open_hashtag_search_results(
         self,
@@ -845,7 +942,14 @@ class AndroidReelMetricsEnricher:
         if not is_likes_and_plays_panel(panel_xml):
             return {}, None
         try:
-            return extract_visible_metrics(panel_xml), bool(_LIKE_PRIVATE.search(panel_xml))
+            metrics = extract_visible_metrics(panel_xml)
+            like_private = bool(_LIKE_PRIVATE.search(panel_xml))
+            # Instagram omits the likes row when a public Reel has no likes,
+            # while still rendering the plays row. Hidden likes are handled
+            # separately by the explicit privacy notice and remain "X".
+            if not like_private and "view_count" in metrics and "like_count" not in metrics:
+                metrics["like_count"] = 0
+            return metrics, like_private
         finally:
             self.driver.press_back()
 
@@ -864,6 +968,7 @@ class AndroidReelMetricsEnricher:
         if error:
             return AndroidMetricResult(status="unavailable", error=error)
         try:
+            self._reel_paused_for_collection = False
             reel_xml = ""
             for launch_attempt, ready_timeout in enumerate(
                 (_ANDROID_REEL_READY_TIMEOUT_SECONDS, _ANDROID_RETRY_READY_TIMEOUT_SECONDS),
@@ -873,13 +978,32 @@ class AndroidReelMetricsEnricher:
                 reel_xml = self._wait_for_surface(
                     _is_reel_surface,
                     timeout_seconds=ready_timeout,
+                    max_consecutive_unreadable=2,
                 )
                 if _is_reel_surface(reel_xml):
                     break
+                detect_dynamic_cta = getattr(self.driver, "is_dynamic_cta_reel", None)
+                if not parse_ui_xml(reel_xml) and callable(detect_dynamic_cta) and detect_dynamic_cta():
+                    self._reset_unreadable_instagram_surface()
+                    return AndroidMetricResult(
+                        status="skipped",
+                        error="Dynamic CTA/shop Reel skipped because Instagram exposed no readable accessibility hierarchy.",
+                    )
                 if launch_attempt == 1:
-                    time.sleep(self._delay)
+                    self.prepare_reel_retry()
             else:
+                if not parse_ui_xml(reel_xml):
+                    self._reset_unreadable_instagram_surface()
                 return AndroidMetricResult(status="unavailable", error=describe_android_surface(reel_xml))
+            # Pause video decoding before opening metric sheets or running
+            # additional UIAutomator dumps. Some Windows emulator builds can
+            # crash inside QEMU while Instagram video playback and hierarchy
+            # inspection run together.
+            tap_center = getattr(self.driver, "tap_screen_center", None)
+            if callable(tap_center):
+                tap_center()
+                self._reel_paused_for_collection = True
+                time.sleep(self._delay)
             metrics = extract_visible_metrics(reel_xml)
             audio_name = extract_audio_name(reel_xml)
             if not metrics and not audio_name:
@@ -896,11 +1020,14 @@ class AndroidReelMetricsEnricher:
                 audio_name = extract_audio_name(reel_xml)
             detail_metrics, like_private = self._open_likes_and_plays(reel_xml)
             metrics.update(detail_metrics)
+            comment_count_disabled = False
             if "comment_count" not in metrics:
                 comment_state = self._read_empty_comment_state(reel_xml)
                 if comment_state == "empty":
                     metrics["comment_count"] = 0
-            if not metrics and not audio_name and like_private is None:
+                elif comment_state == "disabled":
+                    comment_count_disabled = True
+            if not metrics and not audio_name and like_private is None and not comment_count_disabled:
                 return AndroidMetricResult(
                     status="unavailable",
                     error="Instagram rendered the Reel author but exposed no readable metric or audio nodes after retries.",
@@ -909,9 +1036,32 @@ class AndroidReelMetricsEnricher:
                 metrics={name: value for name, value in metrics.items() if name in METRIC_FIELDS},
                 audio_name=audio_name,
                 like_count_private=like_private,
+                comment_count_disabled=comment_count_disabled,
             )
         except AndroidMetricsError as error:
+            detect_dynamic_cta = getattr(self.driver, "is_dynamic_cta_reel", None)
+            if callable(detect_dynamic_cta) and detect_dynamic_cta():
+                self._reset_unreadable_instagram_surface()
+                return AndroidMetricResult(
+                    status="skipped",
+                    error="Dynamic CTA/shop Reel skipped because Instagram exposed no readable accessibility hierarchy.",
+                )
+            if "uiautomator" in str(error).casefold() or "exec-out" in str(error).casefold():
+                self._reset_unreadable_instagram_surface()
             return AndroidMetricResult(status="unavailable", error=str(error))
+
+    def pause_current_reel(self) -> bool:
+        """Pause the Reel this worker just opened before entering queue idle."""
+        try:
+            if not _is_reel_surface(self.driver.dump_ui()):
+                return False
+            if self._reel_paused_for_collection:
+                return True
+            self.driver.tap_screen_center()
+            self._reel_paused_for_collection = True
+            return True
+        except AndroidMetricsError:
+            return False
 
     def collect_related_hashtag_post_counts(
         self,
@@ -1084,16 +1234,62 @@ class AndroidReelMetricsEnricher:
 
 
 def merge_android_metrics(record: dict[str, object], result: AndroidMetricResult) -> dict[str, object]:
-    """Overlay only Android-owned values; browser identity/static fields stay intact."""
+    """Fill only browser-unavailable metrics; exact Python values stay intact."""
     merged = dict(record)
     for field_name in METRIC_FIELDS:
-        if field_name in result.metrics:
+        if field_name in result.metrics and needs_android_metric_fallback(merged.get(field_name)):
             merged[field_name] = result.metrics[field_name]
-    if result.audio_name:
+    if result.audio_name and not str(merged.get("audio_name", "") or "").strip():
         merged["audio_name"] = result.audio_name
-    if result.like_count_private is True and "like_count" not in result.metrics:
+    if (
+        result.like_count_private is True
+    ):
         merged["like_count"] = "X"
-    return merged
+    return apply_metric_visibility_rules(
+        merged,
+        comment_count_disabled=result.comment_count_disabled is True,
+    )
+
+
+def apply_metric_visibility_rules(
+    record: dict[str, object],
+    *,
+    comment_count_disabled: bool = False,
+) -> dict[str, object]:
+    """Resolve counts that Instagram intentionally renders without a number."""
+    resolved = dict(record)
+    if comment_count_disabled:
+        resolved["comment_count"] = "X"
+
+    def missing(value: object) -> bool:
+        return value is None or str(value).strip().casefold() in {"", "unavailable", "none", "null"}
+
+    is_ad = resolved.get("ad") is True or str(resolved.get("ad", "")).strip().casefold() == "true"
+    if is_ad and missing(resolved.get("saved_count")):
+        resolved["saved_count"] = "X"
+
+    like_count = parse_display_count(resolved.get("like_count"))
+    if like_count is not None and like_count <= 100:
+        for field_name in ("comment_count", "repost_count", "share_count", "saved_count"):
+            if missing(resolved.get(field_name)):
+                resolved[field_name] = 0
+    return resolved
+
+
+def needs_android_metric_fallback(value: object) -> bool:
+    """Return whether a count is absent, unavailable, or only compactly rendered."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value < 0
+    if isinstance(value, float):
+        return value < 0 or not value.is_integer()
+    text = str(value).strip()
+    if not text or text.casefold() in {"x", "unavailable", "none", "null"}:
+        return True
+    return _EXACT_COUNT.fullmatch(text) is None
 
 
 def clear_android_owned_fields(record: dict[str, object]) -> dict[str, object]:

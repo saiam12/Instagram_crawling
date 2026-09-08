@@ -137,13 +137,14 @@ class XlsxCollectionTimingTests(unittest.TestCase):
             "profile_category",
             "post_count",
             "follower_count",
+            "following_count",
             "follower_count_change",
             "collected_at",
         ])
         self.assertEqual(projected[1:], [
-            ["1", "", "1", "sample", "profile biography", "", "", "1000", "", "2026-01-01T00:00:00Z"],
-            ["2", "+0.3day", "1", "sample", "profile biography", "", "", "1100", "100", "2026-01-01T06:00:00Z"],
-            ["3", "+2day", "1", "sample", "profile biography", "", "", "1050", "-50", "2026-01-03T06:00:00Z"],
+            ["1", "", "1", "sample", "profile biography", "", "", "1000", "", "", "2026-01-01T00:00:00Z"],
+            ["2", "+0.3day", "1", "sample", "profile biography", "", "", "1100", "", "100", "2026-01-01T06:00:00Z"],
+            ["3", "+2day", "1", "sample", "profile biography", "", "", "1050", "", "-50", "2026-01-03T06:00:00Z"],
         ])
 
     def test_user_collection_history_keeps_uncollected_user_as_first_row(self) -> None:
@@ -168,8 +169,8 @@ class XlsxCollectionTimingTests(unittest.TestCase):
         projected = _xlsx_project_rows("users", rows)
 
         self.assertEqual(projected, [
-            ["collection_number", "days_since_previous", "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "follower_count_change", "collected_at"],
-            ["1", "", "2", "pending_user", "", "", "", "", "", ""],
+            ["collection_number", "days_since_previous", "user_id", "username", "biography", "profile_category", "post_count", "follower_count", "following_count", "follower_count_change", "collected_at"],
+            ["1", "", "2", "pending_user", "", "", "", "", "", "", ""],
         ])
 
     def test_user_collection_history_leaves_change_blank_without_a_previous_count(self) -> None:
@@ -194,7 +195,7 @@ class XlsxCollectionTimingTests(unittest.TestCase):
         projected = _xlsx_project_rows("users", rows)
 
         self.assertEqual(projected[2], [
-            "2", "", "3", "late_count", "", "", "", "1100", "", "2026-01-02T00:00:00Z"
+            "2", "", "3", "late_count", "", "", "", "1100", "", "", "2026-01-02T00:00:00Z"
         ])
 
     def test_user_elapsed_days_uses_previous_successful_snapshot_only(self) -> None:
@@ -223,7 +224,7 @@ class XlsxCollectionTimingTests(unittest.TestCase):
         projected = _xlsx_project_rows("users", rows)
 
         self.assertEqual(projected[3], [
-            "3", "+2day", "4", "failed_middle_snapshot", "", "", "", "1100", "100",
+            "3", "+2day", "4", "failed_middle_snapshot", "", "", "", "1100", "", "100",
             "2026-01-03T00:00:00Z",
         ])
 
@@ -262,7 +263,7 @@ class XlsxCollectionTimingTests(unittest.TestCase):
                 projected = _xlsx_project_rows("users", rows)
 
                 self.assertEqual(projected[3], [
-                    "3", "+2day", "5", "invalid_middle_snapshot", "", "", "", "1100", "100",
+                    "3", "+2day", "5", "invalid_middle_snapshot", "", "", "", "1100", "", "100",
                     "2026-01-03T00:00:00Z",
                 ])
 

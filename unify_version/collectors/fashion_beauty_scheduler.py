@@ -37,13 +37,9 @@ BEAUTY_KEYWORDS: Sequence[str] = (
     "레티놀", "비타민C", "glassskin", "grwm", "cleanbeauty", "skincare",
 )
 
-SNAPSHOT_OFFSETS: Sequence[timedelta] = (
-    timedelta(),
-    timedelta(minutes=30),
-    timedelta(hours=1),
-    timedelta(hours=2),
-    timedelta(hours=4),
-    timedelta(hours=8),
+RECOLLECTION_INTERVAL = timedelta(hours=4)
+SNAPSHOT_OFFSETS: Sequence[timedelta] = tuple(
+    RECOLLECTION_INTERVAL * index for index in range(4)
 )
 
 
@@ -59,7 +55,7 @@ class DatasetConfig:
 class RunConfig:
     data_root: Path
     duration_hours: float = 16
-    discovery_hours: float = 7
+    discovery_hours: float = 4
     discovery_interval_minutes: float = 30
     new_items_per_window: int = 300
     max_new_items_per_window: int = 300
@@ -69,6 +65,7 @@ class RunConfig:
     exact_metric_attempts: int = 3
     exact_metric_retry_delay_seconds: float = 2
     hashtag_candidates_per_keyword: int = 50
+    collect_hashtag_media_count: bool = False
     keywords_per_window: int = KEYWORDS_PER_WINDOW
     new_only: bool = False
     base_output: bool = False
@@ -159,10 +156,13 @@ def due_jobs(dataset: DatasetConfig, rows: list[dict[str, Any]], now: datetime) 
     result: list[DueJob] = []
     for url, snapshots in _rows_grouped_by_normalized_url(rows).items():
         snapshots.sort(key=lambda snapshot: snapshot[1])
-        if len(snapshots) < len(SNAPSHOT_OFFSETS):
-            due_at = snapshots[0][1] + SNAPSHOT_OFFSETS[len(snapshots)]
-            if due_at <= current:
-                result.append(DueJob(dataset.name, url, due_at))
+        # Keep four snapshots in total: the initial collection followed by
+        # recollections at +4h, +8h, and +12h.
+        if len(snapshots) >= len(SNAPSHOT_OFFSETS):
+            continue
+        due_at = snapshots[0][1] + RECOLLECTION_INTERVAL * len(snapshots)
+        if due_at <= current:
+            result.append(DueJob(dataset.name, url, due_at))
     return sorted(result, key=lambda job: (job.due_at, job.dataset, job.url))
 
 
@@ -238,6 +238,7 @@ __all__ = [
     "BEAUTY_KEYWORDS",
     "FASHION_KEYWORDS",
     "KEYWORDS_PER_WINDOW",
+    "RECOLLECTION_INTERVAL",
     "SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW",
     "SNAPSHOT_OFFSETS",
     "DatasetConfig",

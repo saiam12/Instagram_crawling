@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -96,20 +98,128 @@ def read_xlsx_header(path: Path) -> list[str]:
 
 
 class CollectorUtilityTests(unittest.TestCase):
+    def test_process_is_alive_uses_the_real_process_state(self) -> None:
+        self.assertTrue(reels_browser.process_is_alive(os.getpid()))
+        self.assertFalse(reels_browser.process_is_alive(2_147_483_647))
+
+    def test_android_metric_terminal_line_includes_collected_values(self) -> None:
+        line = reels_browser.android_metric_terminal_line(
+            reels_browser.AndroidMetricResult(
+                metrics={
+                    "view_count": 12_345,
+                    "like_count": 987,
+                    "comment_count": 67,
+                    "share_count": 45,
+                    "saved_count": 23,
+                },
+                audio_name="Artist · Track",
+            ),
+            2,
+            current=14,
+            total=15,
+            python_metrics={"repost_count": 8},
+        )
+
+        self.assertEqual(
+            line,
+            "[Android 14/15] like_count=987, comment_count=67, repost_count=8, "
+            "share_count=45, saved_count=23, view_count=12,345, attempt_count=2",
+        )
+
+    def test_android_progress_total_tracks_python_jobs_added_while_android_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = reels_browser._android_metric_queue_paths(directory)
+            reels_browser.enqueue_android_metric_job(
+                directory, reel_record(14), collection_run_id="run-1", python_index=14
+            )
+            reels_browser.enqueue_android_metric_job(
+                directory, reel_record(15), collection_run_id="run-1", python_index=15
+            )
+            current_path, current_job = reels_browser._claim_android_metric_job(paths) or (None, None)
+            self.assertIsNotNone(current_path)
+            self.assertEqual(
+                reels_browser.android_reel_progress(paths, current_job or {}, fallback_current=1),
+                (14, 15),
+            )
+            reels_browser.enqueue_android_metric_job(
+                directory, reel_record(17), collection_run_id="run-1", python_index=17
+            )
+            self.assertEqual(
+                reels_browser.android_reel_progress(paths, current_job or {}, fallback_current=1),
+                (14, 17),
+            )
+
+    def test_android_log_relay_hides_diagnostics_and_returns_only_terminal_summary(self) -> None:
+        diagnostic = "2026-09-08T00:00:00Z [ANDROID] reel_metric_started | url=example"
+        summary = (
+            "2026-09-08T00:00:01Z [ANDROID] reel_metric_collected | url=example"
+            " | terminal_line=[Android 1/2] like_count=3"
+        )
+
+        self.assertIsNone(reels_browser.collection_log_terminal_line("android", diagnostic))
+        self.assertEqual(
+            reels_browser.collection_log_terminal_line("android", summary),
+            "[Android 1/2] like_count=3",
+        )
+
+    def test_android_terminal_marks_author_hidden_like_count_as_x(self) -> None:
+        line = reels_browser.android_metric_terminal_line(
+            reels_browser.AndroidMetricResult(
+                metrics={"view_count": 39_240},
+                like_count_private=True,
+            ),
+            1,
+            current=1,
+            total=1,
+            python_metrics={"like_count": 999},
+        )
+
+        self.assertIn("like_count=X", line)
+        self.assertIn("view_count=39,240", line)
+
+    def test_android_terminal_marks_disabled_comments_as_x(self) -> None:
+        line = reels_browser.android_metric_terminal_line(
+            reels_browser.AndroidMetricResult(comment_count_disabled=True),
+            1,
+            current=1,
+            total=1,
+            python_metrics={"like_count": 12},
+        )
+
+        self.assertIn("comment_count=X", line)
+
+    def test_android_terminal_applies_low_like_and_ad_defaults(self) -> None:
+        line = reels_browser.android_metric_terminal_line(
+            reels_browser.AndroidMetricResult(
+                metrics={"like_count": 12, "share_count": 3},
+            ),
+            1,
+            current=1,
+            total=1,
+            python_metrics={"ad": "true"},
+        )
+
+        self.assertIn("comment_count=0", line)
+        self.assertIn("repost_count=0", line)
+        self.assertIn("share_count=3", line)
+        self.assertIn("saved_count=X", line)
+
     def test_scheduler_flags_are_false_by_default(self) -> None:
         options = parse_args([])
         self.assertFalse(options.new_urls_only)
         self.assertFalse(options.disable_recollect_cooldown)
+        self.assertFalse(options.collect_hashtag_media_count)
         self.assertEqual(options.android_idle_hashtags, [])
 
-    def test_idle_android_hashtag_query_defaults_to_all_user_hashtags(self) -> None:
+    def test_hashtag_media_count_is_collected_only_when_requested(self) -> None:
         defaulted = parse_args(["--hashtag-query", "ootd OR dailylook"])
         overridden = parse_args([
             "--hashtag-query", "ootd OR dailylook",
+            "--collect-hashtag-media-count",
             "--android-idle-hashtag-query", "fashion OR style",
         ])
 
-        self.assertEqual(defaulted.android_idle_hashtags, ["ootd", "dailylook"])
+        self.assertEqual(defaulted.android_idle_hashtags, [])
         self.assertEqual(overridden.android_idle_hashtags, ["fashion", "style"])
 
     def test_filter_new_urls_removes_prior_history_url(self) -> None:
@@ -178,7 +288,7 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(getattr(options, "exact_metric_retry_delay_seconds", None), 3.5)
         self.assertTrue(options.followers_after_reels)
 
-    def test_python_to_android_handoff_ignores_the_three_android_count_fields(self) -> None:
+    def test_python_to_android_handoff_requires_python_repost_count(self) -> None:
         record = reel_record(1)
         record.update({
             "view_count": "",
@@ -189,8 +299,11 @@ class CollectorUtilityTests(unittest.TestCase):
             "follower_count": "",
         })
 
-        self.assertEqual(missing_python_to_android_handoff_fields(record), ())
-        self.assertEqual(python_to_android_handoff_delay_seconds(record), 0.0)
+        self.assertEqual(missing_python_to_android_handoff_fields(record), ("repost_count",))
+        self.assertEqual(
+            python_to_android_handoff_delay_seconds(record),
+            reels_browser.PYTHON_TO_ANDROID_RETRY_DELAY_SECONDS,
+        )
 
     def test_python_android_count_comparison_uses_requested_tolerance_bands(self) -> None:
         compare = reels_browser.compare_python_and_android_counts
@@ -440,6 +553,26 @@ class CollectorUtilityTests(unittest.TestCase):
     def test_visible_reel_script_limits_author_fallback_to_main_content_not_the_sidebar(self) -> None:
         self.assertIn("document.querySelector('main') || scope", reels_browser.EXTRACT_VISIBLE_REEL_SCRIPT)
         self.assertNotIn("profileLinks(document));", reels_browser.EXTRACT_VISIBLE_REEL_SCRIPT)
+
+    def test_visible_reel_metrics_stop_before_a_shared_action_rail_parent(self) -> None:
+        script = reels_browser.EXTRACT_VISIBLE_REEL_SCRIPT
+        self.assertIn("containsOtherMetricControl", script)
+        self.assertLess(
+            script.index("containsOtherMetricControl(node, candidates)"),
+            script.index("for (const source of metricSources(node))"),
+        )
+
+    def test_adb_startup_home_error_is_treated_as_a_reconnectable_device_error(self) -> None:
+        messages = (
+            "adb_utils.cpp:315 Cannot mkdir '\\\\.android': Permission denied",
+            "No online Android emulator was found. Start the Android Studio emulator first.",
+            "The Android emulator is online but has not finished booting.",
+            "cmd: Can't find service: package",
+            "cmd: Can't find service: input",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertTrue(reels_browser._is_android_device_connection_error(message))
 
     def test_profile_reel_card_selector_accepts_the_username_prefixed_grid_href(self) -> None:
         script_constants = [
@@ -3553,6 +3686,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             store = await LongReelStore.create(Path(directory) / "reels_rows.csv", 100, "rows")
             first = reel_record(1, "2026-01-01T00:00:00.000Z")
             second = reel_record(2, "2026-01-01T00:00:01.000Z")
+            first["view_count"] = ""
+            second["view_count"] = ""
             await store.append(first)
             await store.append(second)
             lookup_started = threading.Event()
@@ -3576,8 +3711,8 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             pipeline.enqueue(second)
 
             self.assertEqual(pipeline.backlog, 2)
-            self.assertEqual(store.rows[0]["view_count"], 10)
-            self.assertEqual(store.rows[1]["view_count"], 20)
+            self.assertEqual(store.rows[0]["view_count"], "")
+            self.assertEqual(store.rows[1]["view_count"], "")
 
             release_lookup.set()
             await pipeline.close()
@@ -3591,6 +3726,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             history_path = data_dir / ".collector" / "reels_history_active.csv"
             store = await LongReelStore.create(history_path, 100, "rows")
             first = reel_record(1, "2026-01-01T00:00:00.000Z")
+            first["share_count"] = ""
             await store.append(first)
             await store.flush()
 
@@ -3610,7 +3746,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             )
 
             merged = reels_browser.apply_completed_android_metric_jobs(data_dir, export_outputs=False)
-            self.assertEqual(merged, {"applied": 1, "updated": 2, "pending": 0})
+            self.assertEqual(merged, {"applied": 1, "updated": 1, "pending": 0})
 
             # This in-memory store intentionally still has Python's original
             # value. Its next checkpoint must retain Android's disk update.
@@ -3618,9 +3754,47 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             await store.append(second)
             await store.flush()
 
-            self.assertEqual(store.rows[0]["view_count"], "624267")
+            self.assertEqual(store.rows[0]["view_count"], 10)
             self.assertEqual(store.rows[0]["share_count"], "1337")
             self.assertFalse(list(paths["completed"].glob("*.json")))
+
+    async def test_durable_android_merge_preserves_comment_and_ad_visibility_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            history_path = data_dir / ".collector" / "reels_history_active.csv"
+            store = await LongReelStore.create(history_path, 100, "rows")
+            record = reel_record(1)
+            record.update({
+                "like_count": 12,
+                "comment_count": "",
+                "repost_count": "",
+                "share_count": "",
+                "saved_count": "",
+                "ad": "true",
+            })
+            await store.append(record)
+            await store.flush()
+            reels_browser.enqueue_android_metric_job(data_dir, record)
+            paths = reels_browser._android_metric_queue_paths(data_dir)
+            working, job = reels_browser._claim_android_metric_job(paths) or (None, None)
+            assert working is not None and job is not None
+            reels_browser._write_android_metric_completion(
+                paths,
+                working,
+                job,
+                reels_browser.AndroidMetricResult(
+                    metrics={"like_count": 12, "share_count": 3},
+                    comment_count_disabled=True,
+                ),
+            )
+
+            reels_browser.apply_completed_android_metric_jobs(data_dir, export_outputs=False)
+            _fields, rows = read_csv_objects(history_path)
+
+            self.assertEqual(rows[0]["comment_count"], "X")
+            self.assertEqual(rows[0]["repost_count"], "0")
+            self.assertEqual(rows[0]["share_count"], "3")
+            self.assertEqual(rows[0]["saved_count"], "X")
 
     async def test_durable_android_worker_exits_cleanly_when_the_queue_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3635,6 +3809,152 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             status = json.loads(paths["status"].read_text(encoding="utf-8"))
             self.assertEqual(status["state"], "stopped")
             self.assertFalse(paths["worker_lock"].exists())
+
+    async def test_detached_android_worker_launch_is_reserved_before_popen_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+
+            class Process:
+                pid = 42_424
+
+            with (
+                patch.object(reels_browser.subprocess, "Popen", return_value=Process()) as popen,
+                patch.object(reels_browser, "process_is_alive", side_effect=lambda pid: pid == Process.pid),
+            ):
+                self.assertTrue(reels_browser.start_android_metric_worker(data_dir))
+                self.assertFalse(reels_browser.start_android_metric_worker(data_dir))
+
+            paths = reels_browser._android_metric_queue_paths(data_dir)
+            reservation = json.loads(paths["worker_starting"].read_text(encoding="utf-8"))
+            self.assertEqual(reservation["pid"], Process.pid)
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
+            self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+
+    async def test_android_worker_requeues_reel_while_device_is_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            history_path = data_dir / ".collector" / "reels_history_active.csv"
+            store = await LongReelStore.create(history_path, 100, "rows")
+            record = reel_record(1)
+            record["view_count"] = ""
+            await store.append(record)
+            await store.flush()
+            reels_browser.enqueue_android_metric_job(data_dir, record)
+
+            attempts: list[str] = []
+            connection_resets = 0
+            status_updates: list[dict[str, object]] = []
+            write_worker_status = reels_browser._write_android_metric_worker_status
+
+            def capture_worker_status(paths: dict[str, Path], **patch_values: object) -> None:
+                status_updates.append(dict(patch_values))
+                write_worker_status(paths, **patch_values)
+
+            class ReconnectingEnricher:
+                def enrich(self, url: str) -> reels_browser.AndroidMetricResult:
+                    attempts.append(url)
+                    if len(attempts) == 1:
+                        return reels_browser.AndroidMetricResult(status="unavailable", error="adb.exe: device offline")
+                    return reels_browser.AndroidMetricResult(metrics={"view_count": 321})
+
+                def reset_connection(self) -> None:
+                    nonlocal connection_resets
+                    connection_resets += 1
+
+            with (
+                patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=ReconnectingEnricher()),
+                patch.object(reels_browser, "ANDROID_DEVICE_RECONNECT_SECONDS", 0.01),
+                patch.object(reels_browser, "_write_android_metric_worker_status", side_effect=capture_worker_status),
+            ):
+                exit_code = await asyncio.to_thread(
+                    reels_browser.run_android_metric_worker,
+                    data_dir,
+                    idle_seconds=0.01,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(attempts, [str(record["url"])] * 2)
+            self.assertEqual(connection_resets, 1)
+            self.assertIsNone(reels_browser.read_collection_stop_request(data_dir))
+            waiting = next(update for update in status_updates if update.get("state") == "waiting_for_device")
+            self.assertEqual(waiting["pending"], 1)
+            self.assertEqual(waiting["working"], 0)
+            _fields, rows = read_csv_objects(history_path)
+            self.assertEqual(rows[0]["view_count"], "321")
+
+    async def test_requeued_android_job_preserves_attempt_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = reels_browser._android_metric_queue_paths(directory)
+            paths["working"].mkdir(parents=True)
+            working_path = paths["working"] / "job.json"
+            job = {"job_id": "job", "attempts": 2}
+            reels_browser.write_json_atomic(working_path, job)
+
+            reels_browser._requeue_android_metric_job(
+                paths,
+                working_path,
+                job,
+                "adb.exe: device offline",
+            )
+
+            pending = json.loads((paths["pending"] / "job.json").read_text(encoding="utf-8"))
+            self.assertEqual(pending["attempts"], 2)
+            self.assertEqual(pending["last_device_error"], "adb.exe: device offline")
+
+    async def test_offline_preflight_does_not_claim_or_consume_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            job_id = reels_browser.enqueue_android_metric_job(directory, reel_record(1))
+            paths = reels_browser._android_metric_queue_paths(directory)
+
+            class OfflineEnricher:
+                def _ready(self):
+                    return "No online Android emulator was found."
+
+                def reset_connection(self):
+                    pass
+
+            with (
+                patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=OfflineEnricher()),
+                patch.object(reels_browser.time, "sleep", side_effect=InterruptedError),
+            ):
+                with self.assertRaises(InterruptedError):
+                    reels_browser.run_android_metric_worker(directory)
+            job = json.loads((paths["pending"] / f"{job_id}.json").read_text(encoding="utf-8"))
+            self.assertEqual(job.get("attempts", 0), 0)
+            self.assertFalse(list(paths["working"].glob("*.json")))
+
+    async def test_android_worker_attempts_to_pause_once_when_queue_becomes_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            history_path = data_dir / ".collector" / "reels_history_active.csv"
+            store = await LongReelStore.create(history_path, 100, "rows")
+            record = reel_record(1)
+            record["view_count"] = ""
+            await store.append(record)
+            await store.flush()
+            reels_browser.enqueue_android_metric_job(data_dir, record)
+
+            pause_attempts = 0
+
+            class PausingEnricher:
+                def enrich(self, url: str) -> reels_browser.AndroidMetricResult:
+                    return reels_browser.AndroidMetricResult(metrics={"view_count": 321})
+
+                def pause_current_reel(self) -> bool:
+                    nonlocal pause_attempts
+                    pause_attempts += 1
+                    return False
+
+            with patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=PausingEnricher()):
+                exit_code = await asyncio.to_thread(
+                    reels_browser.run_android_metric_worker,
+                    data_dir,
+                    idle_seconds=0.01,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(pause_attempts, 1)
 
     async def test_idle_hashtag_jobs_yield_to_reel_metric_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3688,12 +4008,55 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             _fields, rows = read_csv_objects(data_dir / "hashtags.csv")
             self.assertEqual([(row["hashtag"], row["media_count"]) for row in rows], [("fashion", "1234")])
 
-    async def test_android_worker_retries_each_reel_three_times_then_stops_after_five_failures(self) -> None:
+    async def test_android_worker_requeues_hashtag_job_after_device_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            reels_browser.enqueue_android_idle_hashtag_post_count_jobs(data_dir, ["fashion"])
+            attempts = resets = 0
+
+            class ReconnectingTagEnricher:
+                def collect_hashtag_post_counts(self, hashtags: list[str]) -> list[dict[str, object]]:
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 1:
+                        return [{
+                            "query_hashtag": "fashion", "hashtag": "fashion", "post_count": "",
+                            "status": "unavailable", "error": "adb.exe: device 'emulator-5554' not found",
+                        }]
+                    return [{
+                        "collected_at": "2026-09-07T00:00:00.000Z",
+                        "query_hashtag": "fashion", "hashtag": "fashion", "post_count": 1_234,
+                        "raw_post_count": "1234 posts", "source": "android_search_tags_exact",
+                        "status": "collected", "error": "",
+                    }]
+
+                def reset_connection(self) -> None:
+                    nonlocal resets
+                    resets += 1
+
+            with (
+                patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=ReconnectingTagEnricher()),
+                patch.object(reels_browser, "ANDROID_DEVICE_RECONNECT_SECONDS", 0.01),
+            ):
+                exit_code = await asyncio.to_thread(
+                    reels_browser.run_android_metric_worker,
+                    data_dir,
+                    idle_seconds=0.01,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(attempts, 2)
+            self.assertEqual(resets, 1)
+            _fields, rows = read_csv_objects(data_dir / "hashtags.csv")
+            self.assertEqual(rows[0]["media_count"], "1234")
+
+    async def test_android_worker_backs_off_without_stopping_python_after_five_failures(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             history_path = data_dir / ".collector" / "reels_history_active.csv"
             store = await LongReelStore.create(history_path, 100, "rows")
-            records = [reel_record(index) for index in range(1, 6)]
+            records = [reel_record(index) for index in range(1, 7)]
+            records[-1]["view_count"] = ""
             for record in records:
                 await store.append(record)
             await store.flush()
@@ -3705,9 +4068,14 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             class AlwaysUnavailableEnricher:
                 def enrich(self, url: str) -> reels_browser.AndroidMetricResult:
                     attempts.append(url)
+                    if url == str(records[-1]["url"]):
+                        return reels_browser.AndroidMetricResult(metrics={"view_count": 321})
                     return reels_browser.AndroidMetricResult(status="unavailable", error="test Android failure")
 
-            with patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=AlwaysUnavailableEnricher()):
+            with (
+                patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=AlwaysUnavailableEnricher()),
+                patch.object(reels_browser, "ANDROID_METRIC_FAILURE_BACKOFF_SECONDS", 0.01),
+            ):
                 exit_code = await asyncio.to_thread(
                     reels_browser.run_android_metric_worker,
                     data_dir,
@@ -3715,14 +4083,12 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
                     ui_delay_seconds=0.1,
                 )
 
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(len(attempts), 15)
-            self.assertEqual(len(set(attempts)), 5)
-            stop = reels_browser.read_collection_stop_request(data_dir)
-            self.assertIsNotNone(stop)
-            self.assertEqual(stop["source"], "android")
-            self.assertEqual(stop["consecutive_failures"], 5)
-            self.assertFalse(reels_browser.start_android_metric_worker(data_dir))
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(len(attempts), 16)
+            self.assertEqual(len(set(attempts)), 6)
+            self.assertIsNone(reels_browser.read_collection_stop_request(data_dir))
+            _fields, rows = read_csv_objects(history_path)
+            self.assertEqual(rows[-1]["view_count"], "321")
 
     async def test_android_worker_skips_a_reel_after_three_count_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3736,11 +4102,16 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             reels_browser.enqueue_android_metric_job(data_dir, record)
 
             attempts: list[str] = []
+            retry_resets = 0
 
             class MismatchedEnricher:
                 def enrich(self, url: str) -> reels_browser.AndroidMetricResult:
                     attempts.append(url)
                     return reels_browser.AndroidMetricResult(metrics={"view_count": 100})
+
+                def prepare_reel_retry(self) -> None:
+                    nonlocal retry_resets
+                    retry_resets += 1
 
             with patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=MismatchedEnricher()):
                 exit_code = await asyncio.to_thread(
@@ -3752,6 +4123,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(attempts, [str(record["url"])] * 3)
+            self.assertEqual(retry_resets, 2)
             _fields, rows = read_csv_objects(history_path)
             self.assertEqual(rows[0]["view_count"], "10")
             self.assertIsNone(reels_browser.read_collection_stop_request(data_dir))

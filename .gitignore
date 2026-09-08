@@ -26,6 +26,9 @@ AGENTS.md
 .codex_tmp/*
 default_version
 outputs/
+.downloads/
+.runtime-logs/
+android_version/data_android/
 .tmp/
 .tmp_*/
 .codex_tmp/

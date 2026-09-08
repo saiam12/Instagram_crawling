@@ -454,7 +454,6 @@ async def invoke_generic_collector(
     dataset: Literal["fashion", "beauty"] | str,
     mode: Literal["discover", "recollect"] | str,
     hashtags: Sequence[str] = (),
-    idle_hashtags: Sequence[str] = (),
     urls: Sequence[str] = (),
     max_items: int | None = None,
     progress_offset: int = 0,
@@ -465,7 +464,6 @@ async def invoke_generic_collector(
         dataset=dataset,
         mode=mode,
         hashtags=hashtags,
-        idle_hashtags=idle_hashtags,
         urls=urls,
         max_items=max_items,
         progress_offset=progress_offset,
@@ -489,7 +487,6 @@ def _generic_collector_options(
     dataset: Literal["fashion", "beauty"] | str,
     mode: Literal["discover", "recollect"] | str,
     hashtags: Sequence[str] = (),
-    idle_hashtags: Sequence[str] = (),
     urls: Sequence[str] = (),
     max_items: int | None = None,
     progress_offset: int = 0,
@@ -506,6 +503,8 @@ def _generic_collector_options(
     ]
     if config.background:
         arguments.append("--background")
+    if config.collect_hashtag_media_count:
+        arguments.append("--collect-hashtag-media-count")
     urls_file: Path | None = None
 
     if mode == "discover":
@@ -523,9 +522,6 @@ def _generic_collector_options(
                 str(config.max_upload_age_days),
             ]
         )
-        all_idle_hashtags = idle_hashtags or hashtags
-        if all_idle_hashtags:
-            arguments.extend(["--android-idle-hashtag-query", " OR ".join(all_idle_hashtags)])
     elif mode == "recollect":
         if not urls:
             raise ValueError("Recollection requires at least one URL")
@@ -818,7 +814,7 @@ async def run_fashion_beauty_collection(
                             job
                             for dataset in configured_datasets
                             for job in due_jobs(dataset, histories[dataset.name], ends_at)
-                            if job.due_at >= started_at
+                            if started_at <= job.due_at < ends_at
                         ),
                         key=lambda job: (job.due_at, job.dataset, job.url),
                     )
@@ -949,7 +945,6 @@ async def run_fashion_beauty_collection(
                                 active_keyword_window_index(config, started_at, now),
                                 config.keywords_per_window,
                             ),
-                            idle_hashtags=selected.keywords,
                             max_items=batch_size,
                             progress_offset=config.max_new_items_per_window - decision.remaining_capacity,
                             stop_event=stop_event,
