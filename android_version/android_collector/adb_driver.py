@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from .diagnostics import CollectorDiagnostics
 from .driver import AndroidDriver
 from .models import CollectorError
 from .ui_parser import parse_ui_xml
@@ -83,20 +85,32 @@ class AdbDriver(AndroidDriver):
         device_id: str,
         adb_user_home: Path,
         runner: Runner = subprocess.run,
+        diagnostics: CollectorDiagnostics | None = None,
     ) -> None:
         self.adb_path = adb_path
         self.device_id = device_id
         self.adb_user_home = adb_user_home
         self.runner = runner
+        self.diagnostics = diagnostics
 
     def _run(self, *arguments: str, binary: bool = False) -> Any:
-        return _run_adb(
-            self.adb_path,
-            ("-s", self.device_id, *arguments),
-            self.adb_user_home,
-            self.runner,
-            binary=binary,
-        )
+        command = ("-s", self.device_id, *arguments)
+        started = time.monotonic()
+        try:
+            result = _run_adb(
+                self.adb_path,
+                command,
+                self.adb_user_home,
+                self.runner,
+                binary=binary,
+            )
+        except CollectorError as error:
+            if self.diagnostics is not None:
+                self.diagnostics.adb_command(command, duration=time.monotonic() - started, status="failed", error=str(error))
+            raise
+        if self.diagnostics is not None:
+            self.diagnostics.adb_command(command, duration=time.monotonic() - started, status="success")
+        return result
 
     def ensure_ready(self) -> None:
         package_path = self._run("shell", "pm", "path", INSTAGRAM_PACKAGE)

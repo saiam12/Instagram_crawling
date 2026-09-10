@@ -1,7 +1,9 @@
 .venv/
 .instagram_browser_profile/
+.instagram_chrome_profile/
 data_web/
 __pycache__/
 *.pyc
 .codex_tmp/*
 default_
+.collection-paused

@@ -28,7 +28,20 @@ _ACCESS_BLOCKS = (
     ("login_required", ("log in", "login", "로그인")),
     ("challenge_required", ("challenge", "보안 확인", "본인 인증")),
     ("captcha_required", ("captcha", "보안 문자")),
-    ("rate_limited", ("try again later", "잠시 후 다시", "too many requests")),
+    (
+        "rate_limited",
+        (
+            "429",
+            "too many requests",
+            "rate limit",
+            "rate_limit",
+            "throttled",
+            "please wait a few minutes",
+            "try again later",
+            "요청을 처리할 수 없습니다",
+            "잠시 후 다시",
+        ),
+    ),
 )
 _METRIC_IDS = (
     ("likes_and_plays_count", ("likes_and_plays", "metric_panel_count")),
@@ -159,6 +172,18 @@ def detect_access_block(xml: str) -> str | None:
     for status, tokens in _ACCESS_BLOCKS:
         if any(token in text for token in tokens):
             return status
+    return None
+
+
+def detect_rate_limit_signal(xml: str) -> str | None:
+    """Return the visible rate-limit candidate without claiming an HTTP status."""
+    text = " ".join(node.visible_text.casefold() for node in parse_ui_xml(xml))
+    for _status, tokens in _ACCESS_BLOCKS:
+        if _status != "rate_limited":
+            continue
+        for token in tokens:
+            if token in text:
+                return token
     return None
 
 

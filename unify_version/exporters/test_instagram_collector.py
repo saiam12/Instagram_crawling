@@ -35,6 +35,12 @@ class XlsxCollectionTimingTests(unittest.TestCase):
     def test_video_duration_cells_use_one_decimal_place(self) -> None:
         self.assertIn('s="9"', _xlsx_cell("A2", "12.75", "video_duration_seconds", False))
 
+    def test_x_placeholder_in_numeric_column_is_right_aligned(self) -> None:
+        self.assertIn('s="10"', _xlsx_cell("A2", "X", "like_count", False))
+
+    def test_xlsx_only_suffix_preserves_numeric_cell_types(self) -> None:
+        self.assertIn('s="4"', _xlsx_cell("A2", "1234", "view_count_xlsx_only", False))
+
     def test_view_count_is_numeric_and_wide_refresh_gets_delta(self) -> None:
         rows = [[
             "url",

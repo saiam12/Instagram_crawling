@@ -567,13 +567,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.data_root / "fashion_collector_status.json").exists())
         self.assertTrue((self.data_root / "beauty_collector_status.json").exists())
 
-    async def test_single_domain_new_only_reuses_its_first_keyword_group_in_later_windows(self) -> None:
+    async def test_single_domain_new_only_advances_after_each_completed_keyword_group(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
         clock = ManualClock(started_at)
         config = RunConfig(
             data_root=self.data_root,
-            duration_hours=1,
-            discovery_hours=1,
+            duration_hours=0.5,
+            discovery_hours=0.5,
             discovery_interval_minutes=30,
             new_items_per_window=600,
             max_new_items_per_window=600,
@@ -584,6 +584,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_invoke(**kwargs: object) -> int:
             calls.append(dict(kwargs))
+            if len(calls) == 2:
+                clock.current = started_at + timedelta(minutes=30)
             return 0
 
         async def fake_wait(_event: object, seconds: float) -> bool:
@@ -596,7 +598,10 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 0)
         self.assertEqual([call["max_items"] for call in calls], [600, 600])
         self.assertEqual(calls[0]["hashtags"], tuple(FASHION_KEYWORDS[:KEYWORDS_PER_WINDOW]))
-        self.assertEqual(calls[1]["hashtags"], tuple(FASHION_KEYWORDS[:KEYWORDS_PER_WINDOW]))
+        self.assertEqual(
+            calls[1]["hashtags"],
+            tuple(FASHION_KEYWORDS[KEYWORDS_PER_WINDOW : KEYWORDS_PER_WINDOW * 2]),
+        )
 
     async def test_fashion_beauty_new_only_keeps_its_alternating_keyword_rotation(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
@@ -615,6 +620,10 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_invoke(**kwargs: object) -> int:
             calls.append(dict(kwargs))
+            if len(calls) == 1:
+                clock.current = started_at + timedelta(minutes=30)
+            elif len(calls) == 2:
+                clock.current = started_at + timedelta(hours=1)
             return 0
 
         async def fake_wait(_event: object, seconds: float) -> bool:
@@ -669,13 +678,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         fashion_status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
         self.assertIn("deadline", fashion_status["last_error"].lower())
 
-    async def test_fashion_only_discovers_every_window(self) -> None:
+    async def test_fashion_only_advances_keyword_group_without_waiting_for_window(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
         clock = ManualClock(started_at)
         config = RunConfig(
             data_root=self.data_root,
-            duration_hours=1,
-            discovery_hours=1,
+            duration_hours=0.5,
+            discovery_hours=0.5,
             discovery_interval_minutes=30,
             domains=("fashion",),
         )
@@ -683,11 +692,13 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_invoke(**kwargs: object) -> int:
             calls.append(dict(kwargs))
-            clock.current += timedelta(minutes=31)
+            if len(calls) == 2:
+                clock.current = started_at + timedelta(minutes=30)
             return 0
 
         result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
 
+        self.assertEqual(result, 0)
         self.assertEqual([call["dataset"] for call in calls], ["fashion", "fashion"])
         self.assertEqual(calls[0]["hashtags"], tuple(FASHION_KEYWORDS[:KEYWORDS_PER_WINDOW]))
         self.assertEqual(
@@ -906,11 +917,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
         self.assertIn("retry deferred", status["last_error"])
 
-    async def test_rate_limit_pauses_all_due_work_for_thirty_minutes(self) -> None:
+    async def test_rate_limit_pauses_failed_due_batch_for_twenty_minutes(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
         config = RunConfig(
             data_root=self.data_root,
-            duration_hours=31 / 60,
+            duration_hours=21 / 60,
             discovery_hours=0,
             domains=("fashion",),
         )
@@ -946,9 +957,142 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, 2)
         self.assertEqual(attempts, 2)
-        self.assertEqual(sum(waits[:60]), 1800.0)
+        self.assertEqual(sum(waits[:40]), 1200.0)
         status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
         self.assertIn("rate limit detected", status["last_error"])
+
+    async def test_rate_limit_respects_longer_server_retry_after(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=21 / 60,
+            discovery_hours=0,
+            domains=("fashion",),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/rate-limited/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+            }],
+        )
+        clock = ManualClock(started_at)
+        attempts = 0
+        waits: list[float] = []
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+            status_path.write_text(
+                json.dumps({"failure_code": "rate_limited", "retry_after_seconds": 1800}),
+                encoding="utf-8",
+            )
+            return 2
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(sum(waits), 1260.0)
+        status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("rate limit detected", status["last_error"])
+
+    async def test_due_recollection_runs_during_discovery_pause_then_backs_off_on_its_own_429(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=31 / 60,
+            discovery_hours=31 / 60,
+            discovery_interval_minutes=30,
+            domains=("fashion",),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/due-during-pause/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(
+                    started_at - RECOLLECTION_INTERVAL + timedelta(minutes=10)
+                ),
+            }],
+        )
+        clock = ManualClock(started_at)
+        invocations: list[tuple[str, datetime]] = []
+        recollection_attempts = 0
+
+        async def fake_invoke(**kwargs: object) -> int:
+            nonlocal recollection_attempts
+            mode = str(kwargs["mode"])
+            invocations.append((mode, clock()))
+            if mode == "discover":
+                status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+                status_path.write_text(json.dumps({"failure_code": "rate_limited"}), encoding="utf-8")
+                return 2
+            recollection_attempts += 1
+            if recollection_attempts == 1:
+                status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+                status_path.write_text(json.dumps({"failure_code": "collector_error"}), encoding="utf-8")
+                return 2
+            clock.current = started_at + timedelta(minutes=31)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            [mode for mode, _when in invocations],
+            ["discover", "recollect", "recollect"],
+        )
+        self.assertLess(invocations[1][1], started_at + timedelta(minutes=20))
+        self.assertEqual(invocations[1][1], started_at + timedelta(minutes=10))
+        self.assertEqual(invocations[2][1], started_at + timedelta(minutes=30))
+
+    async def test_discovery_rate_limit_pause_crosses_window_boundary(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=50 / 60,
+            discovery_hours=50 / 60,
+            discovery_interval_minutes=30,
+            domains=("fashion",),
+        )
+        clock = ManualClock(started_at)
+        discovery_times: list[datetime] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            self.assertEqual(kwargs["mode"], "discover")
+            discovery_times.append(clock())
+            if len(discovery_times) == 1:
+                clock.current = started_at + timedelta(minutes=29)
+                status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+                status_path.write_text(json.dumps({"failure_code": "rate_limited"}), encoding="utf-8")
+                return 2
+            clock.current = started_at + timedelta(minutes=50)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(discovery_times[1], started_at + timedelta(minutes=49))
 
     async def test_failed_discovery_waits_before_retrying_the_same_window(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
@@ -962,10 +1106,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         )
         attempts = 0
         waits: list[float] = []
+        hashtags: list[tuple[str, ...]] = []
 
-        async def fake_invoke(**_kwargs: object) -> int:
+        async def fake_invoke(**kwargs: object) -> int:
             nonlocal attempts
             attempts += 1
+            hashtags.append(tuple(kwargs["hashtags"]))
             if attempts == 1:
                 return 2
             clock.current = started_at + timedelta(hours=1)
@@ -982,6 +1128,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 2)
         self.assertEqual(attempts, 2)
         self.assertEqual(sum(waits), 300.0)
+        self.assertEqual(hashtags, [tuple(FASHION_KEYWORDS[:KEYWORDS_PER_WINDOW])] * 2)
 
     async def test_failed_due_job_backoff_does_not_delay_other_due_domain(self) -> None:
         started_at = datetime(2026, 8, 26, 0, 31, tzinfo=timezone.utc)
@@ -1103,6 +1250,57 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 0)
         self.assertEqual(waits, [])
 
+    async def test_scheduler_owns_android_log_relay_for_its_full_run(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            domains=("fashion",),
+            duration_hours=1,
+            discovery_hours=1,
+            new_only=True,
+        )
+        relay_started: list[tuple[Path, str]] = []
+        relay_stopped: list[tuple[Path, str]] = []
+        invocations = 0
+
+        async def fake_relay(data_dir: Path, source: str) -> None:
+            identity = (data_dir, source)
+            relay_started.append(identity)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                relay_stopped.append(identity)
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal invocations
+            invocations += 1
+            await asyncio.sleep(0)
+            clock.current = started_at + (
+                timedelta(minutes=1)
+                if invocations == 1
+                else timedelta(minutes=30) if invocations == 2 else timedelta(hours=1)
+            )
+            return 0
+
+        async def fake_wait(_event: object, _seconds: float) -> bool:
+            clock.current = started_at + timedelta(hours=1)
+            return False
+
+        with (
+            patch(
+                "collectors.fashion_beauty_collection.relay_new_collection_log_lines",
+                new=fake_relay,
+            ),
+            patch("collectors.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait),
+        ):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        expected = (self.data_root / ".datasets" / "fashion", "android")
+        self.assertEqual(result, 0)
+        self.assertEqual(relay_started, [expected])
+        self.assertEqual(relay_stopped, [expected])
+
     async def test_window_cap_300_stops_discovery_but_keeps_due_jobs(self) -> None:
         now = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)
         rows = [
@@ -1163,6 +1361,8 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(getattr(discover, "exact_metric_attempts"), 3)
         self.assertEqual(getattr(discover, "exact_metric_retry_delay_seconds"), 2)
         self.assertEqual(getattr(discover, "hashtag_candidates_per_keyword"), 50)
+        self.assertFalse(getattr(discover, "relay_detached_android_logs"))
+        self.assertTrue(getattr(discover, "rate_limit_return_immediately"))
         self.assertFalse(getattr(discover, "collect_hashtag_media_count"))
         self.assertTrue(getattr(discover, "new_urls_only"))
         self.assertTrue(getattr(discover, "followers_after_reels"))

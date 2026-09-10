@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from openpyxl import Workbook
 
 from android_collector.adb_driver import AdbDriver, select_online_device
+from android_collector.diagnostics import CollectorDiagnostics
 from android_collector.models import CollectorError
 from android_collector.new_only_schedule import (
     BEAUTY_KEYWORDS,
@@ -201,15 +202,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return options
 
 
-def create_driver(adb_path: Path, device_id: str | None, adb_user_home: Path) -> AdbDriver:
+def create_driver(
+    adb_path: Path,
+    device_id: str | None,
+    adb_user_home: Path,
+    diagnostics: CollectorDiagnostics | None = None,
+) -> AdbDriver:
     if not adb_path.is_file():
         raise CollectorError(f"ADB executable was not found: {adb_path}. Install Android SDK Platform Tools or pass --adb-path.")
     adb_user_home.mkdir(parents=True, exist_ok=True)
     selected_device = select_online_device(adb_path, device_id, adb_user_home)
-    return AdbDriver(adb_path, selected_device, adb_user_home)
+    return AdbDriver(adb_path, selected_device, adb_user_home, diagnostics=diagnostics)
 
 
-def collector_options(options: argparse.Namespace) -> CollectorOptions:
+def collector_options(
+    options: argparse.Namespace,
+    diagnostics: CollectorDiagnostics | None = None,
+) -> CollectorOptions:
     selected_hashtags = list(getattr(options, "hashtag_query", ()))
     keywords_per_run = getattr(options, "keywords_per_run", 5)
     if getattr(options, "fashion", False):
@@ -232,6 +241,7 @@ def collector_options(options: argparse.Namespace) -> CollectorOptions:
         verbose_progress=options.verbose_progress,
         capture_screenshots=not bool(getattr(options, "fast", False)),
         reuse_profiles_within_run=bool(getattr(options, "fast", False)),
+        diagnostics=diagnostics,
     )
 
 
@@ -255,9 +265,13 @@ def sync_xlsx(data_dir: Path, reel_stem: str, user_stem: str) -> Path:
     return destination
 
 
-def _run_new_collection(options: argparse.Namespace, driver: AdbDriver) -> int:
+def _run_new_collection(
+    options: argparse.Namespace,
+    driver: AdbDriver,
+    diagnostics: CollectorDiagnostics | None = None,
+) -> int:
     store = CollectionStore(options.data_dir, reel_stem=options.reel_stem, user_stem=options.user_stem)
-    collection = collector_options(options)
+    collection = collector_options(options, diagnostics)
     if options.command == "refresh":
         return run_refresh(collection, driver, store)
     if options.command == "hashtag" or collection.hashtags:
@@ -267,7 +281,11 @@ def _run_new_collection(options: argparse.Namespace, driver: AdbDriver) -> int:
     return run_feed(collection, driver, store)
 
 
-def _run_schedule(options: argparse.Namespace, driver: AdbDriver) -> int:
+def _run_schedule(
+    options: argparse.Namespace,
+    driver: AdbDriver,
+    diagnostics: CollectorDiagnostics | None = None,
+) -> int:
     domains = ("fashion", "beauty") if options.command == "fashion-beauty" else (options.command,)
     schedule = NewOnlyScheduleOptions(
         data_dir=options.data_dir,
@@ -281,29 +299,50 @@ def _run_schedule(options: argparse.Namespace, driver: AdbDriver) -> int:
         fashion_keywords=options.fashion_hashtag_query or FASHION_KEYWORDS,
         beauty_keywords=options.beauty_hashtag_query or BEAUTY_KEYWORDS,
     )
-    return run_new_only_schedule(collector_options(options), schedule, driver, domains)
+    return run_new_only_schedule(collector_options(options, diagnostics), schedule, driver, domains)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     options = parse_args(argv)
+    if options.command == "xlsx":
+        print(f"XLSX synchronized: {sync_xlsx(options.data_dir.resolve(), options.reel_stem, options.user_stem)}")
+        return 0
+    if options.command == "reconcile":
+        CollectionStore(options.data_dir, reel_stem=options.reel_stem, user_stem=options.user_stem).export()
+        print("Android exports reconciled from the local observation history.")
+        return 0
+
+    diagnostics = CollectorDiagnostics(
+        options.data_dir,
+        run_mode="background" if options.background else "foreground",
+    )
+    exit_code = 0
+    status = "completed"
+    failure = ""
     try:
-        if options.command == "xlsx":
-            print(f"XLSX synchronized: {sync_xlsx(options.data_dir.resolve(), options.reel_stem, options.user_stem)}")
-            return 0
-        if options.command == "reconcile":
-            CollectionStore(options.data_dir, reel_stem=options.reel_stem, user_stem=options.user_stem).export()
-            print("Android exports reconciled from the local observation history.")
-            return 0
-        driver = create_driver(options.adb_path, options.device_id, options.adb_user_home)
+        driver = create_driver(options.adb_path, options.device_id, options.adb_user_home, diagnostics)
         if options.background:
             print("--background uses the already logged-in Android app; no browser window is created.", file=sys.stderr)
-        stored = _run_schedule(options, driver) if options.command in {"fashion", "beauty", "fashion-beauty"} else _run_new_collection(options, driver)
+        stored = (
+            _run_schedule(options, driver, diagnostics)
+            if options.command in {"fashion", "beauty", "fashion-beauty"}
+            else _run_new_collection(options, driver, diagnostics)
+        )
     except (CollectorError, ValueError) as error:
-        print(str(error), file=sys.stderr)
-        return 2
-    action = "refreshed" if options.command == "refresh" else "saved"
-    print(f"Android Reel snapshots {action}: {stored}")
-    return 0
+        failure = str(error)
+        print(failure, file=sys.stderr)
+        exit_code = 2
+        status = "failed"
+    except BaseException as error:
+        failure = str(error) or error.__class__.__name__
+        status = "failed"
+        raise
+    else:
+        action = "refreshed" if options.command == "refresh" else "saved"
+        print(f"Android Reel snapshots {action}: {stored}")
+    finally:
+        diagnostics.finish(status, error=failure)
+    return exit_code
 
 
 if __name__ == "__main__":

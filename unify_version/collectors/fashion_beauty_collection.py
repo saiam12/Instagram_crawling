@@ -27,11 +27,13 @@ from .fashion_beauty_scheduler import (
     keyword_group,
     window_dataset,
 )
+from . import collection_pause
 from .instagram_reels_browser import (
     REEL_HISTORY_DIRECTORY,
     REEL_HISTORY_FILENAME,
     parse_args,
     process_is_alive,
+    relay_new_collection_log_lines,
     run_collector,
     run_collectors_in_shared_context,
     wait_for_stop_or_timeout,
@@ -56,7 +58,7 @@ _LOCK_MALFORMED_GRACE_SECONDS = 2.0
 _COLLECTOR_RETRY_BASE_SECONDS = 5 * 60.0
 _COLLECTOR_RETRY_MAX_SECONDS = 30 * 60.0
 _COLLECTOR_RETRY_MAX_ATTEMPTS = 5
-_RATE_LIMIT_RETRY_SECONDS = 30 * 60.0
+_RATE_LIMIT_RETRY_SECONDS = 20 * 60.0
 _RECOLLECTION_BATCH_SIZE = 50
 
 
@@ -84,6 +86,16 @@ def _collector_access_failure(dataset: DatasetConfig) -> str:
         if status in {"rate_limited", "login_required", "challenge_required"}:
             return status
     return ""
+
+
+def _collector_rate_limit_delay(dataset: DatasetConfig) -> float:
+    """Honor a longer server cooldown recorded by the browser collector."""
+    try:
+        payload = json.loads((dataset.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        delay = float(payload.get("retry_after_seconds") or 0)
+    except (OSError, ValueError, TypeError):
+        return _RATE_LIMIT_RETRY_SECONDS
+    return max(_RATE_LIMIT_RETRY_SECONDS, delay) if math.isfinite(delay) else _RATE_LIMIT_RETRY_SECONDS
 
 
 def utc_now() -> datetime:
@@ -536,7 +548,14 @@ def _generic_collector_options(
         )
     else:
         raise ValueError(f"Unknown collection mode: {mode}")
-    return parse_args(arguments), urls_file
+    options = parse_args(arguments)
+    # The long-running scheduler owns one Android log relay for the whole run,
+    # including the gaps between individual browser collection invocations.
+    options.relay_detached_android_logs = False
+    # Let the scheduler own the cooldown so due Android recollections can run
+    # while new web discovery is paused.
+    options.rate_limit_return_immediately = True
+    return options, urls_file
 
 
 async def invoke_generic_recollection_batches(
@@ -631,6 +650,7 @@ def current_status(
     last_error: str = "",
     collector_failures: int = 0,
     completed: bool = False,
+    keyword_group_number: int | None = None,
 ) -> dict[str, Any]:
     rows = read_history(dataset)
     active_name = active_dataset_name(config, started_at, now) if now < discovery_ends_at else None
@@ -646,7 +666,7 @@ def current_status(
     if active_name == dataset.name:
         active_keywords = keyword_group(
             dataset.keywords,
-            active_keyword_window_index(config, started_at, now),
+            keyword_group_number or active_keyword_window_index(config, started_at, now),
             config.keywords_per_window,
         )
     return {
@@ -684,7 +704,7 @@ async def _invoke_before_deadline(
     if remaining <= 0:
         return 2, f"{mode} deadline reached before collector invocation"
     try:
-        result = int(await asyncio.wait_for(invoke(**kwargs), timeout=remaining))
+        result = int(await collection_pause.wait_for_active_time(invoke(**kwargs), timeout=remaining))
     except TimeoutError:
         return 2, f"{mode} collector exceeded its deadline"
     except Exception as error:
@@ -731,7 +751,7 @@ async def _invoke_recollection_batches_before_deadline(
     if remaining <= 0:
         return [(jobs, 2, "recollect deadline reached before collector invocation") for _dataset, jobs in batches]
     try:
-        results = await asyncio.wait_for(
+        results = await collection_pause.wait_for_active_time(
             invoke_generic_recollection_batches(
                 config=config,
                 batches=[(dataset, [job.url for job in jobs]) for dataset, jobs in batches],
@@ -772,10 +792,12 @@ async def run_fashion_beauty_collection(
     retry_not_before: dict[tuple[str, str, datetime], datetime] = {}
     discovery_retry_attempts: dict[tuple[str, datetime], int] = {}
     discovery_retry_not_before: dict[tuple[str, datetime], datetime] = {}
-    completed_new_only_windows: set[tuple[str, datetime]] = set()
+    discovery_rate_limit_not_before: datetime | None = None
+    keyword_group_numbers = {name: 1 for name in config.domains}
     exit_code = 0
     interrupt_count = 0
     previous_sigint = signal.getsignal(signal.SIGINT)
+    android_log_relays: list[asyncio.Task[None]] = []
 
     def handle_interrupt(_signum: int, _frame: Any) -> None:
         nonlocal interrupt_count
@@ -789,7 +811,12 @@ async def run_fashion_beauty_collection(
     signal.signal(signal.SIGINT, handle_interrupt)
     try:
         async with SupervisorLock(lock_path):
+            android_log_relays = [
+                asyncio.create_task(relay_new_collection_log_lines(dataset.data_root, "android"))
+                for dataset in datasets(config)
+            ]
             while not stop_event.is_set() and clock() < ends_at:
+                await collection_pause.wait()
                 now = clock()
                 configured_datasets = datasets(config)
                 histories = {dataset.name: read_history(dataset) for dataset in configured_datasets}
@@ -829,6 +856,10 @@ async def run_fashion_beauty_collection(
                 ]
 
                 if eligible_jobs:
+                    recollection_during_discovery_rate_limit = bool(
+                        discovery_rate_limit_not_before is not None
+                        and discovery_rate_limit_not_before > now
+                    )
                     recollection_batches = [
                         (
                             dataset.name,
@@ -858,23 +889,19 @@ async def run_fashion_beauty_collection(
                             collector_failures[dataset_name] += 1
                             wait_seconds = 0.0
                             rate_limit_retry_at: datetime | None = None
-                            if access_failure == "rate_limited":
+                            if access_failure == "rate_limited" or recollection_during_discovery_rate_limit:
                                 rate_limit_retry_at = min(
-                                    clock() + timedelta(seconds=_RATE_LIMIT_RETRY_SECONDS),
+                                    clock() + timedelta(seconds=_collector_rate_limit_delay(
+                                        dataset_by_name(config, dataset_name)
+                                    )),
                                     ends_at,
                                 )
-                                last_errors[dataset_name] = (
-                                    f"{error}; Instagram rate limit detected, all due work paused for 30 minutes"
+                                reason = (
+                                    "Instagram rate limit detected"
+                                    if access_failure == "rate_limited"
+                                    else "recollection failed during discovery rate-limit cooldown"
                                 )
-                                for pending_job in pending:
-                                    pending_key = (
-                                        pending_job.dataset,
-                                        pending_job.url,
-                                        pending_job.due_at,
-                                    )
-                                    current_retry_at = retry_not_before.get(pending_key)
-                                    if current_retry_at is None or current_retry_at < rate_limit_retry_at:
-                                        retry_not_before[pending_key] = rate_limit_retry_at
+                                last_errors[dataset_name] = f"{error}; {reason}, failed batch paused for 20 minutes"
                             for job in recollection_jobs:
                                 job_key = (job.dataset, job.url, job.due_at)
                                 attempt = retry_attempts.get(job_key, 0) + 1
@@ -925,11 +952,20 @@ async def run_fashion_beauty_collection(
                         dataset=selected,
                         window_start=window_start,
                     )
+                    keyword_group_number = keyword_group_numbers[selected.name]
                     window_key = (selected.name, window_start)
                     retry_at = discovery_retry_not_before.get(window_key)
-                    if retry_at is not None and retry_at > now:
+                    if (
+                        discovery_rate_limit_not_before is not None
+                        and discovery_rate_limit_not_before > now
+                    ):
+                        wait_seconds = min(
+                            30.0,
+                            max(0.0, (discovery_rate_limit_not_before - now).total_seconds()),
+                        )
+                    elif retry_at is not None and retry_at > now:
                         wait_seconds = min(30.0, max(0.0, (retry_at - now).total_seconds()))
-                    elif decision.discover and (not config.new_only or window_key not in completed_new_only_windows):
+                    elif decision.discover:
                         batch_size = min(config.new_items_per_window, decision.remaining_capacity)
                         invocation_deadline = window_end
                         invoked = True
@@ -942,7 +978,7 @@ async def run_fashion_beauty_collection(
                             mode="discover",
                             hashtags=keyword_group(
                                 selected.keywords,
-                                active_keyword_window_index(config, started_at, now),
+                                keyword_group_number,
                                 config.keywords_per_window,
                             ),
                             max_items=batch_size,
@@ -962,13 +998,18 @@ async def run_fashion_beauty_collection(
                             attempt = discovery_retry_attempts.get(window_key, 0) + 1
                             discovery_retry_attempts[window_key] = attempt
                             if access_failure == "rate_limited":
-                                retry_at = window_end
+                                retry_at = min(
+                                    clock() + timedelta(seconds=_collector_rate_limit_delay(selected)),
+                                    ends_at,
+                                )
+                                discovery_rate_limit_not_before = retry_at
                                 last_errors[selected.name] = (
-                                    f"{error}; Instagram rate limit detected, retry deferred until the next discovery window"
+                                    f"{error}; Instagram rate limit detected, discovery paused until {retry_at.isoformat()}"
                                 )
                                 print(
                                     f"[PYTHON] {selected.name}: Instagram HTTP 429; "
-                                    f"discovery is paused until the next window ({window_end:%H:%M:%S}).",
+                                    f"discovery is paused until {retry_at:%H:%M:%S}; "
+                                    "due recollections remain eligible.",
                                     file=sys.stderr,
                                 )
                             else:
@@ -982,14 +1023,11 @@ async def run_fashion_beauty_collection(
                                         f"{error}; retry deferred until the next discovery window after {attempt} failures"
                                     )
                             discovery_retry_not_before[window_key] = retry_at
-                        elif config.new_only:
-                            # One pass deliberately examines every candidate from this
-                            # keyword group.  Do not rescan the same group merely
-                            # because fewer than the requested number qualified.
-                            completed_new_only_windows.add(window_key)
                         else:
+                            keyword_group_numbers[selected.name] += 1
                             discovery_retry_attempts.pop(window_key, None)
                             discovery_retry_not_before.pop(window_key, None)
+                            discovery_rate_limit_not_before = None
 
                 finish_after_iteration = (
                     not config.new_only
@@ -1027,6 +1065,7 @@ async def run_fashion_beauty_collection(
                             last_error=last_errors[dataset.name],
                             collector_failures=collector_failures[dataset.name],
                             completed=finish_after_iteration,
+                            keyword_group_number=keyword_group_numbers[dataset.name],
                         ),
                     )
                 if finish_after_iteration:
@@ -1041,6 +1080,10 @@ async def run_fashion_beauty_collection(
                             min(wait_seconds, remaining_run_seconds),
                         )
     finally:
+        for relay in android_log_relays:
+            relay.cancel()
+        if android_log_relays:
+            await asyncio.gather(*android_log_relays, return_exceptions=True)
         signal.signal(signal.SIGINT, previous_sigint)
     return exit_code
 

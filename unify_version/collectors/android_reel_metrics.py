@@ -24,6 +24,9 @@ from typing import Callable, Protocol, Sequence
 from urllib.parse import quote
 from xml.etree import ElementTree
 
+from . import collection_pause
+from .collection_diagnostics import CollectorDiagnostics
+
 
 INSTAGRAM_PACKAGE = "com.instagram.android"
 ANDROID_OWNED_FIELDS = (
@@ -31,6 +34,7 @@ ANDROID_OWNED_FIELDS = (
     "view_count",
     "comment_count",
     "share_count",
+    "repost_count",
     "saved_count",
     "audio_name",
 )
@@ -40,6 +44,11 @@ _COMMENT_RESOURCE_MARKERS = ("comment_button", "comment_count", "comments_count"
 _COMMENT_DETAIL_LABELS = ("comment number is", "view comments", "댓글 수", "댓글 보기")
 _NO_COMMENTS = re.compile(r"\bno\s+comments\s+yet\b|아직\s*댓글이\s*(없습니다|없어요)", re.I)
 _COMMENTS_DISABLED = re.compile(r"\bcomments?\s+(?:are|is)\s+(?:turned\s+off|disabled)\b|댓글\s*(?:기능이\s*)?(?:꺼져\s*있|사용할\s*수\s*없)", re.I)
+_RATE_LIMIT_SIGNAL = re.compile(
+    r"429|too\s+many\s+requests|rate[_\s-]?limit|throttled|please\s+wait\s+a\s+few\s+minutes|"
+    r"try\s+again\s+later|요청을\s*처리할\s*수\s*없습니다|잠시\s*후\s*다시",
+    re.I,
+)
 _LIKE_PRIVATE = re.compile(r"only\s+.+?\s+can\s+see\s+the\s+total\s+number\s+of\s+likes|좋아요\s*수는\s*.+?만\s*볼\s*수\s*있", re.I)
 _COMPACT_COUNT = re.compile(r"(?P<number>\d+(?:[.,]\d+)?)\s*(?P<unit>[KMBkmb만천])")
 _EXACT_COUNT = re.compile(r"\d[\d,\s]*")
@@ -55,8 +64,6 @@ _METRIC_RESOURCE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("view_count", ("video_view_count", "view_count", "play_count")),
     ("comment_count", ("comment_count", "comments_count")),
     ("share_count", ("share_count", "shares_count", "share_number", "send_count")),
-    # Recognize repost nodes so they are not mistaken for audio text. The
-    # result filter intentionally excludes this Python-owned field.
     ("repost_count", ("repost_count", "reposts_count", "reshare_count", "reshare_number")),
     ("saved_count", ("save_count", "saved_count", "saves_count", "bookmark_count")),
 )
@@ -78,6 +85,7 @@ _ANDROID_TAG_SEARCH_PAGE_CHANGE_TIMEOUT_SECONDS = 0.75
 _ANDROID_TAG_SEARCH_UI_DELAY_SECONDS = 0.2
 _MIN_HASHTAG_POST_COUNT = 1_000
 _ADB_COMMAND_TIMEOUT_SECONDS = 15.0
+_ADB_UI_DUMP_TIMEOUT_SECONDS = 10.0
 _WINDOWS_CLIPBOARD_SYNC_SECONDS = 0.8
 _CF_UNICODETEXT = 13
 _GMEM_MOVEABLE = 0x0002
@@ -235,8 +243,14 @@ def _command_error(result: subprocess.CompletedProcess[str]) -> str:
 class AdbAndroidUiDriver:
     """Minimal ADB driver owned by the hybrid collector folder."""
 
-    def __init__(self, adb_path: Path, device_id: str | None = None) -> None:
+    def __init__(
+        self,
+        adb_path: Path,
+        device_id: str | None = None,
+        diagnostics: CollectorDiagnostics | None = None,
+    ) -> None:
         self.adb_path = Path(adb_path)
+        self.diagnostics = diagnostics
         self.device_id = (
             device_id
             or os.environ.get("INSTAGRAM_ANDROID_DEVICE_ID", "").strip()
@@ -244,8 +258,14 @@ class AdbAndroidUiDriver:
         )
         self._cached_screen_size: tuple[int, int] | None = None
 
-    def _run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        *arguments: str,
+        timeout_seconds: float = _ADB_COMMAND_TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess[str]:
+        collection_pause.wait_sync()
         command = [str(self.adb_path), "-s", self.device_id, *arguments]
+        started = time.monotonic()
         try:
             result = subprocess.run(
                 command,
@@ -254,15 +274,35 @@ class AdbAndroidUiDriver:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
-                timeout=_ADB_COMMAND_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as error:
             rendered = " ".join(arguments[:3])
+            if self.diagnostics is not None:
+                self.diagnostics.adb_command(
+                    arguments,
+                    duration=time.monotonic() - started,
+                    status="timeout",
+                    error=f"ADB command timed out after {timeout_seconds:g}s: {rendered}",
+                )
             raise AndroidMetricsError(
-                f"ADB command timed out after {_ADB_COMMAND_TIMEOUT_SECONDS:g}s: {rendered}"
+                f"ADB command timed out after {timeout_seconds:g}s: {rendered}"
             ) from error
         if result.returncode:
+            if self.diagnostics is not None:
+                self.diagnostics.adb_command(
+                    arguments,
+                    duration=time.monotonic() - started,
+                    status="failed",
+                    error=_command_error(result),
+                )
             raise AndroidMetricsError(_command_error(result))
+        if self.diagnostics is not None:
+            self.diagnostics.adb_command(
+                arguments,
+                duration=time.monotonic() - started,
+                status="success",
+            )
         return result
 
     def _select_online_device(self) -> str:
@@ -328,7 +368,13 @@ class AdbAndroidUiDriver:
     def dump_ui(self) -> str:
         command = "uiautomator dump --compressed /sdcard/hybrid_window.xml >/dev/null && cat /sdcard/hybrid_window.xml"
         try:
-            return self._run("exec-out", "sh", "-c", command).stdout
+            return self._run(
+                "exec-out",
+                "sh",
+                "-c",
+                command,
+                timeout_seconds=_ADB_UI_DUMP_TIMEOUT_SECONDS,
+            ).stdout
         except AndroidMetricsError:
             self.reset_ui_automation()
             raise
@@ -360,20 +406,24 @@ class AdbAndroidUiDriver:
         )
 
     def reset_instagram_surface(self) -> None:
-        """Clear a poisoned accessibility session without stopping Android."""
+        """Clear a poisoned accessibility session without stopping Instagram."""
+        self.reset_ui_automation()
+
+    def restart_emulator(self) -> None:
+        """Reboot the selected Android emulator without clearing its user data."""
+        if not self.device_id.casefold().startswith("emulator-"):
+            raise AndroidMetricsError(
+                "Automatic Android restart is restricted to emulator devices."
+            )
         self.reset_ui_automation()
         try:
-            subprocess.run(
-                [str(self.adb_path), "-s", self.device_id, "shell", "am", "force-stop", INSTAGRAM_PACKAGE],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            self._run("reboot", timeout_seconds=10)
+        except AndroidMetricsError as error:
+            # ADB may report the transport closing after the emulator has
+            # already accepted the reboot request.
+            if not re.search(r"device\s+(?:offline|not found)|error:\s*closed|closed", str(error), re.I):
+                raise
+        self._cached_screen_size = None
 
     def tap_bounds(self, bounds: str) -> bool:
         match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
@@ -650,7 +700,7 @@ def extract_related_hashtag_post_counts(
 
 
 def parse_display_count(value: object) -> int | None:
-    text = str(value or "").strip()
+    text = str("" if value is None else value).strip()
     compact = _COMPACT_COUNT.fullmatch(text)
     if compact:
         raw = compact.group("number").replace(" ", "")
@@ -739,8 +789,20 @@ def is_likes_and_plays_panel(xml: str) -> bool:
 def _likes_detail_ready(xml: str) -> bool:
     metrics = extract_visible_metrics(xml)
     return is_likes_and_plays_panel(xml) and (
-        "view_count" in metrics or "like_count" in metrics or bool(_LIKE_PRIVATE.search(xml))
+        "view_count" in metrics or bool(_LIKE_PRIVATE.search(xml))
     )
+
+
+def _like_count_control_present(xml: str) -> bool:
+    """Return whether the detail sheet exposes a like-count icon or row."""
+    for node in parse_ui_xml(xml):
+        resource_id = node.resource_id.casefold()
+        if any(marker in resource_id for marker in ("like_count", "like_button", "like_icon", "likes_icon")):
+            return True
+        visible = node.visible_text.strip().casefold()
+        if visible in {"like", "likes", "좋아요"}:
+            return True
+    return False
 
 
 def _first_matching_node(nodes: Sequence[UiNode], predicate: object) -> UiNode | None:
@@ -760,6 +822,13 @@ def _is_reel_surface(xml: str) -> bool:
     )
 
 
+def detect_android_rate_limit_signal(xml: str) -> str:
+    """Return only an app-visible limit signal; it is not an HTTP status."""
+    text = " ".join(node.visible_text for node in parse_ui_xml(xml))
+    match = _RATE_LIMIT_SIGNAL.search(text)
+    return match.group(0) if match else ""
+
+
 def describe_android_surface(xml: str) -> str:
     """Return a stable, non-sensitive reason when a Reel URL did not render."""
     nodes = parse_ui_xml(xml)
@@ -775,6 +844,8 @@ def describe_android_surface(xml: str) -> str:
         return "Android is asking to open the link in Instagram."
     if re.search(r"(?:reel|video).{0,40}(?:not available|unavailable|deleted)|릴스.{0,30}(?:사용할 수 없|삭제)", text, re.I):
         return "The Reel is unavailable or was deleted."
+    if detect_android_rate_limit_signal(xml):
+        return "Instagram displayed a possible rate-limit message in the Android UI."
     if re.search(r"couldn.?t refresh|try again later|잠시 후 다시|새로고침", text, re.I):
         return "Instagram displayed a loading or temporary-error screen."
     return "Instagram did not render a recognizable Reel surface before the timeout."
@@ -822,18 +893,24 @@ class AndroidReelMetricsEnricher:
         device_id: str | None = None,
         ui_delay_seconds: float = 0.35,
         driver: AndroidUiDriver | None = None,
+        diagnostics: CollectorDiagnostics | None = None,
     ) -> None:
         self._adb_path = Path(adb_path) if adb_path else default_adb_path()
         self._device_id = device_id or None
         self._delay = max(0.1, float(ui_delay_seconds))
         self._driver = driver
         self._driver_is_external = driver is not None
+        self.diagnostics = diagnostics
         self._reel_paused_for_collection = False
 
     @property
     def driver(self) -> AndroidUiDriver:
         if self._driver is None:
-            self._driver = AdbAndroidUiDriver(self._adb_path, self._device_id)
+            self._driver = AdbAndroidUiDriver(
+                self._adb_path,
+                self._device_id,
+                diagnostics=self.diagnostics,
+            )
         return self._driver
 
     def _ready(self) -> str:
@@ -857,12 +934,23 @@ class AndroidReelMetricsEnricher:
             return
         self._driver = None
 
+    def restart_emulator(self) -> None:
+        """Checkpoint boundary hook used by the durable queue worker."""
+        restart = getattr(self.driver, "restart_emulator", None)
+        if not callable(restart):
+            raise AndroidMetricsError("The Android UI driver cannot restart the emulator.")
+        restart()
+        self._reel_paused_for_collection = False
+        if not self._driver_is_external:
+            self._driver = None
+
     def _wait_for_surface(
         self,
         predicate: object,
         attempts: int = 4,
         timeout_seconds: float | None = None,
         max_consecutive_unreadable: int | None = None,
+        target: str = "android_surface",
     ) -> str:
         if timeout_seconds is not None:
             attempts = max(attempts, int(timeout_seconds / self._delay) + 1)
@@ -870,8 +958,20 @@ class AndroidReelMetricsEnricher:
         consecutive_unreadable = 0
         for attempt in range(attempts):
             if attempt:
+                if self.diagnostics is not None:
+                    self.diagnostics.record_retry(
+                        stage=self.diagnostics.current_stage or "WAIT_FOR_RENDER",
+                        target=target,
+                        attempt=attempt + 1,
+                        total=attempts,
+                        reason="ELEMENT_TIMEOUT",
+                        previous_wait=self._delay,
+                    )
                 time.sleep(self._delay)
             xml = self.driver.dump_ui()
+            rate_limit_signal = detect_android_rate_limit_signal(xml)
+            if rate_limit_signal and self.diagnostics is not None:
+                self.diagnostics.rate_limit_suspected(rate_limit_signal)
             if callable(predicate) and predicate(xml):
                 return xml
             if max_consecutive_unreadable is not None:
@@ -938,18 +1038,20 @@ class AndroidReelMetricsEnricher:
         node = _first_matching_node(parse_ui_xml(reel_xml), _is_likes_trigger)
         if node is None or not self.driver.tap_bounds(node.bounds):
             return {}, None
-        panel_xml = self._wait_for_surface(_likes_detail_ready)
+        panel_xml = self._wait_for_surface(_likes_detail_ready, target="likes_and_plays_panel")
         if not is_likes_and_plays_panel(panel_xml):
             return {}, None
         try:
             metrics = extract_visible_metrics(panel_xml)
-            like_private = bool(_LIKE_PRIVATE.search(panel_xml))
-            # Instagram omits the likes row when a public Reel has no likes,
-            # while still rendering the plays row. Hidden likes are handled
-            # separately by the explicit privacy notice and remain "X".
-            if not like_private and "view_count" in metrics and "like_count" not in metrics:
-                metrics["like_count"] = 0
-            return metrics, like_private
+            like_unavailable = bool(_LIKE_PRIVATE.search(panel_xml))
+            if not like_unavailable and "view_count" in metrics and "like_count" not in metrics:
+                if _like_count_control_present(panel_xml):
+                    metrics["like_count"] = 0
+                else:
+                    # A plays value without any like icon/row does not prove
+                    # zero likes. Preserve that unavailable state as X.
+                    like_unavailable = True
+            return metrics, like_unavailable
         finally:
             self.driver.press_back()
 
@@ -957,50 +1059,108 @@ class AndroidReelMetricsEnricher:
         node = _first_matching_node(parse_ui_xml(reel_xml), _is_comment_trigger)
         if node is None or not self.driver.tap_bounds(node.bounds):
             return ""
-        panel_xml = self._wait_for_surface(lambda xml: bool(_comment_sheet_state(xml)) or not _is_reel_surface(xml))
+        panel_xml = self._wait_for_surface(
+            lambda xml: bool(_comment_sheet_state(xml)) or not _is_reel_surface(xml),
+            target="comments_panel",
+        )
         try:
             return _comment_sheet_state(panel_xml)
         finally:
             self.driver.press_back()
 
     def enrich(self, reel_url: str) -> AndroidMetricResult:
+        if self.diagnostics is not None:
+            self.diagnostics.update_media(current_url=reel_url)
+            self.diagnostics.stage_start("PREFLIGHT")
         error = self._ready()
         if error:
+            if self.diagnostics is not None:
+                self.diagnostics.stage_failed("PREFLIGHT", reason="ANDROID_UNAVAILABLE", error=error)
             return AndroidMetricResult(status="unavailable", error=error)
+        if self.diagnostics is not None:
+            self.diagnostics.stage_success("PREFLIGHT")
         try:
             self._reel_paused_for_collection = False
             reel_xml = ""
+            if self.diagnostics is not None:
+                self.diagnostics.stage_start("OPEN_REEL")
             for launch_attempt, ready_timeout in enumerate(
                 (_ANDROID_REEL_READY_TIMEOUT_SECONDS, _ANDROID_RETRY_READY_TIMEOUT_SECONDS),
                 start=1,
             ):
+                if launch_attempt > 1 and self.diagnostics is not None:
+                    self.diagnostics.record_retry(
+                        stage="OPEN_REEL",
+                        target="reel_deep_link",
+                        attempt=launch_attempt,
+                        total=2,
+                        reason="UI_RENDER_FAILED",
+                        previous_wait=self._delay,
+                    )
                 self.driver.open_instagram_url(reel_url)
+                # Pause video decoding before the first UIAutomator request.
+                # On the affected Windows emulator, asking for the hierarchy
+                # while a Reel is decoding can return an empty tree or stall.
+                self._reel_paused_for_collection = False
+                tap_center = getattr(self.driver, "tap_screen_center", None)
+                if callable(tap_center):
+                    time.sleep(max(1.0, self._delay))
+                    tap_center()
+                    self._reel_paused_for_collection = True
+                if self.diagnostics is not None:
+                    self.diagnostics.stage_start("WAIT_FOR_RENDER", target="reel")
                 reel_xml = self._wait_for_surface(
                     _is_reel_surface,
                     timeout_seconds=ready_timeout,
-                    max_consecutive_unreadable=2,
+                    max_consecutive_unreadable=4,
+                    target="reel",
                 )
                 if _is_reel_surface(reel_xml):
+                    if self.diagnostics is not None:
+                        self.diagnostics.stage_success("WAIT_FOR_RENDER", target="reel")
+                        self.diagnostics.stage_success("OPEN_REEL")
+                        self.diagnostics.ui_event("MEDIA_RENDER_OK")
+                        self.diagnostics.ui_event(
+                            "VIDEO_RENDER_STATUS_UNAVAILABLE",
+                            reason="UIAutomator confirms the Reel surface but cannot verify continuous playback.",
+                        )
                     break
-                detect_dynamic_cta = getattr(self.driver, "is_dynamic_cta_reel", None)
-                if not parse_ui_xml(reel_xml) and callable(detect_dynamic_cta) and detect_dynamic_cta():
-                    self._reset_unreadable_instagram_surface()
-                    return AndroidMetricResult(
-                        status="skipped",
-                        error="Dynamic CTA/shop Reel skipped because Instagram exposed no readable accessibility hierarchy.",
-                    )
                 if launch_attempt == 1:
                     self.prepare_reel_retry()
             else:
+                if self.diagnostics is not None:
+                    self.diagnostics.stage_timeout("WAIT_FOR_RENDER", target="reel")
+                    self.diagnostics.stage_failed("OPEN_REEL", reason="UI_RENDER_FAILED")
+                    self.diagnostics.ui_event("UI_RENDER_FAILED", target="reel")
                 if not parse_ui_xml(reel_xml):
                     self._reset_unreadable_instagram_surface()
                 return AndroidMetricResult(status="unavailable", error=describe_android_surface(reel_xml))
+            if self.diagnostics is not None:
+                self.diagnostics.stage_start("READ_USERNAME")
+                author = next(
+                    (
+                        node.text or node.content_desc
+                        for node in parse_ui_xml(reel_xml)
+                        if "clips_author_username" in node.resource_id.casefold()
+                        or "author_username" in node.resource_id.casefold()
+                    ),
+                    "",
+                )
+                if author:
+                    self.diagnostics.update_media(username=author)
+                    self.diagnostics.stage_success("READ_USERNAME")
+                else:
+                    self.diagnostics.stage_failed(
+                        "READ_USERNAME",
+                        reason="ELEMENT_LOOKUP_FAILED",
+                        target="reel_author",
+                    )
             # Pause video decoding before opening metric sheets or running
             # additional UIAutomator dumps. Some Windows emulator builds can
             # crash inside QEMU while Instagram video playback and hierarchy
             # inspection run together.
             tap_center = getattr(self.driver, "tap_screen_center", None)
-            if callable(tap_center):
+            if callable(tap_center) and not self._reel_paused_for_collection:
                 tap_center()
                 self._reel_paused_for_collection = True
                 time.sleep(self._delay)
@@ -1013,20 +1173,57 @@ class AndroidReelMetricsEnricher:
                 reel_xml = self._wait_for_surface(
                     lambda candidate: bool(extract_visible_metrics(candidate)) or bool(extract_audio_name(candidate)),
                     attempts=4,
+                    target="reel_metrics",
                 )
                 if not _is_reel_surface(reel_xml):
+                    if self.diagnostics is not None:
+                        self.diagnostics.ui_event("UI_RENDER_FAILED", target="reel_metrics")
                     return AndroidMetricResult(status="unavailable", error="Instagram left the Reel surface before its metrics rendered.")
                 metrics = extract_visible_metrics(reel_xml)
                 audio_name = extract_audio_name(reel_xml)
+            if self.diagnostics is not None:
+                self.diagnostics.stage_start("READ_LIKE_COUNT")
+                self.diagnostics.stage_start("READ_PLAY_COUNT")
             detail_metrics, like_private = self._open_likes_and_plays(reel_xml)
             metrics.update(detail_metrics)
+            if like_private is True:
+                metrics.pop("like_count", None)
+            if self.diagnostics is not None:
+                if "like_count" in metrics or like_private is True:
+                    self.diagnostics.stage_success("READ_LIKE_COUNT", value_state="private" if like_private else "collected")
+                else:
+                    self.diagnostics.stage_failed("READ_LIKE_COUNT", reason="METADATA_MISSING", fields="like_count")
+                if "view_count" in metrics:
+                    self.diagnostics.stage_success("READ_PLAY_COUNT")
+                else:
+                    self.diagnostics.stage_failed("READ_PLAY_COUNT", reason="METADATA_MISSING", fields="view_count")
             comment_count_disabled = False
             if "comment_count" not in metrics:
+                if self.diagnostics is not None:
+                    self.diagnostics.stage_start("READ_COMMENT_COUNT")
                 comment_state = self._read_empty_comment_state(reel_xml)
                 if comment_state == "empty":
                     metrics["comment_count"] = 0
                 elif comment_state == "disabled":
                     comment_count_disabled = True
+                if self.diagnostics is not None:
+                    if "comment_count" in metrics or comment_count_disabled:
+                        self.diagnostics.stage_success("READ_COMMENT_COUNT", value_state=comment_state or "collected")
+                    else:
+                        self.diagnostics.stage_failed("READ_COMMENT_COUNT", reason="METADATA_MISSING", fields="comment_count")
+            elif self.diagnostics is not None:
+                self.diagnostics.stage_start("READ_COMMENT_COUNT")
+                self.diagnostics.stage_success("READ_COMMENT_COUNT", source="reel_surface")
+            if self.diagnostics is not None:
+                missing_fields = [
+                    field_name
+                    for field_name in ("like_count", "view_count", "comment_count", "share_count", "repost_count", "saved_count")
+                    if field_name not in metrics
+                ]
+                if missing_fields:
+                    self.diagnostics.ui_event("METADATA_MISSING", fields=missing_fields)
+                else:
+                    self.diagnostics.ui_event("METADATA_RENDER_OK")
             if not metrics and not audio_name and like_private is None and not comment_count_disabled:
                 return AndroidMetricResult(
                     status="unavailable",
@@ -1039,12 +1236,11 @@ class AndroidReelMetricsEnricher:
                 comment_count_disabled=comment_count_disabled,
             )
         except AndroidMetricsError as error:
-            detect_dynamic_cta = getattr(self.driver, "is_dynamic_cta_reel", None)
-            if callable(detect_dynamic_cta) and detect_dynamic_cta():
-                self._reset_unreadable_instagram_surface()
-                return AndroidMetricResult(
-                    status="skipped",
-                    error="Dynamic CTA/shop Reel skipped because Instagram exposed no readable accessibility hierarchy.",
+            if self.diagnostics is not None:
+                self.diagnostics.stage_failed(
+                    self.diagnostics.current_stage or "ANDROID_UI",
+                    reason=type(error).__name__,
+                    error=str(error),
                 )
             if "uiautomator" in str(error).casefold() or "exec-out" in str(error).casefold():
                 self._reset_unreadable_instagram_surface()
@@ -1268,11 +1464,14 @@ def apply_metric_visibility_rules(
     if is_ad and missing(resolved.get("saved_count")):
         resolved["saved_count"] = "X"
 
-    like_count = parse_display_count(resolved.get("like_count"))
-    if like_count is not None and like_count <= 100:
-        for field_name in ("comment_count", "repost_count", "share_count", "saved_count"):
+    view_count = parse_display_count(resolved.get("view_count"))
+    if view_count is not None:
+        for field_name in ("repost_count", "share_count", "saved_count"):
             if missing(resolved.get(field_name)):
                 resolved[field_name] = 0
+    like_count = parse_display_count(resolved.get("like_count"))
+    if like_count is not None and like_count <= 100 and missing(resolved.get("comment_count")):
+        resolved["comment_count"] = 0
     return resolved
 
 
@@ -1440,13 +1639,14 @@ def write_hashtag_post_counts(
         json.dumps(exported_rows, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    from exporters.instagram_collector import write_xlsx_workbook
+    from exporters.instagram_collector import sync_combined_xlsx, write_xlsx_workbook
 
     xlsx_path = destination / "hashtags.xlsx"
     write_xlsx_workbook(
         xlsx_path,
         [("hashtags", [fields, *[[str(row.get(field_name, "") or "") for field_name in fields] for row in exported_rows]])],
     )
+    sync_combined_xlsx(destination)
     return {"csv": csv_path, "json": json_path, "xlsx": xlsx_path}
 
 

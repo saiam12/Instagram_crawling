@@ -17,7 +17,26 @@ if ($Avd -notmatch '^[A-Za-z0-9_-]+$') {
 }
 
 function Get-OnlineAndroidDevice {
-    $deviceLines = @(& $adbPath devices 2>$null |
+    # On its first invocation ADB writes the normal daemon-start banner to
+    # stderr even when `adb devices` succeeds. With ErrorActionPreference=Stop,
+    # Windows PowerShell turns that banner into a terminating NativeCommandError.
+    # Capture both streams for this command and use its exit code to distinguish
+    # a real ADB failure from successful daemon startup.
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $adbOutput = @(& $adbPath devices 2>&1)
+        $adbExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    if ($adbExitCode -ne 0) {
+        $adbError = ($adbOutput | Out-String).Trim()
+        throw "ADB device query failed (exit $adbExitCode): $adbError"
+    }
+    $deviceLines = @($adbOutput |
+        ForEach-Object { $_.ToString() } |
         Where-Object { $_ -match '^\S+\s+device$' })
     $deviceLine = $deviceLines |
         Where-Object { $_ -match '^emulator-\d+\s+device$' } |

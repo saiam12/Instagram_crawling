@@ -3840,6 +3840,7 @@ async def run_collector(
             browser = shared_browser
             context = shared_context
         rate_limit_state = rate_limit_state_for_context(context)
+        rate_limit_state.raise_if_limited()
 
         async def ensure_follower_runtime() -> SequentialWebFollowerLookup:
             nonlocal follower_runtime
@@ -4573,7 +4574,7 @@ async def run_collectors_in_shared_context(
     *,
     external_stop_event: asyncio.Event | None = None,
 ) -> list[int]:
-    """Run independent output datasets concurrently in one logged-in browser context.
+    """Run output datasets sequentially in one logged-in browser context.
 
     A persistent Chromium profile can only be opened by one browser process.  Each
     collector therefore receives its own Reel and follower pages while sharing the
@@ -4614,7 +4615,8 @@ async def run_collectors_in_shared_context(
                 print(f"공유 브라우저 수집 실패 ({options.data_dir.name}): {error}", file=sys.stderr)
                 return 2
 
-        return list(await asyncio.gather(*(run_one(index, options) for index, options in enumerate(options_list))))
+        # Per-collector delays do not cap the combined load of parallel datasets.
+        return [await run_one(index, options) for index, options in enumerate(options_list)]
     finally:
         await safe_close(context)
         await safe_close(browser)

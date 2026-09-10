@@ -340,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
             rows, paths, android_summaries = asyncio.run(collect_hashtag_count_report(
                 hashtag_options.data_dir,
                 hashtags,
-                profile_dir=PROJECT_ROOT / ".instagram_browser_profile",
+                profile_dir=PROJECT_ROOT / ".instagram_chrome_profile",
                 adb_path=hashtag_options.android_adb_path,
                 device_id=hashtag_options.android_device_id,
                 ui_delay_seconds=hashtag_options.android_ui_delay_seconds,

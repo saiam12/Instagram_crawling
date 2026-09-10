@@ -224,6 +224,7 @@ class FollowerEnricher:
         self.last_lookup_at: dict[str, str] = {}
         self.queue: list[dict[str, Any]] = []
         self.queued: set[str] = set()
+        self.tracked: set[str] = set()
         self.active_tasks: set[asyncio.Task[None]] = set()
         self.stopped = False
         self.loaded = False
@@ -240,6 +241,7 @@ class FollowerEnricher:
             "completed": 0,
             "stopStatus": "",
             "stopError": "",
+            "failures": [],
         }
 
     async def ready(self) -> None:
@@ -282,6 +284,11 @@ class FollowerEnricher:
         row = self.user_id_index.get(user_id) if user_id else None
         if row is None and username:
             row = self.username_index.get(username.lower())
+        if row is not None and (
+            (user_id and row.get("user_id") and user_id != str(row["user_id"]))
+            or (username and row.get("username") and username.lower() != str(row["username"]).lower())
+        ):
+            raise ValueError("Conflicting Instagram user_id and username; author identity must be recollected.")
         if row is None:
             key = f"id:{user_id}" if user_id else f"username:{username.lower()}"
             row = {field: "" for field in self.user_fields}
@@ -370,7 +377,11 @@ class FollowerEnricher:
         normalized_username = str(username or "").strip().lstrip("@")
         if not normalized_id and not normalized_username:
             return None
-        row = self._find_or_create(normalized_id, normalized_username)
+        try:
+            row = self._find_or_create(normalized_id, normalized_username)
+        except ValueError:
+            return None
+        self.tracked.add(str(row["_key"]))
         if enqueue:
             self._enqueue(row)
         self._mark_dirty()
@@ -380,6 +391,17 @@ class FollowerEnricher:
     async def enqueue_all(self) -> int:
         await self.ready()
         count = sum(1 for row in list(self.users.values()) if self._enqueue(row))
+        self._mark_dirty()
+        return count
+
+    async def enqueue_tracked(self) -> int:
+        """Queue only users observed from Reels saved during this run."""
+        await self.ready()
+        count = sum(
+            1
+            for key in list(self.tracked)
+            if (row := self.users.get(key)) is not None and self._enqueue(row)
+        )
         self._mark_dirty()
         return count
 
@@ -418,7 +440,10 @@ class FollowerEnricher:
         normalized_username = str(username or "").strip().lstrip("@")
         if not normalized_id and not normalized_username:
             return {"status": "profile_unavailable", "error": "Missing Instagram user identity.", "follower_count": ""}
-        row = self._find_or_create(normalized_id, normalized_username)
+        try:
+            row = self._find_or_create(normalized_id, normalized_username)
+        except ValueError as error:
+            return {"status": "identity_mismatch", "error": str(error), "follower_count": "", "followerCount": None}
         self.stats["queued"] += 1
         result = await self._lookup_one(row)
         latest = latest_follower_snapshot(row, self.user_fields)
@@ -449,11 +474,20 @@ class FollowerEnricher:
             pass
         self._pump()
 
-    async def _lookup_one(self, row: dict[str, Any]) -> dict[str, Any]:
+    async def record_profile_result(self, user_id: str, username: str, result: dict[str, Any]) -> None:
+        """Persist a profile snapshot already read during a Reel visit."""
+        await self.ready()
+        row = self._find_or_create(user_id, username)
+        self.stats["queued"] += 1
+        await self._lookup_one(row, result)
+        await self._flush_users()
+
+    async def _lookup_one(self, row: dict[str, Any], result: dict[str, Any] | None = None) -> dict[str, Any]:
         key = str(row["_key"])
         label = self._next_collection_label(row)
         try:
-            result = await self.lookup_impl({"username": str(row.get("username", "")), "userId": str(row.get("user_id", ""))})
+            if result is None:
+                result = await self.lookup_impl({"username": str(row.get("username", "")), "userId": str(row.get("user_id", ""))})
         except Exception as error:
             result = {"status": "web_error", "error": str(error)[:500], "source": self.source}
         result = _validate_exact_follower_result(result)
@@ -486,6 +520,13 @@ class FollowerEnricher:
             self.stats["unavailable"] += 1
         else:
             self.stats["failed"] += 1
+        if status != "success":
+            self.stats["failures"].append({
+                "username": str(row.get("username", "")),
+                "status": status,
+                "error": row["last_error"],
+            })
+            self.stats["failures"] = self.stats["failures"][-50:]
         self.consecutive_web_errors = self.consecutive_web_errors + 1 if status == "web_error" else 0
         self.stats["completed"] += 1
         if self.on_progress:

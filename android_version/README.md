@@ -9,7 +9,7 @@ Android Studio 에뮬레이터에서 이미 로그인된 Instagram 앱의 **화�
 Android Studio의 에뮬레이터를 실행하고 Instagram 앱에서 먼저 로그인합니다. 이 폴더에서 전용 가상환경을 만듭니다.
 
 ```powershell
-cd C:\Instagram-crawling\android_emulator_version
+cd C:\Instagram-crawling\android_version
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
 ```
@@ -136,6 +136,30 @@ Android 화면 기반 방식에서는 숫자 `user_id`, 업로드 시각(시간 
 신규 수집 중복 판단은 정규화한 `username + caption + audio_name`의 화면 지문으로 합니다. URL이 새로 확보되어도 신규 수집에서는 기존 지문을 다시 저장하지 않습니다. 최신 수치가 필요하면 Android의 `refresh` 또는 `python_version`의 `refresh`를 사용하세요.
 
 `--checkpoint-items`, `--progress-offset`, `--manual`, `--start-url`, `--output-stem`, `--new-only`, `--background`도 지원합니다. 기본 UI 대기 상한은 0.4초이며, 빠른 에뮬레이터에서는 `--interval-seconds 0.25`를 사용해도 됩니다. `--background`는 브라우저를 숨기는 옵션이 아니라 이미 로그인된 Android 앱을 사용하는 호환 옵션입니다. Android `refresh`는 화면에 표시되는 값만 다시 읽고, `followers`, `--no-login`, `--followers-only`, `--max-upload-age-days` 등 브라우저 응답 전용 기능은 계속 지원하지 않습니다.
+
+## 429 원인 분석 로그
+
+`collect`, `feed`, `hashtag`, `refresh`, `fashion`, `beauty`, `fashion-beauty` 실행은 기존 `data_android` 결과와 별도로 다음 진단 파일을 만듭니다.
+
+```text
+data_android/
+├── logs/instagram_collector_YYYY-MM-DD_HHMMSS.log
+├── logs/instagram_events_YYYY-MM-DD_HHMMSS.jsonl
+└── diagnostics/rate_limit_YYYY-MM-DD_HHMMSS.json  # 제한 의심 최초 1회
+```
+
+사람용 로그에는 미디어별 시도·성공·실패 수, URL에서 확인된 shortcode, username, 단계 시작/성공/실패/timeout, ADB 화면 이동 명령과 소요시간, retry, 최근 1분·5분 처리량이 기록됩니다. JSONL에는 같은 이벤트를 분석 가능한 필드로 저장하며, 종료 시 터미널과 로그에 collector summary를 출력합니다. `--background`를 붙이면 모든 이벤트의 `run_mode`가 `background`, 생략하면 `foreground`입니다.
+
+이 버전은 Instagram 앱 화면을 ADB/UIAutomator로 읽을 뿐 HTTP 응답을 가로채지 않습니다. 따라서 네트워크 상태는 `NETWORK_STATUS_UNAVAILABLE`로 명시되고, 앱 화면의 `429`, `Too Many Requests`, `rate limit`, `잠시 후 다시 시도` 같은 문구만 확인되면 `RATE_LIMIT_SUSPECTED`로 기록됩니다. 실제 HTTP 응답을 관찰하지 못한 상태에서는 `HTTP_429_CONFIRMED`를 기록하지 않습니다. 최초 의심 시 snapshot에는 해당 시점의 미디어 수, 단계, UI 상태, retry 수, run mode가 저장됩니다.
+
+예:
+
+```powershell
+cd C:\Instagram-crawling\android_version
+.\.venv\Scripts\python.exe .\collect_android_reels.py feed --max-items 50 --data-dir .\data_android
+Get-Content .\data_android\logs\instagram_collector_*.log -Tail 80
+Get-Content .\data_android\logs\instagram_events_*.jsonl -Tail 20
+```
 
 ## 중단 및 확인이 필요한 경우
 

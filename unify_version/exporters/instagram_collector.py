@@ -157,6 +157,21 @@ class DataStore:
             ) from error
 
 
+def sync_combined_xlsx(data_dir: Path | str) -> Path | None:
+    """Refresh the workbook that combines hashtags, Reels, and users."""
+    destination = Path(data_dir).resolve()
+    store = DataStore(destination)
+    if not any((destination / f"{name}.csv").is_file() for name in XLSX_COMBINED_SHEET_NAMES):
+        return None
+    try:
+        store.sync_xlsx()
+        return store.workbook
+    except PermissionError:
+        updated = store.workbook.with_name(f"{store.workbook.stem}_updated{store.workbook.suffix}")
+        store.sync_xlsx(updated)
+        return updated
+
+
 def _xlsx_sheet_name(stem: str, used_names: set[str]) -> str:
     base = re.sub(r"[\\[\\]:*?/\\\\]", "_", stem)[:31] or "Sheet"
     candidate = base
@@ -350,8 +365,9 @@ def _xlsx_text(value: str) -> str:
 
 
 def _xlsx_base_field_name(field_name: str) -> str:
-    match = re.match(r"^(?:\d+(?:st|nd|rd|th) collect|\+\d+(?:Minute|Hour|Day|Weeks)(?:_\d+)?)_(.+)$", field_name)
-    return match.group(1) if match else field_name
+    internal_name = field_name.removesuffix("_xlsx_only")
+    match = re.match(r"^(?:\d+(?:st|nd|rd|th) collect|\+\d+(?:Minute|Hour|Day|Weeks)(?:_\d+)?)_(.+)$", internal_name)
+    return match.group(1) if match else internal_name
 
 
 def _xlsx_elapsed_field_name(collected_at_field: str) -> str:
@@ -440,6 +456,8 @@ def _xlsx_cell(reference: str, value: str, field_name: str, is_header: bool) -> 
         return f'<c r="{reference}" s="9"><v>{value.strip()}</v></c>'
     if not is_header and base_field in XLSX_NUMERIC_FIELDS and re.fullmatch(r"-?(?:0|[1-9]\d*)(?:\.\d+)?", value.strip()):
         return f'<c r="{reference}" s="4"><v>{value.strip()}</v></c>'
+    if not is_header and base_field in XLSX_NUMERIC_FIELDS and value.strip().casefold() == "x":
+        return f'<c r="{reference}" s="10" t="inlineStr">{_xlsx_text(value)}</c>'
     style = ' s="1"' if is_header else (' s="3"' if base_field in XLSX_TEXT_IDENTIFIER_FIELDS else "")
     return f'<c r="{reference}"{style} t="inlineStr">{_xlsx_text(value)}</c>'
 
@@ -541,7 +559,7 @@ def write_xlsx_workbook(destination: Path, sheets: list[tuple[str, list[list[str
                 '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF0F766E"/><bgColor indexed="64"/></patternFill></fill></fills>'
                 '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
                 '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
-                '<cellXfs count="10"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="169" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="170" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="2" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="171" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+                '<cellXfs count="11"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFill="1" applyFont="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="168" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="169" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="170" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="2" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="171" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment horizontal="right" vertical="center"/></xf></cellXfs>'
                 '</styleSheet>',
             )
             for index, (_, rows) in enumerate(sheets, start=1):

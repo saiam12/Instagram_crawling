@@ -7,11 +7,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
+from .diagnostics import CollectorDiagnostics
 from .driver import AndroidDriver
 from .models import AccessBlockedError, CollectorError, LayoutUnrecognisedError, ObservedProfile, ObservedReel
 from .store import CollectionStore, read_reel_urls_from_xlsx, reel_url_identity
 from .ui_parser import (
     detect_access_block,
+    detect_rate_limit_signal,
     has_visible_label,
     is_comments_panel,
     is_likes_and_plays_panel,
@@ -78,6 +80,7 @@ class CollectorOptions:
     verbose_progress: bool = False
     capture_screenshots: bool = True
     reuse_profiles_within_run: bool = False
+    diagnostics: CollectorDiagnostics | None = None
 
 
 def utc_now_iso() -> str:
@@ -88,16 +91,91 @@ def hashtag_page_url(hashtag: str) -> str:
     return f"https://www.instagram.com/explore/tags/{quote(hashtag.lstrip('#'), safe='')}/"
 
 
-def _raise_for_access_block(xml: str) -> None:
+def _raise_for_access_block(xml: str, diagnostics: CollectorDiagnostics | None = None) -> None:
     blocked = detect_access_block(xml)
     if blocked:
+        if blocked == "rate_limited" and diagnostics is not None:
+            diagnostics.rate_limit_suspected(detect_rate_limit_signal(xml) or "rate-limit UI signal")
         raise AccessBlockedError(blocked)
 
 
-def preflight(driver: AndroidDriver) -> None:
+def preflight(driver: AndroidDriver, diagnostics: CollectorDiagnostics | None = None) -> None:
     """Verify the selected app is usable without attempting to authenticate."""
-    driver.ensure_ready()
-    _raise_for_access_block(driver.dump_ui())
+    if diagnostics is not None:
+        diagnostics.stage_start("PREFLIGHT")
+    try:
+        driver.ensure_ready()
+        _raise_for_access_block(driver.dump_ui(), diagnostics)
+    except CollectorError as error:
+        if diagnostics is not None:
+            diagnostics.stage_failed("PREFLIGHT", reason=type(error).__name__, error=str(error))
+        raise
+    if diagnostics is not None:
+        diagnostics.stage_success("PREFLIGHT")
+
+
+def _stage_start(options: CollectorOptions, stage: str, **values: object) -> None:
+    if options.diagnostics is not None:
+        options.diagnostics.stage_start(stage, **values)
+
+
+def _stage_success(options: CollectorOptions, stage: str, **values: object) -> None:
+    if options.diagnostics is not None:
+        options.diagnostics.stage_success(stage, **values)
+
+
+def _stage_failed(options: CollectorOptions, stage: str, reason: str, **values: object) -> None:
+    if options.diagnostics is not None:
+        options.diagnostics.stage_failed(stage, reason=reason, **values)
+
+
+def _stage_timeout(options: CollectorOptions, stage: str, **values: object) -> None:
+    if options.diagnostics is not None:
+        options.diagnostics.stage_timeout(stage, **values)
+
+
+def _retry(
+    options: CollectorOptions,
+    *,
+    stage: str,
+    target: str,
+    attempt: int,
+    total: int,
+    reason: str,
+    previous_wait: float,
+) -> None:
+    if options.diagnostics is not None and attempt > 0:
+        options.diagnostics.record_retry(
+            stage=stage,
+            target=target,
+            attempt=attempt + 1,
+            total=total,
+            reason=reason,
+            previous_wait=previous_wait,
+        )
+
+
+def _update_media_diagnostics(options: CollectorOptions, observed: ObservedReel, *, stage: str | None = None) -> None:
+    if options.diagnostics is None:
+        return
+    options.diagnostics.update_media(
+        current_url=observed.reel_url or options.reel_url,
+        username=observed.username,
+        stage=stage,
+    )
+
+
+def _metadata_state(options: CollectorOptions, observed: ObservedReel) -> None:
+    if options.diagnostics is None:
+        return
+    missing = [
+        key for key in ("like_count", "view_count", "comment_count", "repost_count", "share_count")
+        if observed.metrics.get(key) is None
+    ]
+    if missing:
+        options.diagnostics.ui_event("METADATA_MISSING", fields=",".join(missing))
+    else:
+        options.diagnostics.ui_event("METADATA_RENDER_OK")
 
 
 def _reopen_reel_from_hashtag_grid(
@@ -108,12 +186,25 @@ def _reopen_reel_from_hashtag_grid(
     """Return a Reel XML after a profile back-navigation lands on a tag grid."""
     if options.source_mode != "hashtag":
         return ""
+    _stage_start(options, "OPEN_REEL", source="hashtag_grid")
     if not driver.tap_resource_id(HASHTAG_GRID_REEL_RESOURCE_IDS, ui_xml=grid_xml):
+        _stage_failed(options, "OPEN_REEL", "ELEMENT_LOOKUP_FAILED", target="hashtag_grid_reel")
         return ""
+    _stage_success(options, "OPEN_REEL", source="hashtag_grid")
+    _stage_start(options, "WAIT_FOR_RENDER", target="reel")
     for attempt in range(_REEL_READY_ATTEMPTS):
+        _retry(
+            options,
+            stage="WAIT_FOR_RENDER",
+            target="reopened_reel",
+            attempt=attempt,
+            total=_REEL_READY_ATTEMPTS,
+            reason="ELEMENT_TIMEOUT",
+            previous_wait=0.45 if attempt == 0 else 0.2,
+        )
         _ui_pause(options, 0.45 if attempt == 0 else 0.2)
         reel_xml = driver.dump_ui()
-        _raise_for_access_block(reel_xml)
+        _raise_for_access_block(reel_xml, options.diagnostics)
         reopened = parse_visible_reel(
             reel_xml,
             source_mode=options.source_mode,
@@ -122,7 +213,11 @@ def _reopen_reel_from_hashtag_grid(
             collected_at=utc_now_iso(),
         )
         if reopened.username:
+            _stage_success(options, "WAIT_FOR_RENDER", target="reopened_reel")
+            if options.diagnostics is not None:
+                options.diagnostics.ui_event("MEDIA_RENDER_OK", surface="reopened_reel")
             return reel_xml
+    _stage_timeout(options, "WAIT_FOR_RENDER", target="reopened_reel")
     return ""
 
 
@@ -133,30 +228,57 @@ def _capture_account_country(
     profile_xml: str,
 ) -> ObservedProfile:
     """Read a public account country through the profile's About menu."""
+    _stage_start(options, "OPEN_PROFILE_MENU")
     if not driver.tap_text(PROFILE_OPTIONS_LABELS, ui_xml=profile_xml):
+        _stage_failed(options, "OPEN_PROFILE_MENU", "ELEMENT_LOOKUP_FAILED", target="profile_options")
         return profile
+    _stage_success(options, "OPEN_PROFILE_MENU")
 
     menu_xml = ""
     menu_opened = False
     about_opened = False
     try:
+        _stage_start(options, "OPEN_ABOUT_ACCOUNT")
         for attempt in range(_PROFILE_READY_ATTEMPTS):
+            _retry(
+                options,
+                stage="OPEN_ABOUT_ACCOUNT",
+                target="about_account",
+                attempt=attempt,
+                total=_PROFILE_READY_ATTEMPTS,
+                reason="ELEMENT_TIMEOUT",
+                previous_wait=0.35 if attempt == 0 else 0.18,
+            )
             _ui_pause(options, 0.35 if attempt == 0 else 0.18)
             menu_xml = driver.dump_ui()
-            _raise_for_access_block(menu_xml)
+            _raise_for_access_block(menu_xml, options.diagnostics)
             menu_opened = has_visible_label(menu_xml, ABOUT_ACCOUNT_LABELS)
             if menu_opened and driver.tap_text(ABOUT_ACCOUNT_LABELS, ui_xml=menu_xml):
                 about_opened = True
+                _stage_success(options, "OPEN_ABOUT_ACCOUNT")
                 break
         if not about_opened:
+            _stage_timeout(options, "OPEN_ABOUT_ACCOUNT", target="about_account")
             return profile
+        _stage_start(options, "READ_ACCOUNT_COUNTRY")
         for attempt in range(_PROFILE_READY_ATTEMPTS):
+            _retry(
+                options,
+                stage="READ_ACCOUNT_COUNTRY",
+                target="account_country",
+                attempt=attempt,
+                total=_PROFILE_READY_ATTEMPTS,
+                reason="ELEMENT_TIMEOUT",
+                previous_wait=0.4 if attempt == 0 else 0.18,
+            )
             _ui_pause(options, 0.4 if attempt == 0 else 0.18)
             about_xml = driver.dump_ui()
-            _raise_for_access_block(about_xml)
+            _raise_for_access_block(about_xml, options.diagnostics)
             country = parse_account_country(about_xml)
             if country:
+                _stage_success(options, "READ_ACCOUNT_COUNTRY")
                 return replace(profile, account_country=country)
+        _stage_failed(options, "READ_ACCOUNT_COUNTRY", "METADATA_MISSING", fields="account_country")
         return profile
     finally:
         # Instagram's Android builds do not all use the same back stack here.
@@ -171,7 +293,7 @@ def _capture_account_country(
             driver.press_back()  # About this account -> profile or options
             _ui_pause(options, 0.25)
             returned_xml = driver.dump_ui()
-            _raise_for_access_block(returned_xml)
+            _raise_for_access_block(returned_xml, options.diagnostics)
             menu_needs_back = has_visible_label(returned_xml, ABOUT_ACCOUNT_LABELS)
         if menu_needs_back:
             driver.press_back()  # profile options -> profile
@@ -185,23 +307,39 @@ def _capture_author_profile(
     reel_xml: str,
 ) -> tuple[ObservedReel, str]:
     """Open the visible author profile, read public fields, and return to the Reel."""
+    _stage_start(options, "OPEN_PROFILE")
     if not driver.tap_resource_id(AUTHOR_RESOURCE_IDS, ui_xml=reel_xml):
+        _stage_failed(options, "OPEN_PROFILE", "ELEMENT_LOOKUP_FAILED", target="author_username")
         return observed, reel_xml
 
     profile_xml = ""
     profile_detected = False
     try:
         for attempt in range(_PROFILE_READY_ATTEMPTS):
+            _retry(
+                options,
+                stage="OPEN_PROFILE",
+                target="author_profile",
+                attempt=attempt,
+                total=_PROFILE_READY_ATTEMPTS,
+                reason="ELEMENT_TIMEOUT",
+                previous_wait=0.45 if attempt == 0 else 0.2,
+            )
             _ui_pause(options, 0.45 if attempt == 0 else 0.2)
             profile_xml = driver.dump_ui()
-            _raise_for_access_block(profile_xml)
+            _raise_for_access_block(profile_xml, options.diagnostics)
             if not is_profile_screen(profile_xml):
                 continue
             profile_detected = True
+            _stage_success(options, "OPEN_PROFILE")
+            _stage_start(options, "READ_PROFILE")
             profile = parse_visible_profile(profile_xml, expected_username=observed.username)
             observed = observed.with_profile(
                 _capture_account_country(options, driver, profile, profile_xml)
             )
+            _stage_success(options, "READ_PROFILE", username=observed.username)
+            if options.diagnostics is not None:
+                options.diagnostics.ui_event("PROFILE_RENDER_OK", username=observed.username)
             break
     finally:
         # The author control is a navigation action.  Always restore the Reel
@@ -221,9 +359,10 @@ def _capture_author_profile(
             _ui_pause(options, 0.25)
 
     if not profile_detected:
+        _stage_timeout(options, "OPEN_PROFILE", target="author_profile")
         return observed, reel_xml
     restored_xml = driver.dump_ui()
-    _raise_for_access_block(restored_xml)
+    _raise_for_access_block(restored_xml, options.diagnostics)
     restored = parse_visible_reel(
         restored_xml,
         source_mode=options.source_mode,
@@ -256,16 +395,31 @@ def _capture_likes_and_plays(
     restored.  Opening this sheet first keeps the exact view-count path
     reliable, then returns a fresh Reel XML for the profile navigation.
     """
+    _stage_start(options, "READ_LIKE_COUNT")
+    _stage_start(options, "READ_PLAY_COUNT")
     if not driver.tap_text(LIKE_DETAILS_TRIGGER_LABELS, ui_xml=reel_xml):
+        _stage_failed(options, "READ_LIKE_COUNT", "ELEMENT_LOOKUP_FAILED", target="likes_and_plays_panel")
+        _stage_failed(options, "READ_PLAY_COUNT", "ELEMENT_LOOKUP_FAILED", target="likes_and_plays_panel")
         return observed, reel_xml
 
     panel_xml = ""
     panel_detected = False
+    panel_metrics_read = False
+    _stage_start(options, "WAIT_FOR_RENDER", target="likes_and_plays_panel")
     try:
         for attempt in range(_DETAIL_PANEL_ATTEMPTS):
+            _retry(
+                options,
+                stage="WAIT_FOR_RENDER",
+                target="likes_and_plays_panel",
+                attempt=attempt,
+                total=_DETAIL_PANEL_ATTEMPTS,
+                reason="ELEMENT_TIMEOUT",
+                previous_wait=0.45 if attempt == 0 else 0.2,
+            )
             _ui_pause(options, 0.45 if attempt == 0 else 0.2)
             panel_xml = driver.dump_ui()
-            _raise_for_access_block(panel_xml)
+            _raise_for_access_block(panel_xml, options.diagnostics)
             if not is_likes_and_plays_panel(panel_xml):
                 continue
             panel_detected = True
@@ -302,6 +456,7 @@ def _capture_likes_and_plays(
                     else observed.like_count_is_private
                 ),
             )
+            panel_metrics_read = True
             break
     finally:
         # If the sheet is still loading, it has no author and the old code
@@ -321,9 +476,25 @@ def _capture_likes_and_plays(
             _ui_pause(options, 0.25)
 
     if not panel_detected:
+        _stage_timeout(options, "WAIT_FOR_RENDER", target="likes_and_plays_panel")
+        _stage_timeout(options, "READ_LIKE_COUNT", target="likes_and_plays_panel")
+        _stage_timeout(options, "READ_PLAY_COUNT", target="likes_and_plays_panel")
         return observed, reel_xml
+    _stage_success(options, "WAIT_FOR_RENDER", target="likes_and_plays_panel")
+    if panel_metrics_read:
+        if observed.metrics.get("like_count") is not None or observed.like_count_is_private is not None:
+            _stage_success(options, "READ_LIKE_COUNT", value_state="private" if observed.like_count_is_private else "collected")
+        else:
+            _stage_failed(options, "READ_LIKE_COUNT", "METADATA_MISSING", fields="like_count")
+        if observed.metrics.get("view_count") is not None:
+            _stage_success(options, "READ_PLAY_COUNT")
+        else:
+            _stage_failed(options, "READ_PLAY_COUNT", "METADATA_MISSING", fields="view_count")
+    else:
+        _stage_timeout(options, "READ_LIKE_COUNT", target="likes_and_plays_metrics")
+        _stage_timeout(options, "READ_PLAY_COUNT", target="likes_and_plays_metrics")
     restored_xml = driver.dump_ui()
-    _raise_for_access_block(restored_xml)
+    _raise_for_access_block(restored_xml, options.diagnostics)
     restored = parse_visible_reel(
         restored_xml,
         source_mode=options.source_mode,
@@ -347,19 +518,33 @@ def _capture_comment_count(
     reel_xml: str,
 ) -> tuple[ObservedReel, str]:
     """Resolve a missing comment count as zero, disabled/limited, or unknown."""
+    _stage_start(options, "READ_COMMENT_COUNT")
     if observed.metrics.get("comment_count") is not None:
+        _stage_success(options, "READ_COMMENT_COUNT", source="reel_surface")
         return observed, reel_xml
     tapped = driver.tap_resource_id(COMMENT_DETAILS_TRIGGER_RESOURCE_IDS, ui_xml=reel_xml)
     if not tapped and not driver.tap_text(COMMENT_DETAILS_TRIGGER_LABELS, ui_xml=reel_xml):
+        _stage_failed(options, "READ_COMMENT_COUNT", "ELEMENT_LOOKUP_FAILED", target="comments_panel")
         return observed, reel_xml
 
     panel_xml = ""
     panel_detected = False
+    panel_metrics_read = False
+    _stage_start(options, "WAIT_FOR_RENDER", target="comments_panel")
     try:
         for attempt in range(_DETAIL_PANEL_ATTEMPTS):
+            _retry(
+                options,
+                stage="WAIT_FOR_RENDER",
+                target="comments_panel",
+                attempt=attempt,
+                total=_DETAIL_PANEL_ATTEMPTS,
+                reason="ELEMENT_TIMEOUT",
+                previous_wait=0.45 if attempt == 0 else 0.2,
+            )
             _ui_pause(options, 0.45 if attempt == 0 else 0.2)
             panel_xml = driver.dump_ui()
-            _raise_for_access_block(panel_xml)
+            _raise_for_access_block(panel_xml, options.diagnostics)
             panel = parse_visible_reel(
                 panel_xml,
                 source_mode=options.source_mode,
@@ -375,6 +560,7 @@ def _capture_comment_count(
                 metrics={**observed.metrics, **panel.metrics},
                 visible_metrics={**observed.visible_metrics, **panel.visible_metrics},
             )
+            panel_metrics_read = True
             break
     finally:
         if panel_detected:
@@ -382,9 +568,16 @@ def _capture_comment_count(
             _ui_pause(options, 0.25)
 
     if not panel_detected:
+        _stage_timeout(options, "WAIT_FOR_RENDER", target="comments_panel")
+        _stage_timeout(options, "READ_COMMENT_COUNT", target="comments_panel")
         return observed, reel_xml
+    _stage_success(options, "WAIT_FOR_RENDER", target="comments_panel")
+    if panel_metrics_read:
+        _stage_success(options, "READ_COMMENT_COUNT", value_state="collected_or_explicitly_unavailable")
+    else:
+        _stage_failed(options, "READ_COMMENT_COUNT", "METADATA_MISSING", fields="comment_count")
     restored_xml = driver.dump_ui()
-    _raise_for_access_block(restored_xml)
+    _raise_for_access_block(restored_xml, options.diagnostics)
     restored = parse_visible_reel(
         restored_xml,
         source_mode=options.source_mode,
@@ -410,22 +603,36 @@ def _capture_caption_upload_date(
     caption component is tapped.  We deliberately store only an ISO calendar
     date because Instagram does not show a posting time there.
     """
+    _stage_start(options, "READ_CAPTION")
     if not driver.tap_resource_id(CAPTION_RESOURCE_IDS, ui_xml=reel_xml):
+        _stage_failed(options, "READ_CAPTION", "ELEMENT_LOOKUP_FAILED", target="caption_component")
         return observed, reel_xml
 
     caption_xml = ""
     detail_opened = False
+    uploaded_at_read = False
+    _stage_start(options, "WAIT_FOR_RENDER", target="caption_detail")
     try:
         for attempt in range(_DETAIL_PANEL_ATTEMPTS):
+            _retry(
+                options,
+                stage="WAIT_FOR_RENDER",
+                target="caption_detail",
+                attempt=attempt,
+                total=_DETAIL_PANEL_ATTEMPTS,
+                reason="ELEMENT_TIMEOUT",
+                previous_wait=0.4 if attempt == 0 else 0.18,
+            )
             _ui_pause(options, 0.4 if attempt == 0 else 0.18)
             caption_xml = driver.dump_ui()
-            _raise_for_access_block(caption_xml)
+            _raise_for_access_block(caption_xml, options.diagnostics)
             # A changed hierarchy indicates the tap opened the caption surface,
             # even if an unusual app language prevents date parsing below.
             detail_opened = detail_opened or caption_xml != reel_xml
             uploaded_at = parse_uploaded_at(caption_xml, collected_at=observed.collected_at)
             if uploaded_at:
                 observed = replace(observed, uploaded_at=uploaded_at)
+                uploaded_at_read = True
                 break
     finally:
         if detail_opened:
@@ -433,9 +640,16 @@ def _capture_caption_upload_date(
             _ui_pause(options, 0.25)
 
     if not detail_opened:
+        _stage_timeout(options, "WAIT_FOR_RENDER", target="caption_detail")
+        _stage_timeout(options, "READ_CAPTION", target="caption_detail")
         return observed, reel_xml
+    _stage_success(options, "WAIT_FOR_RENDER", target="caption_detail")
+    if uploaded_at_read:
+        _stage_success(options, "READ_CAPTION")
+    else:
+        _stage_failed(options, "READ_CAPTION", "METADATA_MISSING", fields="uploaded_at")
     restored_xml = driver.dump_ui()
-    _raise_for_access_block(restored_xml)
+    _raise_for_access_block(restored_xml, options.diagnostics)
     restored = parse_visible_reel(
         restored_xml,
         source_mode=options.source_mode,
@@ -471,19 +685,34 @@ def _capture_reel_url(
     reel_xml: str,
 ) -> tuple[ObservedReel, str]:
     """Use Instagram's visible Share -> Copy link controls to save a Reel URL."""
-    if observed.reel_url or not callable(getattr(driver, "read_clipboard", None)):
+    _stage_start(options, "READ_REEL_URL")
+    if observed.reel_url:
+        _stage_success(options, "READ_REEL_URL", source="input_url")
+        return observed, reel_xml
+    if not callable(getattr(driver, "read_clipboard", None)):
+        _stage_failed(options, "READ_REEL_URL", "ELEMENT_LOOKUP_FAILED", target="clipboard_reader")
         return observed, reel_xml
     opened = driver.tap_resource_id(SHARE_TRIGGER_RESOURCE_IDS, ui_xml=reel_xml)
     if not opened and not driver.tap_text(SHARE_TRIGGER_LABELS, ui_xml=reel_xml):
+        _stage_failed(options, "READ_REEL_URL", "ELEMENT_LOOKUP_FAILED", target="share_button")
         return observed, reel_xml
 
     share_xml = ""
     copy_tapped = False
     share_panel_seen = False
     for attempt in range(_DETAIL_PANEL_ATTEMPTS):
+        _retry(
+            options,
+            stage="READ_REEL_URL",
+            target="share_panel_copy_link",
+            attempt=attempt,
+            total=_DETAIL_PANEL_ATTEMPTS,
+            reason="ELEMENT_TIMEOUT",
+            previous_wait=0.3 if attempt == 0 else 0.15,
+        )
         _ui_pause(options, 0.3 if attempt == 0 else 0.15)
         share_xml = driver.dump_ui()
-        _raise_for_access_block(share_xml)
+        _raise_for_access_block(share_xml, options.diagnostics)
         share_panel_seen = share_panel_seen or has_visible_label(share_xml, COPY_LINK_LABELS)
         copy_tapped = driver.tap_resource_id(COPY_LINK_RESOURCE_IDS, ui_xml=share_xml)
         if not copy_tapped:
@@ -500,7 +729,14 @@ def _capture_reel_url(
             copied_url = ""
         if copied_url:
             observed = replace(observed, reel_url=copied_url)
+            _update_media_diagnostics(options, observed, stage="READ_REEL_URL")
+            _stage_success(options, "READ_REEL_URL", source="share_copy_link")
+        else:
+            _stage_failed(options, "READ_REEL_URL", "METADATA_MISSING", fields="reel_url")
         break
+
+    if not copy_tapped:
+        _stage_timeout(options, "READ_REEL_URL", target="share_panel_copy_link")
 
     # Copy link normally leaves its share sheet open.  Check the concrete
     # screen first so versions that close it automatically are not navigated
@@ -509,12 +745,12 @@ def _capture_reel_url(
         return observed, reel_xml
     _ui_pause(options, 0.15)
     restored_xml = driver.dump_ui()
-    _raise_for_access_block(restored_xml)
+    _raise_for_access_block(restored_xml, options.diagnostics)
     if has_visible_label(restored_xml, COPY_LINK_LABELS):
         driver.press_back()
         _ui_pause(options, 0.25)
         restored_xml = driver.dump_ui()
-        _raise_for_access_block(restored_xml)
+        _raise_for_access_block(restored_xml, options.diagnostics)
     restored = parse_visible_reel(
         restored_xml,
         source_mode=options.source_mode,
@@ -538,9 +774,21 @@ def capture_current_reel(
 ) -> ObservedReel:
     observed: ObservedReel | None = None
     xml = ""
+    _stage_start(options, "OPEN_REEL", source=options.source_mode)
+    _stage_start(options, "WAIT_FOR_RENDER", target="reel")
+    _stage_start(options, "READ_USERNAME")
     for attempt in range(_REEL_READY_ATTEMPTS):
+        _retry(
+            options,
+            stage="WAIT_FOR_RENDER",
+            target="reel",
+            attempt=attempt,
+            total=_REEL_READY_ATTEMPTS,
+            reason="ELEMENT_TIMEOUT",
+            previous_wait=0.25,
+        )
         xml = driver.dump_ui()
-        _raise_for_access_block(xml)
+        _raise_for_access_block(xml, options.diagnostics)
         candidate = parse_visible_reel(
             xml,
             source_mode=options.source_mode,
@@ -550,10 +798,25 @@ def capture_current_reel(
         )
         if candidate.username:
             observed = candidate
+            _stage_success(options, "READ_USERNAME", username=observed.username)
+            _update_media_diagnostics(options, observed, stage="WAIT_FOR_RENDER")
+            _stage_success(options, "WAIT_FOR_RENDER", target="reel")
+            _stage_success(options, "OPEN_REEL", source=options.source_mode)
+            if options.diagnostics is not None:
+                options.diagnostics.ui_event("MEDIA_RENDER_OK", username=observed.username)
+                options.diagnostics.ui_event(
+                    "VIDEO_RENDER_STATUS_UNAVAILABLE",
+                    reason="UIAutomator exposes the Reel surface but not reliable video playback state.",
+                )
             break
         if attempt < _REEL_READY_ATTEMPTS - 1:
             _ui_pause(options, 0.25)
     if observed is None:
+        _stage_timeout(options, "READ_USERNAME", target="reel_author")
+        _stage_timeout(options, "WAIT_FOR_RENDER", target="reel")
+        _stage_failed(options, "OPEN_REEL", "UI_RENDER_FAILED", target="reel")
+        if options.diagnostics is not None:
+            options.diagnostics.ui_event("UI_RENDER_FAILED", target="reel")
         raise LayoutUnrecognisedError(
             "The current screen did not expose a Reel author after waiting; it was not saved."
         )
@@ -563,6 +826,13 @@ def capture_current_reel(
     # never re-collected as a side effect of the duplicate check.
     if known_fingerprints is not None and observed.reel_fingerprint in known_fingerprints:
         return observed
+
+    for stage, metric_key in (("READ_REPOST_COUNT", "repost_count"), ("READ_SHARE_COUNT", "share_count")):
+        _stage_start(options, stage)
+        if observed.metrics.get(metric_key) is not None:
+            _stage_success(options, stage)
+        else:
+            _stage_failed(options, stage, "METADATA_MISSING", fields=metric_key)
 
     # Reuse the just-read bounds.  Saving a screenshot before tapping can take
     # long enough for Instagram to fade the side rail, leaving no way to open
@@ -580,10 +850,15 @@ def capture_current_reel(
         # profile navigation, country-menu navigation, and several UI dumps
         # without dropping any exported field from later Reels by that author.
         observed = observed.with_profile(replace(cached_profile, username=observed.username))
+        _stage_start(options, "READ_PROFILE", source="profile_cache")
+        _stage_success(options, "READ_PROFILE", source="profile_cache", username=observed.username)
+        if options.diagnostics is not None:
+            options.diagnostics.ui_event("PROFILE_RENDER_OK", source="profile_cache", username=observed.username)
     else:
         observed, _ = _capture_author_profile(options, driver, observed, reel_xml)
         if profile_cache is not None and profile_key:
             profile_cache[profile_key] = observed.profile
+    _metadata_state(options, observed)
     # The screenshot is deliberately captured after returning from the sheet;
     # it still represents the same current Reel while retaining the original,
     # pre-tap XML as its evidence.
@@ -778,6 +1053,8 @@ def _collect_scrolling_surface(
     while stored < limit:
         if options.manual:
             input("Press Enter to capture the current Reel: ")
+        if options.diagnostics is not None:
+            options.diagnostics.begin_media()
         try:
             observed = capture_current_reel(
                 options,
@@ -787,6 +1064,8 @@ def _collect_scrolling_surface(
                 profile_cache=profile_cache,
             )
         except LayoutUnrecognisedError as error:
+            if options.diagnostics is not None:
+                options.diagnostics.finish_media("FAILED", success=False, error=str(error))
             # A back navigation can occasionally leave the app on the
             # hashtag-results grid.  It contains Reel cards but no visible
             # author node, so recover by opening a card instead of repeatedly
@@ -806,8 +1085,20 @@ def _collect_scrolling_surface(
             driver.swipe_up()
             _pause(options.delay_seconds)
             continue
+        except CollectorError as error:
+            if options.diagnostics is not None:
+                options.diagnostics.finish_media("FAILED", success=False, error=str(error))
+            raise
         skipped_loading_screens = 0
         if observed.reel_fingerprint in seen:
+            _update_media_diagnostics(options, observed)
+            if options.diagnostics is not None:
+                options.diagnostics.finish_media(
+                    "SKIPPED",
+                    success=False,
+                    error="already_saved",
+                    count_as_failure=False,
+                )
             consecutive_known_reels += 1
             if consecutive_known_reels >= known_skip_limit:
                 print(
@@ -822,13 +1113,25 @@ def _collect_scrolling_surface(
                 f"({consecutive_known_reels}/{known_skip_limit}).",
                 flush=True,
             )
+            _stage_start(options, "SCROLL_NEXT")
             driver.swipe_up()
+            _stage_success(options, "SCROLL_NEXT")
             _pause(options.delay_seconds)
             continue
         consecutive_known_reels = 0
         seen.add(observed.reel_fingerprint)
-        store.append(observed)
+        _stage_start(options, "SAVE_RESULT")
+        try:
+            store.append(observed)
+        except Exception as error:
+            _stage_failed(options, "SAVE_RESULT", type(error).__name__, error=str(error))
+            if options.diagnostics is not None:
+                options.diagnostics.finish_media("FAILED", success=False, error=str(error))
+            raise
+        _stage_success(options, "SAVE_RESULT")
         stored += 1
+        if options.diagnostics is not None:
+            options.diagnostics.finish_media("SUCCESS", success=True)
         _print_progress(
             progress_start + stored,
             progress_total or limit,
@@ -838,19 +1141,27 @@ def _collect_scrolling_surface(
         if stored % options.checkpoint_items == 0:
             store.export()
         if stored < limit:
+            _stage_start(options, "SCROLL_NEXT")
             driver.swipe_up()
+            _stage_success(options, "SCROLL_NEXT")
             _pause(options.delay_seconds)
     return stored
 
 
 def run_feed(options: CollectorOptions, driver: AndroidDriver, store: CollectionStore) -> int:
-    preflight(driver)
+    preflight(driver, options.diagnostics)
     if options.start_url:
+        _stage_start(options, "OPEN_REEL", source="start_url")
         driver.open_instagram_url(options.start_url)
+        _stage_success(options, "OPEN_REEL", source="start_url")
         _pause(options.delay_seconds)
     else:
+        _stage_start(options, "OPEN_REELS_TAB")
         driver.launch_instagram()
-        driver.tap_text(REELS_LABELS)
+        if driver.tap_text(REELS_LABELS):
+            _stage_success(options, "OPEN_REELS_TAB")
+        else:
+            _stage_failed(options, "OPEN_REELS_TAB", "ELEMENT_LOOKUP_FAILED", target="reels_tab")
     stored = _collect_scrolling_surface(
         replace(options, source_mode="feed"),
         driver,
@@ -866,18 +1177,23 @@ def run_feed(options: CollectorOptions, driver: AndroidDriver, store: Collection
 def run_hashtag(options: CollectorOptions, driver: AndroidDriver, store: CollectionStore) -> int:
     if not options.hashtags:
         raise ValueError("At least one hashtag is required.")
-    preflight(driver)
+    preflight(driver, options.diagnostics)
     stored = 0
     remaining_queries = len(options.hashtags)
     for hashtag in options.hashtags:
         if stored >= options.max_items:
             break
+        _stage_start(options, "OPEN_REELS_TAB", source="hashtag", hashtag=hashtag)
         driver.open_instagram_url(hashtag_page_url(hashtag))
+        _stage_success(options, "OPEN_REELS_TAB", source="hashtag", hashtag=hashtag)
         _pause(options.delay_seconds)
+        _stage_start(options, "OPEN_REEL", source="hashtag", hashtag=hashtag)
         if not driver.tap_text(REEL_CARD_LABELS):
+            _stage_failed(options, "OPEN_REEL", "ELEMENT_LOOKUP_FAILED", target="reel_card")
             print(f"No Reel card was visible for hashtag #{hashtag}; trying the next hashtag.", flush=True)
             remaining_queries -= 1
             continue
+        _stage_success(options, "OPEN_REEL", source="hashtag", hashtag=hashtag)
         _pause(options.delay_seconds)
         per_query_limit = max(1, (options.max_items - stored + remaining_queries - 1) // remaining_queries)
         stored += _collect_scrolling_surface(
@@ -927,12 +1243,23 @@ def run_refresh(options: CollectorOptions, driver: AndroidDriver, store: Collect
             "No Instagram Reel URLs were found. Existing rows without a URL cannot be refreshed by Android."
         )
 
-    preflight(driver)
+    preflight(driver, options.diagnostics)
     refreshed = 0
     skipped = 0
     profile_cache: dict[str, ObservedProfile] | None = {} if options.reuse_profiles_within_run else None
     for position, url in enumerate(targets, start=1):
-        driver.open_instagram_url(url)
+        if options.diagnostics is not None:
+            options.diagnostics.begin_media()
+            options.diagnostics.update_media(current_url=url, stage="OPEN_REEL")
+        _stage_start(options, "OPEN_REEL", source="refresh", position=position)
+        try:
+            driver.open_instagram_url(url)
+        except CollectorError as error:
+            _stage_failed(options, "OPEN_REEL", type(error).__name__, error=str(error))
+            if options.diagnostics is not None:
+                options.diagnostics.finish_media("FAILED", success=False, error=str(error))
+            raise
+        _stage_success(options, "OPEN_REEL", source="refresh", position=position)
         _pause(options.delay_seconds)
         refresh_options = replace(
             options,
@@ -949,10 +1276,20 @@ def run_refresh(options: CollectorOptions, driver: AndroidDriver, store: Collect
             )
         except LayoutUnrecognisedError as error:
             skipped += 1
+            if options.diagnostics is not None:
+                options.diagnostics.finish_media("FAILED", success=False, error=str(error))
             print(f"Skipped refresh URL {position}/{len(targets)}: {error}", flush=True)
             continue
+        except CollectorError as error:
+            if options.diagnostics is not None:
+                options.diagnostics.finish_media("FAILED", success=False, error=str(error))
+            raise
         observed = store.preserve_refresh_fields(observed)
+        _stage_start(options, "SAVE_RESULT")
         store.append(observed)
+        _stage_success(options, "SAVE_RESULT")
+        if options.diagnostics is not None:
+            options.diagnostics.finish_media("SUCCESS", success=True)
         refreshed += 1
         _print_progress(
             position,

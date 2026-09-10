@@ -10,7 +10,7 @@ import time
 import unittest
 import zipfile
 from xml.etree import ElementTree
-from unittest.mock import call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -191,7 +191,7 @@ class CollectorUtilityTests(unittest.TestCase):
     def test_android_terminal_applies_low_like_and_ad_defaults(self) -> None:
         line = reels_browser.android_metric_terminal_line(
             reels_browser.AndroidMetricResult(
-                metrics={"like_count": 12, "share_count": 3},
+                metrics={"view_count": 1_000, "like_count": 12, "share_count": 3},
             ),
             1,
             current=1,
@@ -203,6 +203,22 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertIn("repost_count=0", line)
         self.assertIn("share_count=3", line)
         self.assertIn("saved_count=X", line)
+
+    def test_android_terminal_does_not_invent_zeroes_after_collection_failure(self) -> None:
+        line = reels_browser.android_metric_terminal_line(
+            reels_browser.AndroidMetricResult(
+                status="unavailable",
+                error="UI hierarchy unavailable",
+            ),
+            3,
+            current=1,
+            total=1,
+            python_metrics={"like_count": 12, "comment_count": 2},
+        )
+
+        self.assertIn("comment_count=2", line)
+        self.assertIn("share_count=unavailable", line)
+        self.assertIn("saved_count=unavailable", line)
 
     def test_scheduler_flags_are_false_by_default(self) -> None:
         options = parse_args([])
@@ -250,6 +266,7 @@ class CollectorUtilityTests(unittest.TestCase):
                 directory,
                 "android",
                 "reel_metric_collected",
+                job_id="internal-queue-id",
                 url="https://www.instagram.com/reels/android/",
                 metrics={"view_count": 123},
             )
@@ -258,7 +275,18 @@ class CollectorUtilityTests(unittest.TestCase):
             self.assertNotEqual(python_log, android_log)
             self.assertIn("[PYTHON] reel_saved", python_log.read_text(encoding="utf-8"))
             self.assertNotIn("reel_metric_collected", python_log.read_text(encoding="utf-8"))
-            self.assertIn("[ANDROID] reel_metric_collected", android_log.read_text(encoding="utf-8"))
+            android_text = android_log.read_text(encoding="utf-8")
+            self.assertRegex(android_text, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+09:00 \[ANDROID\] reel_metric_collected")
+            self.assertNotIn("job_id", android_text)
+            self.assertNotIn("internal-queue-id", android_text)
+            self.assertIn("| https://www.instagram.com/reels/android/ metrics=", android_text)
+            self.assertNotIn("url=", android_text)
+
+    def test_collection_log_timestamp_uses_korean_time(self) -> None:
+        self.assertEqual(
+            reels_browser.isoformat_kst(datetime(2026, 9, 9, 6, 2, 13, tzinfo=timezone.utc)),
+            "2026-09-09T15:02:13.000+09:00",
+        )
 
     def test_cli_defaults_and_long_run_controls(self) -> None:
         defaults = parse_args([])
@@ -288,7 +316,7 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(getattr(options, "exact_metric_retry_delay_seconds", None), 3.5)
         self.assertTrue(options.followers_after_reels)
 
-    def test_python_to_android_handoff_requires_python_repost_count(self) -> None:
+    def test_python_to_android_handoff_does_not_wait_for_android_readable_counts(self) -> None:
         record = reel_record(1)
         record.update({
             "view_count": "",
@@ -299,11 +327,26 @@ class CollectorUtilityTests(unittest.TestCase):
             "follower_count": "",
         })
 
-        self.assertEqual(missing_python_to_android_handoff_fields(record), ("repost_count",))
-        self.assertEqual(
-            python_to_android_handoff_delay_seconds(record),
-            reels_browser.PYTHON_TO_ANDROID_RETRY_DELAY_SECONDS,
+        self.assertEqual(missing_python_to_android_handoff_fields(record), ())
+        self.assertEqual(python_to_android_handoff_delay_seconds(record), 0.0)
+
+    def test_rate_limited_record_keeps_static_history_but_not_old_counts(self) -> None:
+        previous = reel_record(1, "2026-01-01T00:00:00.000Z")
+        previous.update({"view_count": 999, "repost_count": 8, "follower_count": 1234})
+
+        result = reels_browser.build_rate_limited_collected_record(
+            [previous], previous["url"]
         )
+
+        self.assertIsNotNone(result)
+        _visible, collected = result or ({}, {})
+        self.assertEqual(collected["url"], previous["url"])
+        self.assertEqual(collected["username"], previous["username"])
+        self.assertEqual(collected["uploaded_at"], previous["uploaded_at"])
+        self.assertEqual(collected["ad"], previous["ad"])
+        self.assertIsNone(collected["view_count"])
+        self.assertIsNone(collected["repost_count"])
+        self.assertEqual(collected["follower_count"], "")
 
     def test_python_android_count_comparison_uses_requested_tolerance_bands(self) -> None:
         compare = reels_browser.compare_python_and_android_counts
@@ -1216,6 +1259,213 @@ class DirectReelInfoDisabledTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inline_profile_clicks_author_and_verifies_id(self) -> None:
+        page = MagicMock()
+        page.url = "https://www.instagram.com/reel/ABC123/"
+        link = MagicMock()
+        link.is_visible = AsyncMock(return_value=True)
+        link.evaluate = AsyncMock(return_value=True)
+        link.click = AsyncMock()
+        page.locator.return_value.count = AsyncMock(return_value=1)
+        page.locator.return_value.nth.return_value = link
+        response = asyncio.get_running_loop().create_future()
+        response.set_result(None)
+        navigation = MagicMock()
+        navigation.value = response
+        page.expect_navigation.return_value.__aenter__ = AsyncMock(return_value=navigation)
+        page.expect_navigation.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        async def read_profile(_page, username, *, navigate):
+            await navigate()
+            return {"status": "success", "userId": "42", "username": username, "followerCount": 1234}
+
+        with patch.object(reels_browser, "request_web_follower_count", side_effect=read_profile):
+            result = await reels_browser.read_reel_author_profile(page, {
+                "url": page.url, "user_id": "42", "username": "author",
+            })
+        self.assertEqual(result["followerCount"], 1234)
+        link.click.assert_awaited_once()
+        page.goto.assert_not_called()
+
+    async def test_inline_profile_rejects_missing_link_and_wrong_owner(self) -> None:
+        page = MagicMock()
+        page.url = "https://www.instagram.com/reel/ABC123/"
+        record = {"url": page.url, "user_id": "42", "username": "author"}
+        page.locator.return_value.count = AsyncMock(return_value=0)
+        result = await reels_browser.read_reel_author_profile(page, record)
+        self.assertEqual(result["status"], "author_link_unavailable")
+        link = MagicMock()
+        link.is_visible = AsyncMock(return_value=True)
+        link.evaluate = AsyncMock(return_value=True)
+        page.locator.return_value.count = AsyncMock(return_value=1)
+        page.locator.return_value.nth.return_value = link
+        for user_id in ("", "99"):
+            with patch.object(reels_browser, "request_web_follower_count", new=AsyncMock(return_value={
+                "status": "success", "userId": user_id, "followerCount": 1000,
+            })):
+                result = await reels_browser.read_reel_author_profile(page, record)
+            self.assertEqual(result["status"], "identity_mismatch")
+            self.assertNotIn("followerCount", result)
+        with patch.object(reels_browser, "request_web_follower_count", new=AsyncMock(return_value={
+            "status": "rate_limited", "error": "HTTP 429",
+        })):
+            result = await reels_browser.read_reel_author_profile(page, record)
+        self.assertEqual(result["status"], "rate_limited")
+        self.assertNotIn("followerCount", result)
+        page.url = "https://www.instagram.com/reel/OTHER/"
+        result = await reels_browser.read_reel_author_profile(page, record)
+        self.assertEqual(result["status"], "identity_mismatch")
+
+    async def test_inline_profile_persists_users_without_second_network_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lookup = AsyncMock()
+            enricher = FollowerEnricher(data_dir=directory, lookup_impl=lookup)
+            await enricher.record_profile_result("42", "author", {
+                "status": "success", "followerCount": 1234,
+                "sourceField": "passive_profile_response.follower_count",
+                "biography": "verified profile", "postCount": 10, "followingCount": 20,
+            })
+            await enricher.drain()
+            lookup.assert_not_awaited()
+            _, rows = read_csv_objects(user_history_path(directory))
+            self.assertEqual(rows[0]["follower_count"], "1234")
+            self.assertEqual(rows[0]["username"], "author")
+
+    async def test_login_confirmation_is_requested_once_per_process(self) -> None:
+        stop_event = asyncio.Event()
+        confirmation_calls = 0
+
+        async def confirm(_prompt: str, _stop_event: asyncio.Event) -> bool:
+            nonlocal confirmation_calls
+            confirmation_calls += 1
+            await asyncio.sleep(0)
+            return True
+
+        with (
+            patch.object(reels_browser, "_LOGIN_CONFIRMATION_GRANTED", False),
+            patch.object(reels_browser, "_LOGIN_CONFIRMATION_TASK", None),
+            patch.object(reels_browser, "_wait_for_login_confirmation_input", new=confirm),
+        ):
+            first, concurrent = await asyncio.gather(
+                reels_browser.wait_for_login_confirmation("Enter: ", stop_event),
+                reels_browser.wait_for_login_confirmation("Enter: ", stop_event),
+            )
+            later = await reels_browser.wait_for_login_confirmation("Enter: ", stop_event)
+
+        self.assertTrue(first)
+        self.assertTrue(concurrent)
+        self.assertTrue(later)
+        self.assertEqual(confirmation_calls, 1)
+
+    async def test_reel_exploration_limiter_waits_for_the_rest_of_the_minute(self) -> None:
+        current = [0.0]
+        waits: list[float] = []
+
+        async def fake_sleep(seconds: float) -> None:
+            waits.append(seconds)
+            current[0] += seconds
+
+        limiter = reels_browser.ReelExplorationRateLimiter(
+            clock=lambda: current[0],
+            sleep=fake_sleep,
+        )
+        for _ in range(12):
+            self.assertEqual(await limiter.wait_for_slot(), 0)
+            current[0] += 2
+
+        self.assertEqual(await limiter.wait_for_slot(), 36)
+        self.assertEqual(waits, [36])
+
+    async def test_navigation_stops_without_refresh_after_first_http_429(self) -> None:
+        class Response:
+            def __init__(self, status: int) -> None:
+                self.url = "https://www.instagram.com/reels/example/"
+                self.status = status
+                self.headers = {}
+                self.request = None
+
+        class Page:
+            url = "https://www.instagram.com/reels/example/"
+            goto_calls = 0
+            reload_calls = 0
+
+            async def goto(self, *_args: object, **_kwargs: object) -> Response:
+                self.goto_calls += 1
+                return Response(429)
+
+            async def reload(self, **_kwargs: object) -> Response:
+                self.reload_calls += 1
+                return Response(200)
+
+        page = Page()
+        state = reels_browser.InstagramRateLimitState()
+        page._instagram_collector_rate_limit_state = state
+
+        with self.assertRaises(reels_browser.CrawlerAccessError):
+            await reels_browser.navigate_with_retries(page, page.url)
+
+        self.assertEqual(page.goto_calls, 1)
+        self.assertEqual(page.reload_calls, 0)
+        self.assertTrue(state.limited)
+
+    async def test_navigation_keeps_http_429_latched_without_refresh(self) -> None:
+        class Response:
+            url = "https://www.instagram.com/reels/example/"
+            status = 429
+            headers: dict[str, str] = {}
+            request = None
+
+        class Page:
+            url = Response.url
+            reload_calls = 0
+
+            async def goto(self, *_args: object, **_kwargs: object) -> Response:
+                return Response()
+
+            async def reload(self, **_kwargs: object) -> Response:
+                self.reload_calls += 1
+                return Response()
+
+        page = Page()
+        page._instagram_collector_rate_limit_state = reels_browser.InstagramRateLimitState()
+
+        with self.assertRaises(reels_browser.CrawlerAccessError) as raised:
+            await reels_browser.navigate_with_retries(page, page.url)
+
+        self.assertEqual(raised.exception.code, "rate_limited")
+        self.assertTrue(page._instagram_collector_rate_limit_state.limited)
+        self.assertEqual(page.reload_calls, 0)
+
+    async def test_standalone_collector_resumes_after_twenty_minute_cooldown(self) -> None:
+        attempts = 0
+        waits: list[float] = []
+
+        async def fake_run_once(*_args: object, **_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise reels_browser.CrawlerAccessError(
+                    "rate_limited",
+                    "second 429",
+                    refresh_attempted=True,
+                )
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            return False
+
+        options = type("Options", (), {"rate_limit_return_immediately": False})()
+        with (
+            patch.object(reels_browser, "_run_collector_once", new=fake_run_once),
+            patch.object(reels_browser, "wait_for_stop_or_timeout", new=fake_wait),
+        ):
+            result = await reels_browser.run_collector(options)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(waits, [20 * 60.0])
+
     def setUp(self) -> None:
         direct_request_toggle = patch.object(
             reels_browser,
@@ -2389,6 +2639,58 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, 3)
         self.assertEqual(result["status"], "success")
+
+    async def test_follower_web_lookup_retries_temporarily_unrendered_profile(self) -> None:
+        class Context:
+            async def new_page(self) -> "Page":
+                return Page(self)
+
+        class Page:
+            def __init__(self, context: Context) -> None:
+                self.context = context
+
+            def is_closed(self) -> bool:
+                return False
+
+            async def close(self) -> None:
+                return None
+
+        calls = 0
+
+        async def delayed_profile(_page: object, _username: str) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"status": "web_unavailable", "error": "profile count not rendered", "source": "test"}
+            return {
+                "status": "success",
+                "followerCount": 1_234,
+                "sourceField": "profile_header_text",
+            }
+
+        lookup = reels_browser.SequentialWebFollowerLookup(
+            Page(Context()),
+            max_attempts=3,
+            retry_delay_seconds=0,
+        )
+        with patch.object(reels_browser, "request_web_follower_count", new=delayed_profile):
+            result = await lookup({"username": "example", "userId": "123"})
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["status"], "success")
+
+    def test_android_result_without_any_exact_view_is_retryable(self) -> None:
+        incomplete = reels_browser.require_exact_android_view_count(
+            {"view_count": ""},
+            reels_browser.AndroidMetricResult(
+                metrics={"like_count": 10, "share_count": 2},
+                status="collected",
+            ),
+        )
+
+        self.assertEqual(incomplete.status, "unavailable")
+        self.assertEqual(incomplete.metrics, {"like_count": 10, "share_count": 2})
+        self.assertIn("view_count", incomplete.error)
 
     async def test_prefetched_direct_reel_info_is_reused_without_a_second_request(self) -> None:
         class Page:
@@ -3610,6 +3912,10 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(outputs["xlsx"].name, "reels.xlsx")
             for path in outputs.values():
                 self.assertTrue(path.exists(), path)
+            internal_history = Path(directory) / ".collector" / "count_history.xlsx"
+            self.assertTrue(internal_history.exists())
+            self.assertTrue(all(header.endswith("_xlsx_only") for header in read_xlsx_header(internal_history)))
+            self.assertTrue((Path(directory) / "instagram_data.xlsx").exists())
             expected_fields = [
                 "collection_number", "days_since_previous", "collected_at", "url", "user_id", "username",
                 "title", "hashtags", "audio_name", "location_name", "ad",
@@ -3680,6 +3986,35 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(store.rows[0]["saved_count"], 4)
             self.assertEqual(store.rows[0]["audio_name"], "Artist · Track")
 
+    def test_internal_count_history_is_xlsx_only_and_records_android_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            row = reel_record(1, "2026-01-01T00:00:00.000Z")
+            row.update({"view_count": 321, "repost_count": 7, "follower_count": 1000})
+            result = {
+                "target": {"url": row["url"], "collected_at": row["collected_at"]},
+                "status": "collected",
+                "error": "",
+                "metrics": {"view_count": 321, "repost_count": 7},
+                "python_metrics": {"view_count": "", "repost_count": ""},
+            }
+            web_result = {
+                "target": {"url": row["url"], "collected_at": row["collected_at"]},
+                "status": "rate_limited",
+                "error": "Instagram returned HTTP 429.",
+            }
+
+            workbook = reels_browser.write_count_history_xlsx(
+                directory, [row], android_results=[result], web_results=[web_result]
+            )
+            matrix = reels_browser._read_xlsx_matrix(workbook)
+            values = dict(zip(matrix[0], matrix[1]))
+
+            self.assertTrue(all(field.endswith("_xlsx_only") for field in matrix[0]))
+            self.assertEqual(values["view_count_source_xlsx_only"], "android_collected")
+            self.assertEqual(values["repost_count_source_xlsx_only"], "android_collected")
+            self.assertEqual(values["android_status_xlsx_only"], "collected")
+            self.assertEqual(values["web_status_xlsx_only"], "rate_limited")
+
     async def test_android_metric_pipeline_queues_the_next_reel_without_waiting(self) -> None:
         """Python can append a second Reel while the first Android lookup is open."""
         with tempfile.TemporaryDirectory() as directory:
@@ -3727,6 +4062,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             store = await LongReelStore.create(history_path, 100, "rows")
             first = reel_record(1, "2026-01-01T00:00:00.000Z")
             first["share_count"] = ""
+            first["repost_count"] = ""
             await store.append(first)
             await store.flush()
 
@@ -3742,11 +4078,13 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
                 paths,
                 working,
                 job or {},
-                reels_browser.AndroidMetricResult(metrics={"view_count": 624_267, "share_count": 1_337}),
+                reels_browser.AndroidMetricResult(
+                    metrics={"view_count": 624_267, "share_count": 1_337, "repost_count": 42}
+                ),
             )
 
             merged = reels_browser.apply_completed_android_metric_jobs(data_dir, export_outputs=False)
-            self.assertEqual(merged, {"applied": 1, "updated": 1, "pending": 0})
+            self.assertEqual(merged, {"applied": 1, "updated": 2, "pending": 0})
 
             # This in-memory store intentionally still has Python's original
             # value. Its next checkpoint must retain Android's disk update.
@@ -3756,6 +4094,7 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(store.rows[0]["view_count"], 10)
             self.assertEqual(store.rows[0]["share_count"], "1337")
+            self.assertEqual(store.rows[0]["repost_count"], "42")
             self.assertFalse(list(paths["completed"].glob("*.json")))
 
     async def test_durable_android_merge_preserves_comment_and_ad_visibility_rules(self) -> None:
@@ -3795,6 +4134,43 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows[0]["repost_count"], "0")
             self.assertEqual(rows[0]["share_count"], "3")
             self.assertEqual(rows[0]["saved_count"], "X")
+
+    async def test_durable_unavailable_android_result_keeps_missing_counts_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            history_path = data_dir / ".collector" / "reels_history_active.csv"
+            store = await LongReelStore.create(history_path, 100, "rows")
+            record = reel_record(1)
+            record.update({
+                "like_count": 12,
+                "comment_count": 2,
+                "repost_count": "",
+                "share_count": "",
+                "saved_count": "",
+            })
+            await store.append(record)
+            await store.flush()
+            reels_browser.enqueue_android_metric_job(data_dir, record)
+            paths = reels_browser._android_metric_queue_paths(data_dir)
+            working, job = reels_browser._claim_android_metric_job(paths) or (None, None)
+            assert working is not None and job is not None
+            reels_browser._write_android_metric_completion(
+                paths,
+                working,
+                job,
+                reels_browser.AndroidMetricResult(
+                    status="unavailable",
+                    error="UI hierarchy unavailable",
+                ),
+            )
+
+            reels_browser.apply_completed_android_metric_jobs(data_dir, export_outputs=False)
+            _fields, rows = read_csv_objects(history_path)
+
+            self.assertEqual(rows[0]["comment_count"], "2")
+            self.assertEqual(rows[0]["repost_count"], "")
+            self.assertEqual(rows[0]["share_count"], "")
+            self.assertEqual(rows[0]["saved_count"], "")
 
     async def test_durable_android_worker_exits_cleanly_when_the_queue_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3955,6 +4331,45 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(pause_attempts, 1)
+
+    async def test_android_worker_restarts_emulator_after_reel_batch_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            history_path = data_dir / ".collector" / "reels_history_active.csv"
+            store = await LongReelStore.create(history_path, 100, "rows")
+            record = reel_record(1)
+            record["view_count"] = ""
+            await store.append(record)
+            await store.flush()
+            reels_browser.enqueue_android_metric_job(data_dir, record)
+            restarts = 0
+
+            class RestartingEnricher:
+                def enrich(self, _url: str) -> reels_browser.AndroidMetricResult:
+                    return reels_browser.AndroidMetricResult(metrics={"view_count": 321})
+
+                def restart_emulator(self) -> None:
+                    nonlocal restarts
+                    restarts += 1
+
+            with (
+                patch.object(reels_browser, "AndroidReelMetricsEnricher", return_value=RestartingEnricher()),
+                patch.object(reels_browser, "ANDROID_EMULATOR_RESTART_REEL_COUNT", 1),
+            ):
+                exit_code = await asyncio.to_thread(
+                    reels_browser.run_android_metric_worker,
+                    data_dir,
+                    idle_seconds=0.01,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(restarts, 1)
+            status = json.loads(
+                reels_browser._android_metric_queue_paths(data_dir)["status"].read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["emulator_restarts"], 1)
+            _fields, rows = read_csv_objects(history_path)
+            self.assertEqual(rows[0]["view_count"], "321")
 
     async def test_idle_hashtag_jobs_yield_to_reel_metric_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4409,6 +4824,29 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(queued, 1)
             self.assertEqual(calls, 2)
 
+    async def test_deferred_follower_lookup_queues_only_users_tracked_this_run(self) -> None:
+        calls: list[str] = []
+
+        async def lookup(payload: dict[str, str]) -> dict[str, object]:
+            calls.append(payload["username"])
+            return {"status": "success", "followerCount": 100, "sourceField": "edge_followed_by.count"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            users_path = Path(directory) / "users.csv"
+            users_path.write_text(
+                "user_id,username,follower_count,collected_at\n"
+                "1,uncollected_user,,\n",
+                encoding="utf-8",
+            )
+            enricher = FollowerEnricher(data_dir=directory, lookup_impl=lookup)
+            await enricher.track_user(user_id="2", username="saved_reel_user", enqueue=False)
+
+            queued = await enricher.enqueue_tracked()
+            await enricher.drain()
+
+            self.assertEqual(queued, 1)
+            self.assertEqual(calls, ["saved_reel_user"])
+
     async def test_follower_merge_updates_every_matching_row_in_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             users_path = Path(directory) / "users.csv"
@@ -4427,6 +4865,34 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(changed, 2)
             self.assertEqual([row["follower_count"] for row in rows], ["1000", "2000"])
+
+    async def test_follower_merge_rejects_conflicting_author_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            users_path = Path(directory) / "users.csv"
+            users_path.write_text(
+                "user_id,username,follower_count,collected_at\n"
+                "1,first,1000,2026-01-01T00:00:00Z\n",
+                encoding="utf-8",
+            )
+            rows = [
+                {**reel_record(1), "user_id": "2", "username": "first", "follower_count": "1000"},
+                {**reel_record(2), "user_id": "1", "username": "other", "follower_count": "1000"},
+            ]
+            self.assertEqual(merge_follower_data_into_rows(rows, users_path), 2)
+            self.assertEqual([row["follower_count"] for row in rows], ["", ""])
+
+    async def test_user_identity_conflict_does_not_mutate_cached_user(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            async def lookup(user):
+                return {}
+            enricher = FollowerEnricher(data_dir=directory, lookup_impl=lookup)
+            await enricher.ready()
+            row = enricher._find_or_create("1", "first")
+            with self.assertRaises(ValueError):
+                enricher._find_or_create("2", "first")
+            with self.assertRaises(ValueError):
+                enricher._find_or_create("1", "other")
+            self.assertEqual((row["user_id"], row["username"]), ("1", "first"))
 
     async def test_follower_merge_replaces_a_larger_legacy_estimate_with_latest_exact_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
