@@ -27,9 +27,14 @@ default_version
 outputs/
 .downloads/
 .runtime-logs/
-android_version/data_android/
+collectors/android/data_android/
+.venv/
+.android/
+.adb/
+/temp/
 .tmp/
 .tmp_*/
 .codex_tmp/
 *.inspect.ndjson
+analyzers/gemini/.pool_pending/
 .codex*

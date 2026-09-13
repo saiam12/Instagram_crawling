@@ -9,7 +9,7 @@
 PowerShell에서 이 폴더로 이동한 뒤 가상환경과 패키지를 설치합니다.
 
 ```powershell
-cd C:\Instagram-crawling\python_version
+cd C:\Instagram-crawling\collectors\web
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
 ```

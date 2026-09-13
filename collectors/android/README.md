@@ -9,7 +9,7 @@ Android Studio 에뮬레이터에서 이미 로그인된 Instagram 앱의 **화�
 Android Studio의 에뮬레이터를 실행하고 Instagram 앱에서 먼저 로그인합니다. 이 폴더에서 전용 가상환경을 만듭니다.
 
 ```powershell
-cd C:\Instagram-crawling\android_version
+cd C:\Instagram-crawling\collectors\android
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
 ```
@@ -155,7 +155,7 @@ data_android/
 예:
 
 ```powershell
-cd C:\Instagram-crawling\android_version
+cd C:\Instagram-crawling\collectors\android
 .\.venv\Scripts\python.exe .\collect_android_reels.py feed --max-items 50 --data-dir .\data_android
 Get-Content .\data_android\logs\instagram_collector_*.log -Tail 80
 Get-Content .\data_android\logs\instagram_events_*.jsonl -Tail 20

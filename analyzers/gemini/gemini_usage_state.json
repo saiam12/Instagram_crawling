@@ -1,0 +1,50 @@
+{
+  "acct1:gemini-3.5-flash": {
+    "day": "2026-09-12",
+    "day_count": 1,
+    "minute_window_start": 1789208685.444934,
+    "minute_count": 1
+  },
+  "acct1:gemini-3.6-flash": {
+    "day": "2026-09-12",
+    "day_count": 0,
+    "minute_window_start": 1789208602.189131,
+    "minute_count": 0
+  },
+  "acct1:gemini-3.7-flash": {
+    "day": "2026-09-12",
+    "day_count": 0,
+    "minute_window_start": 1789208602.189131,
+    "minute_count": 0
+  },
+  "acct1:gemini-3.8-flash": {
+    "day": "2026-09-12",
+    "day_count": 0,
+    "minute_window_start": 1789208602.189131,
+    "minute_count": 0
+  },
+  "acct2:gemini-3.5-flash": {
+    "day": "2026-09-12",
+    "day_count": 0,
+    "minute_window_start": 1789208602.189131,
+    "minute_count": 0
+  },
+  "acct2:gemini-3.6-flash": {
+    "day": "2026-09-12",
+    "day_count": 0,
+    "minute_window_start": 1789208602.189131,
+    "minute_count": 0
+  },
+  "acct2:gemini-3.7-flash": {
+    "day": "2026-09-12",
+    "day_count": 0,
+    "minute_window_start": 1789208602.189131,
+    "minute_count": 0
+  },
+  "acct2:gemini-3.8-flash": {
+    "day": "2026-09-12",
+    "day_count": 0,
+    "minute_window_start": 1789208602.189131,
+    "minute_count": 0
+  }
+}

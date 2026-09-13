@@ -5,7 +5,7 @@ An independent CLI that downloads a permitted public Instagram Reel (or reads a 
 ## Setup
 
 ```powershell
-cd C:\Instagram-crawling\reel_analyzer
+cd C:\Instagram-crawling\analyzers\local_llm
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
@@ -21,7 +21,7 @@ ollama ps
 ## Run
 
 ```powershell
-cd C:\Instagram-crawling\reel_analyzer
+cd C:\Instagram-crawling\analyzers\local_llm
 .\.venv\Scripts\python.exe reel_analyzer.py
 .\.venv\Scripts\python.exe reel_analyzer.py --url "https://www.instagram.com/reel/SHORTCODE/"
 .\.venv\Scripts\python.exe reel_analyzer.py --file .\test.mp4

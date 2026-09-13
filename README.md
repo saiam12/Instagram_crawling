@@ -1,57 +1,43 @@
 # Instagram crawling
 
-기본 구현, 로그인 Python 구현, 무로그인 Python 구현을 각각 독립된 폴더로 정리했습니다.
-
-| 버전 | 폴더 | 설명 |
-|---|---|---|
-| 기본 버전 | `default_version` | JavaScript 수집기와 PowerShell 실행 스크립트 |
-| Python 버전 | `python_version` | 조회수를 포함하고 재수집 값을 새 열에 누적하는 Python 수집기 |
-| 무로그인 Python 버전 | `python_no_login_version` | 로그인 수집으로 저장한 신규 릴스만 임시 브라우저로 재수집하며 로그인 프로필을 저장하지 않음 |
-| Android 에뮬레이터 버전 | `android_version` | Android Studio 에뮬레이터의 로그인된 Instagram 앱 화면을 ADB/UIAutomator로 읽는 수집기 |
+Instagram 릴스 수집기와 영상 분석기를 용도별로 관리합니다.
 
 ```text
 Instagram-crawling/
-├── default_version/  # 기존 코드, 데이터, 로그인 프로필, 결과물
-├── python_version/   # Python 코드와 전용 데이터·로그인 프로필
-├── python_no_login_version/  # 공개 릴스용 무로그인 실행기
-├── android_version/ # Android Studio 에뮬레이터 전용 수집기
-└── README.md         # 각 버전의 시작 안내
+├── collectors/          # 수집 도구
+│   ├── web/             # 브라우저 수집
+│   ├── android/         # Android 앱 수집
+│   └── unified/         # 웹 + Android 통합 수집
+├── analyzers/           # 영상 분석 도구
+│   ├── gemini/          # Gemini API 분석
+│   └── local_llm/       # 로컬 LLM 분석
+├── docs/                # 설계·구현 계획·리뷰
+├── data_web/            # 기존 루트 데이터
+└── temp/                # 임시 작업 및 이전 구현 보관
 ```
 
-## 기본 버전 실행
+## 사용 안내
+
+| 도구 | 설치 및 실행 안내 |
+|---|---|
+| 웹 수집기 | [collectors/web](collectors/web/README.md) |
+| Android 수집기 | [collectors/android](collectors/android/README.md) |
+| 통합 수집기 | [collectors/unified](collectors/unified/README.md) |
+| Gemini 분석기 | [analyzers/gemini](analyzers/gemini/README.md) |
+| 로컬 LLM 분석기 | [analyzers/local_llm](analyzers/local_llm/README.md) |
+
+통합 수집기 실행 예시:
 
 ```powershell
-cd C:\Instagram-crawling\default_version
-.\scripts\start_reels_web.ps1
+cd C:\Instagram-crawling\collectors\unified
+.\collector.ps1 --max-items 50
 ```
 
-자세한 사용법은 `default_version\README.md`를 확인하세요.
+## 관리 기준
 
-## Python 버전 실행
-
-```powershell
-cd C:\Instagram-crawling\python_version
-.\.venv\Scripts\python.exe .\collectors\instagram_reels_browser.py --max-items 50
-```
-
-설치와 출력 형식은 `python_version\README.md`에 정리되어 있습니다.
-
-## 무로그인 Python 버전 실행
-
-```powershell
-cd C:\Instagram-crawling\python_no_login_version
-.\.venv\Scripts\python.exe .\collect_public_reels.py
-```
-
-무로그인 재수집은 `python_version\data_web\reels.xlsx`를 대상으로 같은 데이터 폴더에 결과를 이어서 저장합니다. 공개 콘텐츠 제한과 사용법은 `python_no_login_version\README.md`에 정리되어 있습니다.
-
-## Android 에뮬레이터 수집
-
-Android Studio 에뮬레이터에서 Instagram에 직접 로그인한 뒤, 화면에 보이는 Reel 지표를 ADB/UIAutomator로 수집합니다. 이 버전은 웹 수집기와 데이터·로그인 정보를 공유하지 않으며 좋아요·팔로우·댓글 등 계정 행동을 자동화하지 않습니다.
-
-```powershell
-cd C:\Instagram-crawling\android_version
-.\collector.ps1 feed --max-items 50
-```
-
-해시태그 검색과 기존 URL XLSX 재수집도 지원합니다. 설치와 전체 사용법은 `android_version\README.md`를 확인하세요.
+- 각 도구의 가상환경, 로그인 프로필, 데이터와 결과물은 해당 도구 폴더에서 관리합니다.
+- 수집기 내부 `collectors/`, `android_collector/`, `exporters/`, `scripts/`는 Python 모듈과 실행 진입점입니다.
+- `examples/`와 `data_web_test/`는 예제·검증 자료입니다.
+- `temp/`에는 이전 `default_version`과 임시 작업 자료가 보존되어 있습니다.
+- 과거 설계·계획 문서의 경로는 작성 당시 기준이며, 현재 실행 경로는 위 표를 따릅니다.
+- 이동한 가상환경은 `.venv\Scripts\python.exe`로 직접 실행하고, 패키지 설치에는 `-m pip`를 사용합니다. 기존 활성화 스크립트나 pip 실행 파일에 이전 경로가 남아 있을 수 있습니다.

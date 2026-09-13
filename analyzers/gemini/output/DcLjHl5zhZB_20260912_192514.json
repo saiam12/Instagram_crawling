@@ -1,0 +1,178 @@
+{
+  "summary": "빅4 회계사 남성이 네 가지 데일리 출근 및 캐주얼 패션을 거울 셀카로 소개하는 룩북 영상입니다.",
+  "hook": {
+    "description": "영상 시작 시 '빅4 회계법인 회계사 출근룩..' 자막과 함께 첫 번째 핑크색 상의와 카고 팬츠 조합을 가까이서 보여주며 주목도를 높입니다.",
+    "strength": "strong"
+  },
+  "body_structure": "첫 번째 코디의 밀착 샷과 전신 샷을 보여준 뒤, 순차적으로 나머지 세 가지 스타일(셔츠, 에니메이션 그래픽 티셔츠, 린넨 셔츠 코디)의 상하반신 밀착 거울 셀카와 전신 거울 셀카를 리드미컬하게 번갈아 전개하는 구조입니다.",
+  "camera": {
+    "main_composition": "mirror_selfie",
+    "angles": [
+      "eye_level",
+      "high_angle"
+    ],
+    "movements": [
+      "none"
+    ]
+  },
+  "editing": {
+    "style": "rhythmic_jump_cuts",
+    "cut_speed": "fast",
+    "transitions": [
+      "jump_cut"
+    ]
+  },
+  "subtitle": {
+    "exists": true,
+    "position": "center",
+    "style": "speech_bubble"
+  },
+  "subjects": {
+    "people_count": 1,
+    "main_subject": "인물 A (20대 후반에서 30대 초반으로 보이는 남성, 검은색 헝클어진 머리, 안경 착용, 검은색 백팩을 일관되게 착용)"
+  },
+  "product": {
+    "exists": true,
+    "description": "남성 출근용 데일리 코디 4종 (핑크 반팔 티셔츠와 올리브 카고 팬츠, 스트라이프 셔츠와 브라운 팬츠, 에반게리온 프린팅 티셔츠와 라이트 브라운 팬츠, 화이트 린넨 셔츠와 베이지 팬츠)"
+  },
+  "scene_details": [
+    {
+      "scene_number": 1,
+      "start_second": 0,
+      "end_second": 1.2,
+      "section": "hook",
+      "visual_description": "인물 A가 거울을 보며 첫 번째 아웃핏(핑크색 반팔 티셔츠, 검은색 벨트, 올리브색 카고 바지)을 입고 폰을 들고 있는 바스트 샷입니다. 손에는 미니 선풍기를 들고 있습니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "eye_level",
+      "camera_movement": "없음",
+      "on_screen_text": "빅4 회계법인 회계사 출근룩..",
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "없음",
+      "emotional_tone": "casual",
+      "purpose": "첫 코디의 디테일을 보여주고 회계사 출근룩이라는 흥미로운 자막으로 시청자의 시선을 끕니다."
+    },
+    {
+      "scene_number": 2,
+      "start_second": 1.2,
+      "end_second": 3.4,
+      "section": "hook",
+      "visual_description": "인물 A가 한 걸음 물러나 첫 번째 아웃핏의 전신을 거울로 보여주고 있습니다. 신발은 갈색 가죽 구두를 신었습니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "high_angle",
+      "camera_movement": "없음",
+      "on_screen_text": "빅4 회계법인 회계사 출근룩..",
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "점프 컷",
+      "emotional_tone": "casual",
+      "purpose": "첫 코디의 전체적인 실루엣과 핏을 제공합니다."
+    },
+    {
+      "scene_number": 3,
+      "start_second": 3.4,
+      "end_second": 4.4,
+      "section": "body",
+      "visual_description": "인물 A가 두 번째 아웃핏(스트라이프 반팔 셔츠, 흰색 티셔츠 레이어드, 브라운 바지)을 착용한 상태로 거울 셀카를 찍고 있습니다. 검은 뿔테 안경을 썼습니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "eye_level",
+      "camera_movement": "없음",
+      "on_screen_text": null,
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "점프 컷",
+      "emotional_tone": "neutral",
+      "purpose": "두 번째 코디의 레이어드 스타일과 상반신 디테일을 소개합니다."
+    },
+    {
+      "scene_number": 4,
+      "start_second": 4.4,
+      "end_second": 6.2,
+      "section": "body",
+      "visual_description": "인물 A가 멀리서 두 번째 코디의 전신을 보여줍니다. 신발은 어두운 샌들을 신고 있습니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "high_angle",
+      "camera_movement": "없음",
+      "on_screen_text": null,
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "점프 컷",
+      "emotional_tone": "neutral",
+      "purpose": "두 번째 코디의 전체적인 조화와 캐주얼한 무드를 보여줍니다."
+    },
+    {
+      "scene_number": 5,
+      "start_second": 6.2,
+      "end_second": 7.8,
+      "section": "body",
+      "visual_description": "인물 A가 세 번째 아웃핏(에반게리온 그래픽이 들어간 검은색 반팔 티셔츠, 카키색 면바지)을 착용하고 스마트폰으로 상반신 거울 셀카를 찍고 있습니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "eye_level",
+      "camera_movement": "없음",
+      "on_screen_text": null,
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "점프 컷",
+      "emotional_tone": "casual",
+      "purpose": "서브컬처 요소가 가미된 개성 있는 세 번째 코디를 보여줍니다."
+    },
+    {
+      "scene_number": 6,
+      "start_second": 7.8,
+      "end_second": 9,
+      "section": "body",
+      "visual_description": "인물 A가 세 번째 아웃핏의 전신을 드러내고 있습니다. 신발은 검은색 스니커즈를 매치했습니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "high_angle",
+      "camera_movement": "없음",
+      "on_screen_text": null,
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "점프 컷",
+      "emotional_tone": "casual",
+      "purpose": "세 번째 코디의 전신 실루엣을 노출합니다."
+    },
+    {
+      "scene_number": 7,
+      "start_second": 9,
+      "end_second": 10.6,
+      "section": "body",
+      "visual_description": "인물 A가 네 번째 아웃핏(화이트 린넨 셔츠, 베이지색 바지)을 입고 한 손에는 검은색 더플백을 들고 거울 셀카를 촬영 중입니다. 목에는 헤드폰을 걸치고 있습니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "eye_level",
+      "camera_movement": "없음",
+      "on_screen_text": null,
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "점프 컷",
+      "emotional_tone": "stylish",
+      "purpose": "출장이나 여행에 적합한 네 번째 코디의 상반신과 가방 매치 방식을 연출합니다."
+    },
+    {
+      "scene_number": 8,
+      "start_second": 10.6,
+      "end_second": 11.4,
+      "section": "body",
+      "visual_description": "인물 A가 네 번째 아웃핏의 전신을 거울로 비추며 밝은색 러닝화를 신은 캐주얼한 전신 핏을 보여줍니다.",
+      "layout_type": "mirror_selfie",
+      "camera": "high_angle",
+      "camera_movement": "없음",
+      "on_screen_text": null,
+      "audio_or_dialogue": "빠른 템포의 신나는 비트 음악",
+      "transition_in": "점프 컷",
+      "emotional_tone": "stylish",
+      "purpose": "마지막 아웃핏의 전신 뷰를 보여주며 룩북을 마무리합니다."
+    }
+  ],
+  "content_type": "lookbook",
+  "marketing_analysis": {
+    "strengths": [
+      "'회계사 출근룩'이라는 직업 맞춤형 컨셉으로 호기심을 유발",
+      "현실적이고 모던한 비즈니스 캐주얼의 정석을 제안함"
+    ],
+    "weaknesses": [
+      "동일한 구도의 거울 셀카가 계속 반복되어 전반적으로 정적인 느낌을 줄 수 있음"
+    ],
+    "notable_elements": [
+      "중간에 서브컬처 그래픽 티셔츠를 믹스매치하여 개성 있는 반전 요소를 가미한 점"
+    ]
+  },
+  "generation_prompts": {
+    "video_prompt_en": "Appearance and setting: A Korean young man with messy dark hair, medium build, wearing a black backpack in a minimal white-walled dressing room with a clean mirror. Warm studio lighting casts soft shadows. Shot timeline: From 0.0s to 1.2s, a close-up mirror selfie showing the man wearing a pink t-shirt and green cargo pants, holding a phone with one hand and a small portable fan with the other. From 1.2s to 3.4s, a zoomed-out full-body shot of the same outfit showing brown leather shoes. From 3.4s to 4.4s, transition to a close-up mirror selfie wearing a striped short-sleeve shirt over a white undershirt and brown pants, holding a phone. From 4.4s to 6.2s, a full-body mirror selfie of the striped shirt outfit. From 6.2s to 7.8s, transition to a close-up mirror selfie wearing an anime graphic black t-shirt and beige pants. From 7.8s to 9.0s, a full-body shot of the graphic tee outfit with black sneakers. From 9.0s to 10.6s, transition to a close-up shot wearing a white linen shirt and beige pants, carrying a black sports bag and wearing headphones. From 10.6s to 11.4s, a full-body shot of the white linen shirt outfit with beige sneakers. Continuity constraints: The man's physical features, facial structure, phone, and black backpack must remain consistent across all shots. The transition between shots should be clean jump cuts with no motion blur. All scenes are static mirror selfie poses with no camera movement.",
+    "graphic_post_processing_needed": true,
+    "post_processing_notes": "영상 0초부터 2초 구간의 중앙 우측 상단 영역에 '빅4 회계법인 회계사 출근룩..'이라는 한글 텍스트를 포함한 말풍선 자막 오버레이를 합성해야 합니다."
+  }
+}
