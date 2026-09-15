@@ -3,7 +3,7 @@ key_pool.py
 
 여러 개의 Gemini API 키 x 여러 개의 모델을 하나의 풀(pool)로 관리한다.
 
-- .env의 GEMINI_API_KEYS (쉼표 구분)로 키를 몇 개든 추가할 수 있다.
+- .env의 GEMINI_API_KEYS ({별칭:키,...})로 키를 몇 개든 추가할 수 있다.
 - .env의 GEMINI_MODELS (쉼표 구분)로 사용할 모델을 몇 개든 지정할 수 있다.
 - model_limits.json 에 모델별 RPM/RPD 한도를 적어두면, 그 한도를 넘기지 않는 선에서
   현재 조합을 유지하고 사용 불가 시 같은 키의 다음 모델, 다음 키 순서로 전환한다.
@@ -43,7 +43,6 @@ DEFAULT_LIMITS = {
     "gemini-3.5-flash": {"rpm": 5, "rpd": 20},
     "gemini-3.6-flash": {"rpm": 5, "rpd": 20},
     "gemini-3.7-flash": {"rpm": 5, "rpd": 20},
-    "gemini-3.8-flash": {"rpm": 5, "rpd": 20},
 }
 
 
@@ -117,11 +116,27 @@ class GeminiKeyPool:
     @staticmethod
     def _load_keys() -> list:
         """
-        GEMINI_API_KEYS="key1,key2,key3" 형태로 .env에서 읽는다.
-        라벨을 붙이고 싶으면 GEMINI_API_KEY_LABELS="acct1,acct2,acct3" 로 순서를 맞춰 지정 가능.
-        (안 적으면 key1, key2, ... 로 자동 라벨링)
+        큰따옴표로 감싼 GEMINI_API_KEYS의 중괄호 안에서 키를 한 줄씩 읽는다.
+        기존 쉼표 목록과 GEMINI_API_KEY_LABELS 조합도 계속 지원한다.
         """
         raw = os.getenv("GEMINI_API_KEYS") or os.getenv("GEMINI_API_KEY", "")
+        raw = raw.strip()
+        if raw.startswith("{") or raw.endswith("}"):
+            if not (raw.startswith("{") and raw.endswith("}")):
+                raise RuntimeError("GEMINI_API_KEYS는 큰따옴표로 감싼 {별칭:API키,...} 형식으로 입력하세요.")
+            if not raw[1:-1].strip():
+                return []
+            result = []
+            for entry in raw[1:-1].split(","):
+                alias, separator, key = entry.partition(":")
+                alias, key = alias.strip(), key.strip()
+                if not separator or not alias or not key or any(c in alias for c in "{}:, "):
+                    raise RuntimeError("GEMINI_API_KEYS는 큰따옴표로 감싼 {별칭:API키,...} 형식으로 입력하세요.")
+                result.append((alias, key))
+            if len(dict(result)) != len(result):
+                raise RuntimeError("GEMINI_API_KEYS의 별칭이 중복되었습니다.")
+            return result
+
         keys = [k.strip() for k in raw.split(",") if k.strip()]
 
         raw_labels = os.getenv("GEMINI_API_KEY_LABELS", "")
@@ -137,7 +152,7 @@ class GeminiKeyPool:
     def _load_models() -> list:
         raw = os.getenv(
             "GEMINI_MODELS",
-            os.getenv("GEMINI_MODEL") or "gemini-3.5-flash,gemini-3.6-flash,gemini-3.7-flash,gemini-3.8-flash",
+            os.getenv("GEMINI_MODEL") or "gemini-3.5-flash,gemini-3.6-flash,gemini-3.7-flash",
         )
         return [m.strip() for m in raw.split(",") if m.strip()]
 

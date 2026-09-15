@@ -1,7 +1,9 @@
-"""공용 시트에서 매 분석 시 두 후보를 예약/비교한다. API 키는 전송하지 않는다."""
+"""공용 시트에서 후보를 예약하고, 명시적 명령으로 공유 키를 동기화한다."""
 
 import json
 import os
+import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -16,16 +18,38 @@ class SheetsPoolError(RuntimeError):
     pass
 
 
+_PENDING_LOCK = threading.Lock()
+ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+HEARTBEAT_INTERVAL_SEC = 60
+
+
+def _write_keys_to_env(keys, path=ENV_PATH):
+    """다른 설정을 보존하면서 GEMINI_API_KEYS 블록만 원자적으로 교체한다."""
+    content = path.read_bytes().decode("utf-8") if path.exists() else ""
+    newline = "\r\n" if "\r\n" in content else "\n"
+    value = 'GEMINI_API_KEYS="{' + ("," + newline).join(
+        f"{label}:{key}" for label, key in keys
+    ) + '}"'
+    pattern = re.compile(r'(?m)^GEMINI_API_KEYS[ \t]*=[ \t]*(?:"[^"]*"|[^\r\n]*)')
+    if pattern.search(content):
+        content = pattern.sub(lambda _: value, content, count=1)
+    else:
+        content += ("" if not content or content.endswith(("\n", "\r")) else newline) + value + newline
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_bytes(content.encode("utf-8"))
+    os.replace(temporary, path)
+
+
 class SheetsKeyPool(GeminiKeyPool):
     def __init__(self):
         self.keys = self._load_keys()
         self.models = self._load_models()
         if not self.models or any(m not in {
-            "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash",
+            "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash",
         } for m in self.models):
-            raise SheetsPoolError("공용 풀은 Gemini 3.5/3.6/3.7/3.8 Flash만 지원합니다. GEMINI_MODELS에서 Lite 및 다른 모델을 제외하세요.")
-        if not self.keys or len(dict(self.keys)) != len(self.keys):
-            raise SheetsPoolError("API 키와 중복 없는 키 별칭을 .env에 설정하세요.")
+            raise SheetsPoolError("공용 풀은 Gemini 3.5/3.6/3.7 Flash만 지원합니다. 3.8과 Lite 및 다른 모델은 제외하세요.")
+        if len(dict(self.keys)) != len(self.keys):
+            raise SheetsPoolError("API 키의 별칭을 중복 없이 .env에 설정하세요.")
         self.combos = [Combo(label, key, model) for label, key in self.keys for model in self.models]
         self.url = os.getenv("GEMINI_POOL_URL", "").strip()
         self.token = os.getenv("GEMINI_POOL_TOKEN", "").strip()
@@ -37,6 +61,8 @@ class SheetsKeyPool(GeminiKeyPool):
         self._disabled = set()
         self._active = None
         self._outcome = {}
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
         self.pending_dir = Path(__file__).resolve().parents[1] / ".pool_pending"
 
     def _post(self, action, **payload):
@@ -58,12 +84,13 @@ class SheetsKeyPool(GeminiKeyPool):
             return result
 
     def _retry_pending(self):
-        for path in sorted(self.pending_dir.glob("*.json")):
-            record = json.loads(path.read_text(encoding="utf-8"))
-            if record["endpoint"] != self.url or record["user"] != self.user:
-                continue
-            self._post("finish", **record["payload"])
-            path.unlink()
+        with _PENDING_LOCK:
+            for path in sorted(self.pending_dir.glob("*.json")):
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record["endpoint"] != self.url or record["user"] != self.user:
+                    continue
+                self._post("finish", **record["payload"])
+                path.unlink()
 
     def acquire_blocking(self, max_wait_sec=90, poll_interval=5):
         if self._active:
@@ -84,6 +111,7 @@ class SheetsKeyPool(GeminiKeyPool):
                     raise SheetsPoolError("서버가 로컬에 없는 키/모델을 선택했습니다.")
                 self._active = selected["request_id"]
                 self._outcome = {}
+                self._start_heartbeat()
                 print("  - 무작위 후보: " + ", ".join(
                     f"{c['key_label']}:{c['model']} (잔여 {c.get('remaining', '?')}회, 일일 사용 {c['day_count']}회)"
                     for c in result["sampled"]))
@@ -100,9 +128,31 @@ class SheetsKeyPool(GeminiKeyPool):
     def mark_cooldown(self, combo, seconds=60):
         self._outcome.update(limit="일시", retry_seconds=max(1, seconds))
 
+    def _start_heartbeat(self):
+        stop = threading.Event()
+        request_id = self._active
+
+        def send():
+            while not stop.wait(HEARTBEAT_INTERVAL_SEC):
+                try:
+                    self._post("heartbeat", request_id=request_id)
+                except SheetsPoolError:
+                    pass
+
+        self._heartbeat_stop = stop
+        self._heartbeat_thread = threading.Thread(target=send, name="gemini-pool-heartbeat", daemon=True)
+        self._heartbeat_thread.start()
+
+    def _stop_heartbeat(self):
+        if self._heartbeat_stop is not None:
+            self._heartbeat_stop.set()
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
+
     def finish(self, combo, response=None, error=None):
         if self._active is None:
             return
+        self._stop_heartbeat()
         usage = getattr(response, "usage_metadata", None)
         def count(name):
             value = getattr(usage, name, None)
@@ -119,10 +169,12 @@ class SheetsKeyPool(GeminiKeyPool):
         self.pending_dir.mkdir(exist_ok=True)
         path = self.pending_dir / (self._active.replace(":", "_") + ".json")
         # API 응답 본문/영상/키/인증 토큰은 저장하거나 시트로 전송하지 않는다.
-        path.write_text(json.dumps({"endpoint": self.url, "user": self.user, "payload": payload}), encoding="utf-8")
+        with _PENDING_LOCK:
+            path.write_text(json.dumps({"endpoint": self.url, "user": self.user, "payload": payload}), encoding="utf-8")
         try:
             self._post("finish", **payload)
-            path.unlink()
+            with _PENDING_LOCK:
+                path.unlink(missing_ok=True)
         except SheetsPoolError:
             print("  - 결과 기록 전송 실패: 로컬 보관 후 다음 분석 전에 재전송합니다. 시트 예약은 유지됩니다.")
         finally:
@@ -131,6 +183,30 @@ class SheetsKeyPool(GeminiKeyPool):
     def status(self):
         result = self._post("status")
         return json.dumps(result["rows"], ensure_ascii=False, indent=2)
+
+    def sync_keys(self):
+        """스크립트 속성의 공유 키와 병합하고 로컬 .env를 갱신한다."""
+        before = dict(self.keys)
+        result = self._post("sync", keys=[
+            {"key_label": label, "api_key": key} for label, key in self.keys
+        ])
+        shared = result.pop("keys", None)
+        if not isinstance(shared, list):
+            raise SheetsPoolError("공유 키 동기화 응답 형식이 올바르지 않습니다.")
+        keys = []
+        for item in shared:
+            label = item.get("key_label") if isinstance(item, dict) else None
+            key = item.get("api_key") if isinstance(item, dict) else None
+            if (not isinstance(label, str) or not label or any(c in label for c in "{}:, \t\r\n")
+                    or not isinstance(key, str) or not key or any(c in key for c in "{},:\"\r\n")):
+                raise SheetsPoolError("공유 키 동기화 응답에 잘못된 별칭 또는 키가 있습니다.")
+            keys.append((label, key))
+        if len(dict(keys)) != len(keys):
+            raise SheetsPoolError("공유 키 동기화 응답의 별칭이 중복되었습니다.")
+        result["local_added"] = sum(label not in before for label, _ in keys)
+        result["local_updated"] = sum(label in before and before[label] != key for label, key in keys)
+        _write_keys_to_env(keys, ENV_PATH)
+        return result
 
 
 def create_pool():

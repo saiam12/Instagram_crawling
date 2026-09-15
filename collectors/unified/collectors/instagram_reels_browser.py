@@ -4252,6 +4252,15 @@ def _response_status(response: Any) -> int | None:
     return status() if callable(status) else status
 
 
+def _should_collect_inline_profiles(options: argparse.Namespace, refresh_urls: Sequence[str]) -> bool:
+    return bool(
+        not options.no_login
+        and not refresh_urls
+        and not options.followers_only
+        and not options.followers_after_reels
+    )
+
+
 @dataclass
 class InstagramRateLimitState:
     """Shared stop signal for every page in one browser context."""
@@ -6289,7 +6298,7 @@ async def _run_collector_once(
         refresh_urls = load_reel_urls(options.urls_file) if not options.followers_only and options.urls_file else []
         anonymous_refresh = bool(options.no_login and refresh_urls)
         hybrid_android_metrics = bool(options.android_metrics and not anonymous_refresh)
-        inline_profiles = not options.no_login and not refresh_urls and not options.followers_only
+        inline_profiles = _should_collect_inline_profiles(options, refresh_urls)
         detached_android_metrics = hybrid_android_metrics and not options.android_metrics_required
         if detached_android_metrics and getattr(options, "relay_detached_android_logs", True):
             android_log_relay = asyncio.create_task(
@@ -6648,7 +6657,18 @@ async def _run_collector_once(
             )
 
         profile_pending_path = options.data_dir / ".collector" / "author_profile_pending.json"
-        profile_pending = json.loads(profile_pending_path.read_text(encoding="utf-8")) if profile_pending_path.exists() else {}
+        try:
+            profile_pending = (
+                json.loads(profile_pending_path.read_text(encoding="utf-8"))
+                if profile_pending_path.exists()
+                else {}
+            )
+            if not isinstance(profile_pending, dict):
+                profile_pending = {}
+        except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+            # A killed worker can leave a partially written profile queue.
+            # Treat it as empty so a new collection can rebuild it safely.
+            profile_pending = {}
         profile_cache: dict[str, dict[str, Any]] = {}
 
         async def collect_inline_profile(collected: dict[str, Any], active_page: Any, *, open_reel: bool = False) -> None:

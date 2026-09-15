@@ -111,14 +111,30 @@ def reel_url_identity(value: object) -> str:
     return f"{parsed.scheme.casefold()}://{parsed.hostname.casefold()}{path}"
 
 
-def read_reel_urls_from_xlsx(path: Path) -> list[str]:
+def read_reel_urls_from_xlsx(
+    path: Path,
+    *,
+    start_row: int | None = None,
+    end_row: int | None = None,
+) -> list[str]:
+    if start_row is not None and start_row < 1:
+        raise ValueError("start_row must be at least 1")
+    if end_row is not None and end_row < 1:
+        raise ValueError("end_row must be at least 1")
+    if start_row is not None and end_row is not None and end_row < start_row:
+        raise ValueError("end_row must be greater than or equal to start_row")
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
-        rows = workbook.active.iter_rows(values_only=True)
-        headers = [str(value or "").strip().casefold() for value in next(rows, ())]
+        worksheet = workbook.active
+        header = next(worksheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        headers = [str(value or "").strip().casefold() for value in header]
         url_index = next((index for index, value in enumerate(headers) if value in {"url", "reel_url"}), 0)
         urls: list[str] = []
-        for row in rows:
+        for row in worksheet.iter_rows(
+            min_row=max(2, start_row or 2),
+            max_row=end_row,
+            values_only=True,
+        ):
             value = row[url_index] if len(row) > url_index else ""
             candidate = str(value or "").strip()
             if is_instagram_reel_url(candidate):

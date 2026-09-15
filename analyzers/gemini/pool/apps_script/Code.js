@@ -1,14 +1,21 @@
 // Google Apps Script V8. 모든 클라이언트는 이 배포 한 곳만 사용해야 한다.
-// API 키는 받지 않는다. POOL_TOKEN은 스크립트 속성에 별도로 설정한다.
+// API 키는 동기화 요청에서만 받아 스크립트 속성에 저장한다. 시트 셀에는 기록하지 않는다.
 const SHEET_ID = '1g9sq7tuoiz-WE1OZNbN48M_KA0FY7MXgssE1_ev_-O8';
 const FIRST_ROW = 6;
 const LOG_WIDTH = 17;
 const BUSY = new Set(['후보 예약', '사용중']);
 const COUNTED = new Set(['사용중', '성공', '실패', '결과 미확인']);
-const FLASH_MODELS = new Set(['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-3.8-flash']);
+const RESERVATION_LEASE_MS = 10 * 60 * 1000;
+const FLASH_MODELS = new Set(['gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3.7-flash']);
+const DISABLED_MODELS = new Set(['gemini-3.8-flash']);
+const SETTINGS_HEADERS = ['키 별칭', '담당자', '모델', 'RPM 한도', 'RPD 한도',
+  '사용 여부', '비고', '초기 집계일', '초기 사용량'];
 
 function dayAt(now) {
-  return Utilities.formatDate(new Date(now), 'America/Los_Angeles', 'yyyy-MM-dd');
+  return Utilities.formatDate(new Date(now), 'Asia/Seoul', 'yyyy-MM-dd');
+}
+function timeAt(now) {
+  return Utilities.formatDate(new Date(now), 'Asia/Seoul', 'HH:mm:ss');
 }
 function groupKey(project, model) { return JSON.stringify([project, model]); }
 function clean(value) {
@@ -28,45 +35,60 @@ function readRows(sheet, width) {
   }
   return rows;
 }
+function migrateSettingsSchema(sheet) {
+  const headers = sheet.getRange(5, 1, 1, 10).getDisplayValues()[0];
+  const migrated = headers[0] === '프로젝트 별칭' && headers[1] === '키 별칭';
+  if (migrated) {
+    const count = sheet.getLastRow() - FIRST_ROW + 1;
+    if (count > 0) {
+      const labels = sheet.getRange(FIRST_ROW, 2, count, 1).getValues();
+      sheet.getRange(FIRST_ROW, 1, count, 1).setValues(labels);
+    }
+    sheet.deleteColumn(2);
+  }
+  sheet.getRange(5, 1, 1, SETTINGS_HEADERS.length).setValues([SETTINGS_HEADERS]);
+  SpreadsheetApp.flush();
+  return migrated;
+}
 function settingsFrom(rows) {
-  const config = [], labels = new Map(), groups = new Map(), seen = new Set();
+  const config = [], seen = new Set();
   rows.forEach(r => {
-    if (!r.slice(0, 8).some(v => v !== '')) return;
-    if (r[6] !== '사용') return;
-    const [project, label, , model, rpm, rpd] = r;
-    if (!FLASH_MODELS.has(model)) throw new Error('3.5/3.6/3.7/3.8 Flash만 사용 가능합니다. Lite는 제외하세요.');
-    if (![project, label, model].every(v => typeof v === 'string' && v.trim()) ||
+    if (!r.slice(0, 7).some(v => v !== '')) return;
+    if (r[5] !== '사용') return;
+    const [label, , model, rpm, rpd] = r, project = label;
+    if (DISABLED_MODELS.has(model)) return;
+    if (!FLASH_MODELS.has(model)) throw new Error('3.5/3.6/3.7 Flash만 사용 가능합니다. 3.8과 Lite는 제외하세요.');
+    if (![label, model].every(v => typeof v === 'string' && v.trim()) ||
         !Number.isInteger(rpm) || rpm < 0 || !Number.isInteger(rpd) || rpd < 0)
       throw new Error('사용 설정 행에는 별칭/모델과 정수 RPM/RPD를 입력하세요.');
-    [project, label, model].forEach(clean);
-    if (labels.has(label) && labels.get(label) !== project) throw new Error('같은 키 별칭이 여러 프로젝트에 연결되었습니다.');
-    labels.set(label, project);
-    const key = groupKey(project, model), pair = groupKey(label, model);
+    [label, model].forEach(clean);
+    const pair = groupKey(label, model);
     if (seen.has(pair)) throw new Error('키 별칭 + 모델 설정이 중복되었습니다.');
     seen.add(pair);
-    const baselineDay = r[8] instanceof Date ? Utilities.formatDate(r[8], 'America/Los_Angeles', 'yyyy-MM-dd') : (r[8] || '');
-    const baseline = r[9] === '' || r[9] == null ? 0 : r[9];
+    const baselineDay = r[7] instanceof Date ? dayAt(r[7]) : (r[7] || '');
+    const baseline = r[8] === '' || r[8] == null ? 0 : r[8];
     if (!Number.isInteger(baseline) || baseline < 0 || (baseline > 0 && !/^\d{4}-\d{2}-\d{2}$/.test(baselineDay)))
       throw new Error('초기 사용량은 0 이상 정수, 초기 집계일은 YYYY-MM-DD로 입력하세요.');
-    if (groups.has(key) && (groups.get(key).rpm !== rpm || groups.get(key).rpd !== rpd ||
-        groups.get(key).baseline !== baseline || groups.get(key).baselineDay !== baselineDay))
-      throw new Error('같은 프로젝트 + 모델의 RPM/RPD가 서로 다릅니다.');
     const c = {project, key_label: label, model, rpm, rpd, baseline, baselineDay};
-    config.push(c); groups.set(key, c);
+    config.push(c);
   });
   return config;
 }
 function statsFor(c, logs, now) {
   const day = dayAt(now);
   const rows = logs.filter(r => r[2] === c.project && r[4] === c.model);
-  // Sheets가 YYYY-MM-DD 문자열을 Date로 자동 변환해도 같은 태평양시 날짜로 집계한다.
+  const active = rows.filter(r => BUSY.has(r[7]) &&
+    (Date.parse(r[6]) || Date.parse(r[5]) || 0) > now - RESERVATION_LEASE_MS);
+  // Sheets가 YYYY-MM-DD 문자열을 Date로 자동 변환해도 같은 한국 날짜로 집계한다.
   const today = rows.filter(r => (r[14] instanceof Date ? dayAt(r[14]) : String(r[14])) === day);
   return {
     count: today.filter(r => COUNTED.has(r[7])).length + (c.baselineDay === day ? c.baseline : 0),
     // 날짜가 바뀌어도 실제 진행 중인 분석은 계속 사용중이다.
-    busy: rows.some(r => BUSY.has(r[7])),
+    busy: active.length > 0,
+    users: [...new Set(active.map(r => String(r[1] || '')).filter(Boolean))],
     daily: today.some(r => r[12] === '일일'),
     retry: Math.max(0, ...rows.map(r => Date.parse(r[13]) || 0)),
+    lastUsed: Math.max(0, ...rows.filter(r => COUNTED.has(r[7])).map(r => Date.parse(r[5]) || 0)),
     rpm: rows.filter(r => COUNTED.has(r[7]) && Date.parse(r[5]) > now - 60000).length,
   };
 }
@@ -129,7 +151,7 @@ function acquire(sheet, config, logs, body, now) {
   }
   const iso = new Date(now).toISOString();
   const rows = sample.map((c, i) => [body.request_id + ':' + i, clean(body.user), c.project,
-    c.key_label, c.model, iso, '', '후보 예약', '', '', '', '', '', '', dayAt(now), c.day_count, c.remaining]);
+    c.key_label, c.model, iso, iso, '후보 예약', '', '', '', '', '', '', dayAt(now), c.day_count, c.remaining]);
   const range = sheet.getRange(FIRST_ROW + logs.length, 1, rows.length, LOG_WIDTH);
   range.setValues(rows); // 두 후보를 한 번의 쓰기로 함께 예약
   SpreadsheetApp.flush();
@@ -158,6 +180,107 @@ function finish(sheet, logs, body, now) {
   SpreadsheetApp.flush();
   return {ok: true};
 }
+function heartbeat(sheet, logs, body, now) {
+  const index = logs.findIndex(r => r[0] === body.request_id && r[1] === body.user);
+  if (index < 0) throw new Error('heartbeat 요청 ID 또는 예약 소유자를 확인하세요.');
+  const row = logs[index];
+  if (!BUSY.has(row[7])) return {ok: true};
+  row[6] = new Date(now).toISOString();
+  sheet.getRange(FIRST_ROW + index, 1, 1, LOG_WIDTH).setValues([row]);
+  SpreadsheetApp.flush();
+  return {ok: true};
+}
+function mergeSharedKeys(stored, submitted, user, now) {
+  if (!Array.isArray(stored) || !Array.isArray(submitted)) throw new Error('공유 키 목록 형식이 올바르지 않습니다.');
+  const byLabel = new Map();
+  stored.forEach(item => {
+    if (!item || typeof item.key_label !== 'string' || typeof item.api_key !== 'string' ||
+        typeof item.owner !== 'string') throw new Error('저장된 공유 키 형식이 올바르지 않습니다.');
+    byLabel.set(item.key_label, item);
+  });
+  const storedLabels = new Set(stored.map(item => item.key_label));
+  const submittedByLabel = new Map(submitted.map(item => [item?.key_label, item?.api_key]));
+  const owners = new Set(stored.map(item => item.owner));
+  let owner_renamed = 0;
+  if (stored.length && owners.size === 1 && !owners.has(user) &&
+      submittedByLabel.size === storedLabels.size &&
+      stored.every(item => submittedByLabel.get(item.key_label) === item.api_key)) {
+    byLabel.forEach(item => { item.owner = user; });
+    owner_renamed = stored.length;
+  }
+  let vault_added = 0, vault_updated = 0;
+  submitted.forEach(item => {
+    const label = clean(item?.key_label), key = String(item?.api_key || '');
+    if (!label || !key || key.length > 500 || /[{},:\"\r\n]/.test(key))
+      throw new Error('동기화할 키 별칭 또는 API 키 형식이 올바르지 않습니다.');
+    const current = byLabel.get(label);
+    if (!current) {
+      byLabel.set(label, {key_label: label, api_key: key, owner: user,
+        updated_at: new Date(now).toISOString()});
+      vault_added++;
+    } else if (current.owner === user && current.api_key !== key) {
+      byLabel.set(label, {...current, api_key: key, updated_at: new Date(now).toISOString()});
+      vault_updated++;
+    }
+  });
+  return {keys: [...byLabel.values()], vault_added, vault_updated, owner_renamed};
+}
+function syncSettings(sheet, rows, sharedKeys) {
+  const owners = new Map(sharedKeys.map(item => [item.key_label, item.owner]));
+  const labels = [...owners.keys()], wanted = new Set(labels), supported = [...FLASH_MODELS];
+  const aliases = new Map();
+  rows.forEach(row => {
+    const label = String(row[0] || '');
+    if (!label) return;
+    if (!aliases.has(label)) aliases.set(label, []);
+    aliases.get(label).push(row);
+  });
+  let added = 0, updated = 0, enabled = 0, stopped = 0;
+  rows.forEach(row => {
+    const label = String(row[0] || ''), isWanted = wanted.has(label);
+    if (isWanted) {
+      let changed = false;
+      if (row[1] !== owners.get(label)) { row[1] = owners.get(label); changed = true; }
+      if (changed) updated++;
+    }
+    if (!isWanted) return;
+    const shouldUse = FLASH_MODELS.has(String(row[2] || ''));
+    const next = shouldUse ? '사용' : '중지';
+    if (row[5] !== next) {
+      row[5] = next;
+      shouldUse ? enabled++ : stopped++;
+    }
+  });
+  labels.forEach(label => {
+    const existing = aliases.get(label) || [];
+    supported.forEach(model => {
+      if (existing.some(row => row[2] === model)) return;
+      const group = rows.find(row => row[0] === label && row[2] === model);
+      rows.push([label, owners.get(label), model,
+        Number.isInteger(group?.[3]) ? group[3] : 5,
+        Number.isInteger(group?.[4]) ? group[4] : 20,
+        '사용', '명령어 자동 동기화', group?.[7] || '', group?.[8] || '']);
+      added++;
+    });
+  });
+  if (rows.length) sheet.getRange(FIRST_ROW, 1, rows.length, 9).setValues(rows);
+  SpreadsheetApp.flush();
+  return {ok: true, added, updated, enabled, stopped};
+}
+function syncLogProjects(sheet, rows, sharedKeys) {
+  const labels = new Set(sharedKeys.map(item => item.key_label));
+  let updated = 0;
+  rows.forEach(row => {
+    const label = String(row[3] || '');
+    if (labels.has(label) && row[2] !== label) {
+      row[2] = label;
+      updated++;
+    }
+  });
+  if (updated) sheet.getRange(FIRST_ROW, 1, rows.length, LOG_WIDTH).setValues(rows);
+  SpreadsheetApp.flush();
+  return updated;
+}
 function refreshOverview(book, config, logs, now) {
   const sheet = book.getSheetByName('사용 현황');
   if (!sheet) return;
@@ -168,12 +291,17 @@ function refreshOverview(book, config, logs, now) {
       s.retry > now || s.rpm >= c.rpm ? '일시 대기' : '사용 가능';
     return [dayAt(now), c.project, c.model, s.count, s.busy ? 1 : 0,
       s.daily ? 0 : Math.max(0, c.rpd - s.count), status,
-      s.retry > now ? new Date(s.retry).toISOString() : '', new Date(now).toISOString()];
+      s.lastUsed ? timeAt(s.lastUsed) : '', timeAt(now), s.users.join(', ')];
   });
   sheet.getRange('A2').setValue('공용 기록 집계 — 요청 수는 예약 시 보수적으로 차감합니다. 외부 사용량은 미반영입니다.');
+  sheet.getRange('A5').setValue('집계일(KST)');
+  sheet.getRange('B5').setValue('키 별칭');
+  sheet.getRange('H5').setValue('마지막 사용 시각(KST)');
+  sheet.getRange('I5').setValue('마지막 갱신(KST)');
+  sheet.getRange('J5').setValue('사용 중 사용자');
   const height = Math.max(rows.length, sheet.getLastRow() - FIRST_ROW + 1);
-  if (height > 0) sheet.getRange(FIRST_ROW, 1, height, 9).setValues(
-    Array.from({length: height}, (_, i) => rows[i] || Array(9).fill('')));
+  if (height > 0) sheet.getRange(FIRST_ROW, 1, height, 10).setValues(
+    Array.from({length: height}, (_, i) => rows[i] || Array(10).fill('')));
   return rows;
 }
 function doPost(e) {
@@ -181,26 +309,42 @@ function doPost(e) {
   let result;
   try {
     const body = JSON.parse(e.postData.contents);
-    const token = PropertiesService.getScriptProperties().getProperty('POOL_TOKEN');
+    const properties = PropertiesService.getScriptProperties();
+    const token = properties.getProperty('POOL_TOKEN');
     if (!token || token.length < 32 || body.token !== token) throw new Error('인증 실패');
     if (!body.user || typeof body.user !== 'string') throw new Error('사용자 별칭이 필요합니다.');
     clean(body.user);
-    if (!['acquire', 'finish', 'status'].includes(body.action)) throw new Error('지원하지 않는 요청');
+    if (!['acquire', 'finish', 'heartbeat', 'status', 'sync'].includes(body.action)) throw new Error('지원하지 않는 요청');
     lock = LockService.getScriptLock();
     lock.waitLock(10000);
     const book = SpreadsheetApp.openById(SHEET_ID);
     const settings = book.getSheetByName('프로젝트 설정'), log = book.getSheetByName('요청 기록');
     if (!settings || !log) throw new Error('설정/요청 기록 탭을 확인하세요.');
+    migrateSettingsSchema(settings);
     const logs = readRows(log, LOG_WIDTH), now = Date.now();
     // 설정 오류가 생겨도 이미 진행 중인 예약은 해제할 수 있어야 한다.
     if (body.action === 'finish') result = finish(log, logs, body, now);
+    else if (body.action === 'heartbeat') result = heartbeat(log, logs, body, now);
+    else if (body.action === 'sync') {
+      let stored;
+      try { stored = JSON.parse(properties.getProperty('GEMINI_SHARED_KEYS') || '[]'); }
+      catch (_) { throw new Error('저장된 공유 키 JSON을 확인하세요.'); }
+      const merged = mergeSharedKeys(stored, body.keys, body.user, now);
+      properties.setProperty('GEMINI_SHARED_KEYS', JSON.stringify(merged.keys));
+      result = syncSettings(settings, readRows(settings, 9), merged.keys);
+      result.log_updated = syncLogProjects(log, logs, merged.keys);
+      result.vault_added = merged.vault_added;
+      result.vault_updated = merged.vault_updated;
+      result.owner_renamed = merged.owner_renamed;
+      result.keys = merged.keys.map(item => ({key_label: item.key_label, api_key: item.api_key}));
+    }
     else {
-      const config = settingsFrom(readRows(settings, 10));
+      const config = settingsFrom(readRows(settings, 9));
       result = body.action === 'acquire' ? acquire(log, config, logs, body, now) : {ok: true};
     }
     // 요청 기록이 원본이다. 현황 갱신 실패가 성공한 예약/종료를 취소하지 않는다.
     try {
-      const config = settingsFrom(readRows(settings, 10));
+      const config = settingsFrom(readRows(settings, 9));
       result.rows = refreshOverview(book, config, readRows(log, LOG_WIDTH), now);
       log.getRange('P5').setValue('후보 선택 전 요청 수');
       log.getRange('Q5').setValue('후보 선택 전 잔여량');
@@ -215,5 +359,6 @@ function doPost(e) {
 
 // Node의 모의 시트 테스트에서만 사용. Apps Script에서는 실행되지 않는다.
 if (typeof module !== 'undefined') module.exports = {
-  readRows, settingsFrom, statsFor, sampleCandidates, selectRows, acquire, finish, doPost,
+  dayAt, timeAt, readRows, migrateSettingsSchema, settingsFrom, statsFor, sampleCandidates, selectRows, acquire, finish, heartbeat,
+  mergeSharedKeys, syncSettings, syncLogProjects, refreshOverview, doPost,
 };

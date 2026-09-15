@@ -26,12 +26,18 @@ python -m venv .venv
 
 | 경로 | 용도 |
 |---|---|
-| `collectors` | Python 릴스 및 팔로워 수집 코드 |
+| `collectors` | 웹·팔로워 수집, Android 지표 보강, 일시정지·진단 코드 |
 | `exporters` | CSV·JSON·XLSX 저장 코드 |
 | `scripts` | 실행 목적별 진입점 |
 | `data_web` | 실제 수집 결과(처음 실행할 때 자동 생성) |
 | `.instagram_chrome_profile` | Chrome 전용 로그인 프로필(자동 생성, 최초 실행 시 로그인 필요) |
 | `examples` | 출력 예시와 검증 자료 |
+| `data_web_test` | 수집 출력 검증용 데이터 |
+| `collector.ps1` | PowerShell 실행 진입점 |
+| `start-android.ps1` | 에뮬레이터 준비 스크립트 |
+| `repair_venv.ps1` | 가상환경 복구 스크립트 |
+
+통합 수집기의 Android 보강 코드는 이 폴더의 `collectors/android_reel_metrics.py`에 있습니다. 독립 Android 수집기는 `../android/`에서 별도로 관리합니다.
 
 ## 기본 실행
 
@@ -150,12 +156,25 @@ Get-Content .\data_web\diagnostics\rate_limit_*.json
 
 작성자 팔로워 수와 프로필 정보는 Python 웹 프로필 수집기가 담당합니다. Android 보강은 사용자 프로필을 읽거나 웹의 URL·캡션·해시태그·위치·업로드일을 덮어쓰지 않습니다. Instagram이 리포스트·공유·저장 집계를 표시하지 않으면 `0`으로 추정하지 않고 빈 값으로 둡니다.
 
-로그인한 신규 Reel 수집은 저장 조건을 통과한 릴스를 먼저 보존한 뒤, 현재 Reel의 작성자 프로필 링크(프로필 사진 또는 작성자 제목)를 클릭합니다. 캡션의 계정 태그는 클릭 후보에서 제외합니다. 이동한 프로필 URL과 응답의 user ID가 작성자와 일치할 때 기존 정확값 판독기로 팔로워 수 및 users 정보를 저장하고 다음 릴스로 진행합니다. 같은 실행에서 검증한 동일 ID·username의 프로필 결과는 재사용합니다. 프로필 확인이 실패해도 저장한 Reel과 Android 작업은 유지됩니다. 프로필 응답에서 ID를 검증할 수 없는 경우에도 추정값을 쓰지 않습니다.
+일반 로그인 신규 Reel 수집은 저장 조건을 통과한 릴스를 먼저 보존한 뒤, 현재 Reel의 작성자 프로필 링크(프로필 사진 또는 작성자 제목)를 클릭합니다. 캡션의 계정 태그는 클릭 후보에서 제외합니다. 이동한 프로필 URL과 응답의 user ID가 작성자와 일치할 때 기존 정확값 판독기로 팔로워 수 및 users 정보를 저장하고 다음 릴스로 진행합니다. 같은 실행에서 검증한 동일 ID·username의 프로필 결과는 재사용합니다. 프로필 확인이 실패해도 저장한 Reel과 Android 작업은 유지됩니다. 프로필 응답에서 ID를 검증할 수 없는 경우에도 추정값을 쓰지 않습니다. 패션·뷰티 예약 수집은 5개 해시태그 묶음의 Reel 수집을 먼저 마친 뒤, 그 묶음에서 저장한 Reel 작성자를 중복 제거해 팔로워 수를 수집하고 결과를 저장한 다음 다음 해시태그 묶음으로 넘어갑니다.
 
 실패한 프로필 조회는 데이터셋의 `.collector/author_profile_pending.json`에 원본 Reel URL, 실패 이유, 시도 횟수와 재시도 시각을 저장합니다. 다음 신규 수집 호출 시작 시 도래한 작업을 최대 5건 재시도합니다. 일반 실패는 60초 이후 다시 시도하며 3회 실패하면 `needs_review`로 남깁니다. 429 uses the manual pause described above; enter `resume` to continue. 이 파일은 프로그램 재시작 후에도 유지되며 독립적인 예약 워커는 아닙니다. 기존에 잘못 저장된 행 전체를 자동 복구하는 기능은 아닙니다. +4시간 URL 재수집과 `followers` 명령은 기존 users 조회 경로를 유지합니다.
 터미널의 릴스 진행 표시는 실제로 저장된 릴스만 `[현재 저장 수/목표] URL` 형식으로 카운트합니다.
 `[METRIC]` 디버그 줄은 콘솔에 출력하지 않습니다. 원본 필드 검증은 수집 내부에서 유지합니다.
 `collection_label` 열은 만들지 않습니다. 같은 `data_web` 폴더에서 여러 수집기를 동시에 실행하면 파일 잠금 오류가 발생하도록 보호되어 있습니다.
+
+패션 고반응 릴스 자동 분석
+
+패션 데이터셋의 `reaction_rate`가 9000% 이상(내부 저장값 90.0 이상)인 릴스는 수집이 끝난 뒤 Gemini 분석기로 자동 전달됩니다. 분석 작업은 최대 4개까지 병렬 실행되며 수집 스케줄을 막지 않습니다. 같은 URL은 성공한 분석 결과를 다시 실행하지 않습니다.
+
+분석 결과와 처리 상태는 다음 파일에 저장됩니다.
+
+```text
+data_web/fashion_reel_analyses.json
+data_web/.datasets/fashion/.collector/fashion_analyzer_state.json
+```
+
+기본 `fashion --background` 실행에 이 동작이 포함됩니다. Gemini 분석기 가상환경을 별도로 사용하려면 `FASHION_ANALYZER_PYTHON` 환경 변수에 해당 Python 실행 파일 경로를 지정하세요. API 키·모델 풀 설정은 `analyzers/gemini/.env`를 사용합니다.
 
 ## 패션·뷰티 승인 수집
 
@@ -282,7 +301,7 @@ Reel 파일은 최초 수집과 재수집을 각각 별도 행으로 추가하�
 .\collector.ps1 followers
 ```
 
-`--followers-after-reels`는 기존 명령 호환을 위해 허용합니다. 로그인한 신규 수집에서는 이 옵션보다 Reel별 작성자 프로필 확인 흐름이 우선하며, URL 재수집에서는 기존 의미를 유지합니다.
+`--followers-after-reels`는 신규 Reel 수집 중 작성자를 기록해 두었다가 Reel 탐색이 끝난 뒤 중복 제거하여 일괄 조회합니다. 패션·뷰티 예약 수집은 이 옵션을 사용하므로 기본 5개 해시태그 묶음마다 실행됩니다. URL 재수집에서는 기존 의미를 유지합니다.
 `--direct-concurrency`도 기존 명령 호환을 위해 허용하지만, 정확한 shortcode 연결을 위해 실제 재수집 동시성은 1로 고정됩니다.
 `--hashtag-query`, `--urls-file`, `--followers-only`, `--max-upload-age-days`, `--page-recycle-items`, `--checkpoint-items` 등의 옵션도 사용할 수 있습니다. `--direct-reel-info-wait-seconds`와 정확 지표 재시도 옵션은 이전 수집기 호환을 위해 남아 있지만 기본 수집 경로에서는 별도 endpoint를 호출하지 않습니다.
 

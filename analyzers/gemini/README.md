@@ -15,7 +15,21 @@ python -m pip install -r requirements.txt
    ```bash
    cp .env.example .env
    ```
-2. `.env` 파일의 `GEMINI_API_KEYS`에 키를 쉼표로 구분해 입력합니다. 단일 키는 `GEMINI_API_KEY`도 지원합니다.
+2. `.env` 파일의 `GEMINI_API_KEYS`를 큰따옴표로 감싸고, 중괄호 안에 키를 한 줄씩 입력합니다. 단일 키는 `GEMINI_API_KEY`도 지원합니다.
+
+   ```dotenv
+   GEMINI_API_KEYS="{acct1:키1,
+   acct2:키2}"
+   ```
+   키를 추가하거나 제거한 뒤 아래 명령으로 공용 시트에 별칭을 동기화합니다.
+
+   ```powershell
+   python reel_analyzer.py --sync-key-pool
+   ```
+
+   동기화할 때 실제 키는 Apps Script의 `GEMINI_SHARED_KEYS` 스크립트 속성에 저장되고,
+   공용 시트 셀에는 기록되지 않습니다. 같은 `GEMINI_POOL_TOKEN`을 가진 팀원은 공유 키를 내려받아
+   로컬 `.env`에 자동으로 추가하거나 갱신합니다.
    - 키 발급: https://aistudio.google.com/apikey
 3. `GEMINI_MODELS`에 사용할 모델을 우선순위 순서로 입력합니다. 복수 설정이 없으면 `GEMINI_MODEL`을 사용합니다.
 
@@ -25,7 +39,7 @@ python -m pip install -r requirements.txt
 
 기본 실행은 **Google Sheets 공용 풀**입니다. 먼저 [시트 연동 설정](pool/apps_script/README.md)을 마치세요.
 릴스마다 무작위 후보 2개를 함께 예약하고 당일 요청 수가 적은 조합을 선택합니다.
-Flash 3.5/3.6/3.7/3.8만 허용합니다. 연결 설정이 없으면 실행을 중단합니다.
+Flash 3.5/3.6/3.7만 허용하며 3.8은 비활성화되어 있습니다. 연결 설정이 없으면 실행을 중단합니다.
 로컬 단독 풀이 필요한 경우에만 `.env`에서 `GEMINI_POOL_MODE=local`로 지정하세요.
 
 ```bash
@@ -41,7 +55,8 @@ Reel URL > https://www.instagram.com/reels/DcSDbXNCtfd/
 ```
 
 - 종료하려면 `quit`, `exit`, `q` 중 하나를 입력하세요.
-- 계속해서 다른 URL을 입력하며 여러 개를 연속으로 분석할 수 있습니다.
+- 분석 중에도 다음 URL을 계속 입력할 수 있습니다. URL은 대기열에 들어가며 공용 시트 모드에서는 2개 워커가 병렬로 처리합니다.
+- `quit`, `exit`, `q`를 입력하면 이미 대기열에 넣은 분석을 모두 마친 뒤 종료합니다.
 
 URL 한 건을 바로 분석하려면:
 
@@ -61,8 +76,8 @@ python reel_analyzer.py --xlsx "C:\path\to\reels.xlsx"
 python reel_analyzer.py --xlsx "C:\path\to\reels.xlsx" --model gemini-3.6-flash
 ```
 
-지원 모델은 `gemini-3.5-flash`, `gemini-3.6-flash`, `gemini-3.7-flash`,
-`gemini-3.8-flash`입니다. XLSX의 한 URL이 실패해도 다음 URL 분석은 계속됩니다.
+지원 모델은 `gemini-3.5-flash`, `gemini-3.6-flash`, `gemini-3.7-flash`입니다.
+`gemini-3.8-flash`는 운영 안정성 확인 전까지 비활성화되어 있습니다. XLSX의 한 URL이 실패해도 다음 URL 분석은 계속됩니다.
 
 ## 프로젝트 구조
 

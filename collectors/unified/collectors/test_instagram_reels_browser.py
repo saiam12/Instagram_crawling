@@ -330,6 +330,15 @@ class CollectorUtilityTests(unittest.TestCase):
         self.assertEqual(missing_python_to_android_handoff_fields(record), ())
         self.assertEqual(python_to_android_handoff_delay_seconds(record), 0.0)
 
+    def test_followers_after_reels_disables_per_reel_profile_navigation(self) -> None:
+        self.assertFalse(
+            reels_browser._should_collect_inline_profiles(
+                parse_args(["--followers-after-reels"]),
+                [],
+            )
+        )
+        self.assertTrue(reels_browser._should_collect_inline_profiles(parse_args([]), []))
+
     def test_rate_limited_record_keeps_static_history_but_not_old_counts(self) -> None:
         previous = reel_record(1, "2026-01-01T00:00:00.000Z")
         previous.update({"view_count": 999, "repost_count": 8, "follower_count": 1234})

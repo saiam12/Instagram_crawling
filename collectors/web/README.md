@@ -1,6 +1,6 @@
 # Python Instagram Reels 수집기
 
-기존 JavaScript·PowerShell 구현은 상위 프로젝트 폴더에 그대로 두고, Python 구현만 이 폴더에 분리했습니다. Python 수집기는 자체 로그인 프로필과 `data_web` 출력 폴더를 사용하므로 기존 버전의 데이터와 섞이지 않습니다.
+브라우저 기반 Python 수집기는 `collectors/web`에서 관리합니다. 이 폴더의 로그인 프로필과 `data_web` 출력 폴더를 사용합니다.
 
 수집 항목에는 조회수(`view_count`)가 포함됩니다. 릴스 공개 출력은 한 릴스가 한 행을 사용하고, 재수집 값은 `2nd collect_*` 같은 새 열에 저장됩니다. 사용자 공개 CSV·엑셀은 재수집마다 새 행을 추가합니다.
 
@@ -32,6 +32,9 @@ python -m venv .venv
 | `data_web` | 실제 수집 결과(처음 실행할 때 자동 생성) |
 | `.instagram_browser_profile` | Python 버전 전용 로그인 프로필(자동 생성) |
 | `examples` | 출력 예시와 검증 자료 |
+| `data_web_test` | 수집 출력 검증용 데이터 |
+| `collector.ps1` | PowerShell 실행 진입점 |
+| `repair_venv.ps1` | 가상환경 복구 스크립트 |
 
 ## 기본 실행
 

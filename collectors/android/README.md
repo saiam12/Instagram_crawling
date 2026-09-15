@@ -2,7 +2,7 @@
 
 Android Studio 에뮬레이터에서 이미 로그인된 Instagram 앱의 **화면에 표시되는 정보만** 읽는 독립 수집기입니다. ADB와 UIAutomator로 앱을 열고, 검색·릴스 상세 화면·스크롤·공유 링크 복사만 자동화합니다. 좋아요, 팔로우, 댓글, 게시, 메시지 전송 같은 계정 행동은 수행하지 않습니다. 신규 릴스 수집과 URL이 있는 기존 릴스 재수집을 지원합니다.
 
-`python_version`, `python_no_login_version`과 소스·로그인 프로필·출력 파일을 공유하지 않습니다.
+독립 Android 수집기 코드는 `collectors/android`에서 관리하며, 브라우저 로그인 프로필 대신 Android 앱의 로그인 상태를 사용합니다. 결과는 이 폴더의 `data_android`에 별도로 저장합니다.
 
 ## 설치
 
@@ -25,7 +25,7 @@ python -m venv .venv
 
 ## 실행
 
-`python_version`의 신규 수집 명령과 옵션 이름을 최대한 맞췄습니다. 명령어를 생략하면 `collect`입니다.
+웹 수집기(`collectors/web`)의 신규 수집 명령과 옵션 이름을 최대한 맞췄습니다. 명령어를 생략하면 `collect`입니다.
 
 ### 릴스 피드 신규 수집
 
@@ -88,7 +88,7 @@ python -m venv .venv
 .\collector.ps1 fashion-beauty --six-hour-new-only --background
 ```
 
-`fashion`, `beauty`, `fashion-beauty`는 `python_version`의 키워드 목록을 사용해 지정 간격마다 **신규 릴스만** 탐색합니다. 기본 실행은 16시간·30분 간격이며, `--duration-hours`, `--discovery-interval-minutes`, `--new-items-per-window`, `--max-new-items-per-window`, `--keywords-per-window`, `--fashion-hashtag-query`, `--beauty-hashtag-query`, `--test-single-hashtag`, `--base-output`을 지원합니다. `--six-hour-new-only`는 6시간·창당 250개·기본 `reels.*` 출력 프리셋입니다.
+`fashion`, `beauty`, `fashion-beauty`는 웹 수집기와 같은 키워드 목록을 사용해 지정 간격마다 **신규 릴스만** 탐색합니다. 기본 실행은 16시간·30분 간격이며, `--duration-hours`, `--discovery-interval-minutes`, `--new-items-per-window`, `--max-new-items-per-window`, `--keywords-per-window`, `--fashion-hashtag-query`, `--beauty-hashtag-query`, `--test-single-hashtag`, `--base-output`을 지원합니다. `--six-hour-new-only`는 6시간·창당 250개·기본 `reels.*` 출력 프리셋입니다.
 
 ### URL 기반 재수집
 
@@ -96,6 +96,21 @@ python -m venv .venv
 
 ```powershell
 .\collector.ps1 refresh --max-items 50 --verbose-progress
+```
+
+다른 Excel 파일에서 화면에 보이는 행 번호 범위만 골라 재수집할 수도 있습니다. 첫 행의 `url` 또는
+`reel_url` 열을 사용하며, 시작 행과 끝 행을 모두 포함합니다. 헤더가 1행이면 아래 예시는 데이터
+100행부터 150행까지 처리합니다. 범위 안의 빈 행, Instagram Reel URL이 아닌 값, 중복 URL은 건너뜁니다.
+행 범위를 명시한 실행은 `--max-items` 기본값보다 범위를 우선합니다. 결과는 원본 Excel을 수정하지 않고
+`--data-dir`의 Android 출력에 새 수집 행으로 누적합니다.
+
+```powershell
+.\collector.ps1 refresh `
+  --input-xlsx 'C:\Instagram-crawling\collectors\unified\data_web\.datasets\fashion\reels.xlsx' `
+  --start-row 100 `
+  --end-row 150 `
+  --data-dir .\data_android `
+  --verbose-progress
 ```
 
 URL이 비어 있는 과거 행은 Android가 같은 Reel을 안정적으로 다시 열 수 없으므로 건너뜁니다. Android 신규 수집과 `refresh`를 같은 출력 폴더에서 동시에 실행하지 마세요.
@@ -115,8 +130,8 @@ URL이 비어 있는 과거 행은 Android가 같은 Reel을 안정적으로 다
 
 | 경로 | 내용 |
 | --- | --- |
-| `reels.csv` | `python_version`과 같은 공개 릴스 관측 이력 |
-| `reels.json` | `python_version`과 같은 열·자료형의 공개 JSON 이력 |
+| `reels.csv` | 웹 수집기와 호환되는 공개 릴스 관측 이력 |
+| `reels.json` | 웹 수집기와 호환되는 열·자료형의 공개 JSON 이력 |
 | `reels.xlsx` | Python 호환 공개 Excel 수집 이력 |
 | `users.csv`, `users.json`, `users.xlsx` | 수집된 릴스 작성자 기준의 사용자 관측 이력 |
 | `.collector\android_observations.json` | Android 전용 원문 지표·수집 방식·XML/PNG 증빙 경로 |
@@ -125,7 +140,7 @@ URL이 비어 있는 과거 행은 Android가 같은 Reel을 안정적으로 다
 | `evidence\000001.likes_and_plays.xml` | 좋아요·조회수 상세 패널의 UIAutomator XML |
 | `evidence\000001.likes_and_plays.png` | 좋아요·조회수 상세 패널의 스크린샷 |
 
-공개 파일의 열 순서는 `collection_number`, `days_since_previous`를 포함해 `python_version`의 `reels.*`와 같습니다. 접근성 텍스트의 정확한 `Like number`, `Comment number`, `Reposted`, `Reshare number`를 우선 읽습니다. 화면이 `15.6K`·`1.2M`처럼 축약값만 보일 때는 각각 곱셈 단위(K=1,000, M=1,000,000)를 적용한 표시 기반 정수를 저장합니다. 좋아요 수 버튼을 열면 표시되는 `Likes and plays` 상세 패널에서 정확한 `like_count`와 `view_count`를 읽고 바로 원래 릴스로 돌아옵니다.
+공개 파일의 열 순서는 `collection_number`, `days_since_previous`를 포함해 웹 수집기의 `reels.*`와 같습니다. 접근성 텍스트의 정확한 `Like number`, `Comment number`, `Reposted`, `Reshare number`를 우선 읽습니다. 화면이 `15.6K`·`1.2M`처럼 축약값만 보일 때는 각각 곱셈 단위(K=1,000, M=1,000,000)를 적용한 표시 기반 정수를 저장합니다. 좋아요 수 버튼을 열면 표시되는 `Likes and plays` 상세 패널에서 정확한 `like_count`와 `view_count`를 읽고 바로 원래 릴스로 돌아옵니다.
 
 상세 패널에 “이 릴스의 총 좋아요 수는 …만 볼 수 있습니다” 또는 같은 의미의 영문 문구가 있으면 `.collector\android_observations.json`의 `like_count_is_private`에 `true`로 기록합니다. 정확한 수치가 표시되면 `false`, 패널을 열 수 없거나 문구를 판별할 수 없으면 `null`입니다. 화면에 댓글 수가 없을 때는 댓글 시트를 열어 `No comments yet`면 `comment_count=0`으로 기록하고, 댓글이 꺼졌거나 제한되었다는 화면 문구면 공개 `comment_count`는 빈 값으로 두되 터미널에는 `unavailable(disabled|limited)`로 표시합니다. 화면 우하단의 독립 `Ad`/`광고` 라벨은 공개 파일의 `ad=true`로, 캡션의 `#협찬`은 `ad=협찬`으로 기록합니다. 둘 다 있으면 명시적 `Ad`를 우선합니다. 신규 릴스마다 작성자 프로필을 열어 공개된 `biography`, `profile_category`, `post_count`, `following_count`, `follower_count`를 읽고, 옵션 메뉴의 `About this account`에서 공개된 `Account based in` 국가를 `account_country`로 저장한 뒤 릴스로 복귀합니다. `About`에서 Back을 눌렀을 때 실제로 옵션 메뉴가 남은 경우에만 한 번 더 Back을 눌러, 릴스가 해시태그 그리드로 빠지는 일을 막습니다.
 
@@ -133,7 +148,7 @@ Android 화면 기반 방식에서는 숫자 `user_id`, 업로드 시각(시간 
 
 이미 만들어진 기존 Android 형식의 `reels.json`이 있더라도 다음 수집 시 자동으로 새 공개 양식으로 변환하고, 기존 Android 원본 필드는 `.collector\android_observations.json`으로 옮겨 보존합니다. 이미 저장된 화면 지문과 같은 릴스는 신규 행으로 추가하지 않습니다.
 
-신규 수집 중복 판단은 정규화한 `username + caption + audio_name`의 화면 지문으로 합니다. URL이 새로 확보되어도 신규 수집에서는 기존 지문을 다시 저장하지 않습니다. 최신 수치가 필요하면 Android의 `refresh` 또는 `python_version`의 `refresh`를 사용하세요.
+신규 수집 중복 판단은 정규화한 `username + caption + audio_name`의 화면 지문으로 합니다. URL이 새로 확보되어도 신규 수집에서는 기존 지문을 다시 저장하지 않습니다. 최신 수치가 필요하면 Android 또는 웹 수집기의 `refresh`를 사용하세요.
 
 `--checkpoint-items`, `--progress-offset`, `--manual`, `--start-url`, `--output-stem`, `--new-only`, `--background`도 지원합니다. 기본 UI 대기 상한은 0.4초이며, 빠른 에뮬레이터에서는 `--interval-seconds 0.25`를 사용해도 됩니다. `--background`는 브라우저를 숨기는 옵션이 아니라 이미 로그인된 Android 앱을 사용하는 호환 옵션입니다. Android `refresh`는 화면에 표시되는 값만 다시 읽고, `followers`, `--no-login`, `--followers-only`, `--max-upload-age-days` 등 브라우저 응답 전용 기능은 계속 지원하지 않습니다.
 

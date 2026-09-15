@@ -1223,21 +1223,40 @@ def _refresh_workbook_path(store: CollectionStore) -> str:
     return ""
 
 
-def run_refresh(options: CollectorOptions, driver: AndroidDriver, store: CollectionStore) -> int:
+def _run_refresh_impl(
+    options: CollectorOptions,
+    driver: AndroidDriver,
+    store: CollectionStore,
+    *,
+    input_xlsx: Path | None = None,
+    start_row: int | None = None,
+    end_row: int | None = None,
+) -> int:
     """Re-open URL-backed Android observations and append refreshed snapshots."""
-    workbook_path = _refresh_workbook_path(store)
+    workbook_path = input_xlsx or _refresh_workbook_path(store)
     if not workbook_path:
         raise CollectorError(
             f"No {store.reel_stem}.xlsx or instagram_data.xlsx was found in {store.data_dir}. "
             "Android refresh requires previously collected Reel URLs."
         )
-    urls = read_reel_urls_from_xlsx(Path(workbook_path))
+    workbook_path = Path(workbook_path)
+    if workbook_path.suffix.casefold() != ".xlsx":
+        raise CollectorError(f"Android refresh supports .xlsx input files only: {workbook_path}")
+    if not workbook_path.is_file():
+        raise CollectorError(f"Refresh input workbook was not found: {workbook_path}")
+    urls = read_reel_urls_from_xlsx(
+        workbook_path,
+        start_row=start_row,
+        end_row=end_row,
+    )
     unique_urls: dict[str, str] = {}
     for url in urls:
         # Keep the first shared URL to preserve its query parameters in the
         # public record while avoiding a duplicate app navigation.
         unique_urls.setdefault(reel_url_identity(url) or url.casefold(), url)
-    targets = list(unique_urls.values())[: options.max_items]
+    targets = list(unique_urls.values())
+    if start_row is None or end_row is None:
+        targets = targets[: options.max_items]
     if not targets:
         raise CollectorError(
             "No Instagram Reel URLs were found. Existing rows without a URL cannot be refreshed by Android."
@@ -1303,3 +1322,32 @@ def run_refresh(options: CollectorOptions, driver: AndroidDriver, store: Collect
     if skipped:
         print(f"Android refresh skipped {skipped} unavailable Reel URL(s).", flush=True)
     return refreshed
+
+
+def run_refresh(
+    options: CollectorOptions,
+    driver: AndroidDriver,
+    store: CollectionStore,
+    *,
+    input_xlsx: Path | None = None,
+    start_row: int | None = None,
+    end_row: int | None = None,
+) -> int:
+    """Run refresh and export any appended rows before propagating a failure."""
+    initial_row_count = len(store.rows)
+    try:
+        return _run_refresh_impl(
+            options,
+            driver,
+            store,
+            input_xlsx=input_xlsx,
+            start_row=start_row,
+            end_row=end_row,
+        )
+    except BaseException:
+        if len(store.rows) > initial_row_count:
+            try:
+                store.export()
+            except Exception:
+                pass
+        raise

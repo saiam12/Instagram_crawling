@@ -1,17 +1,13 @@
 {
   "gemini-3.5-flash": {
     "rpm": 10,
-    "rpd": 250
+    "rpd": 20
   },
   "gemini-3.6-flash": {
     "rpm": 5,
     "rpd": 20
   },
   "gemini-3.7-flash": {
-    "rpm": 5,
-    "rpd": 20
-  },
-  "gemini-3.8-flash": {
     "rpm": 5,
     "rpd": 20
   }

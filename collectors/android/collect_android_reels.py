@@ -176,6 +176,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         _add_android_options(command_parser)
     refresh_parser = subparsers.add_parser("refresh")
     _add_android_options(refresh_parser, include_hashtag=False, include_new_only=False)
+    refresh_parser.add_argument(
+        "--input-xlsx",
+        type=Path,
+        help="Read refresh URLs from this .xlsx file instead of data-dir/reels.xlsx.",
+    )
+    refresh_parser.add_argument(
+        "--start-row",
+        type=positive_int,
+        help="First visible Excel row to refresh, including the header in row numbering.",
+    )
+    refresh_parser.add_argument(
+        "--end-row",
+        type=positive_int,
+        help="Last visible Excel row to refresh (inclusive).",
+    )
     for command in ("fashion", "beauty", "fashion-beauty"):
         command_parser = subparsers.add_parser(command)
         _add_android_options(command_parser, include_hashtag=False)
@@ -191,6 +206,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(str(error))
     if options.command == "hashtag" and not options.hashtag_query:
         parser.error("hashtag requires --hashtag or --hashtag-query.")
+    if options.command == "refresh":
+        if (options.start_row is None) != (options.end_row is None):
+            parser.error("--start-row and --end-row must be used together.")
+        if options.start_row is not None and options.end_row < options.start_row:
+            parser.error("--end-row must be greater than or equal to --start-row.")
     if options.command in {"fashion", "beauty", "fashion-beauty"}:
         if options.manual:
             parser.error("--manual is not available for scheduled collection.")
@@ -273,7 +293,14 @@ def _run_new_collection(
     store = CollectionStore(options.data_dir, reel_stem=options.reel_stem, user_stem=options.user_stem)
     collection = collector_options(options, diagnostics)
     if options.command == "refresh":
-        return run_refresh(collection, driver, store)
+        return run_refresh(
+            collection,
+            driver,
+            store,
+            input_xlsx=options.input_xlsx,
+            start_row=options.start_row,
+            end_row=options.end_row,
+        )
     if options.command == "hashtag" or collection.hashtags:
         if not collection.hashtags:
             raise CollectorError("--hashtag-query is required for hashtag collection.")

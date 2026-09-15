@@ -38,6 +38,7 @@ from .instagram_reels_browser import (
     run_collectors_in_shared_context,
     wait_for_stop_or_timeout,
 )
+from .fashion_analyzer import analyze_qualifying_fashion_reels
 from exporters.instagram_collector import write_xlsx_workbook
 
 
@@ -798,6 +799,34 @@ async def run_fashion_beauty_collection(
     interrupt_count = 0
     previous_sigint = signal.getsignal(signal.SIGINT)
     android_log_relays: list[asyncio.Task[None]] = []
+    fashion_analyzer_task: asyncio.Task[None] | None = None
+    fashion_analyzer_requested = False
+
+    def request_fashion_analysis() -> None:
+        """Run the high-reaction-rate analyzer without delaying collection."""
+        nonlocal fashion_analyzer_task, fashion_analyzer_requested
+        if "fashion" not in config.domains:
+            return
+        fashion_analyzer_requested = True
+        if fashion_analyzer_task is None or fashion_analyzer_task.done():
+            async def worker() -> None:
+                nonlocal fashion_analyzer_requested
+                while fashion_analyzer_requested:
+                    fashion_analyzer_requested = False
+                    try:
+                        summary = await analyze_qualifying_fashion_reels(
+                            dataset_by_name(config, "fashion").data_root,
+                        )
+                        if summary.get("queued"):
+                            print(
+                                "[ANALYZER] Fashion reaction_rate >= 9000%: "
+                                f"queued={summary['queued']} succeeded={summary['succeeded']} "
+                                f"failed={summary['failed']}"
+                            )
+                    except Exception as error:
+                        print(f"[ANALYZER] Fashion analysis failed: {error}", file=sys.stderr)
+
+            fashion_analyzer_task = asyncio.create_task(worker())
 
     def handle_interrupt(_signum: int, _frame: Any) -> None:
         nonlocal interrupt_count
@@ -815,6 +844,8 @@ async def run_fashion_beauty_collection(
                 asyncio.create_task(relay_new_collection_log_lines(dataset.data_root, "android"))
                 for dataset in datasets(config)
             ]
+            # Existing Fashion history is eligible on a resumed/default run.
+            request_fashion_analysis()
             while not stop_event.is_set() and clock() < ends_at:
                 await collection_pause.wait()
                 now = clock()
@@ -922,6 +953,8 @@ async def run_fashion_beauty_collection(
                                     retry_not_before[job_key] = clock() + timedelta(seconds=retry_delay)
                                 wait_seconds = max(wait_seconds, retry_delay)
                         else:
+                            if any(job.dataset == "fashion" for job in recollection_jobs):
+                                request_fashion_analysis()
                             for job in recollection_jobs:
                                 job_key = (job.dataset, job.url, job.due_at)
                                 retry_attempts.pop(job_key, None)
@@ -1024,6 +1057,8 @@ async def run_fashion_beauty_collection(
                                     )
                             discovery_retry_not_before[window_key] = retry_at
                         else:
+                            if selected.name == "fashion":
+                                request_fashion_analysis()
                             keyword_group_numbers[selected.name] += 1
                             discovery_retry_attempts.pop(window_key, None)
                             discovery_retry_not_before.pop(window_key, None)
@@ -1080,6 +1115,11 @@ async def run_fashion_beauty_collection(
                             min(wait_seconds, remaining_run_seconds),
                         )
     finally:
+        if fashion_analyzer_task is not None:
+            try:
+                await fashion_analyzer_task
+            except Exception as error:
+                print(f"[ANALYZER] Fashion analysis stopped: {error}", file=sys.stderr)
         for relay in android_log_relays:
             relay.cancel()
         if android_log_relays:

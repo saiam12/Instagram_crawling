@@ -18,6 +18,8 @@ import json
 import time
 import tempfile
 import argparse
+import threading
+from queue import Queue
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -48,16 +50,24 @@ INLINE_SIZE_LIMIT_MB = 18
 # 풀에서 쓸 수 있는 조합이 당장 없을 때(RPM 제한), 최대 몇 초까지 기다릴지
 POOL_WAIT_MAX_SEC = 90
 
+# 대화형 입력과 분석을 분리하되 프로젝트별 API 한도를 과도하게 밀어붙이지 않는다.
+INTERACTIVE_WORKERS = 2
+
 # 장면(scene) 분석용 프레임 샘플링 속도(fps).
 SCENE_ANALYSIS_FPS = 5
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "reel_analyses.json")
+# Batch callers can give each worker an isolated file.  The normal CLI keeps
+# the historical output path and behavior.
+OUTPUT_FILE = os.getenv(
+    "GEMINI_OUTPUT_FILE",
+    os.path.join(OUTPUT_DIR, "reel_analyses.json"),
+)
+OUTPUT_LOCK = threading.Lock()
 ALLOWED_MODELS = (
     "gemini-3.5-flash",
     "gemini-3.6-flash",
     "gemini-3.7-flash",
-    "gemini-3.8-flash",
 )
 
 
@@ -66,6 +76,11 @@ def parse_args(argv=None):
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--url", help="분석할 Instagram Reel URL 한 건")
     source.add_argument("--xlsx", type=Path, help="url 또는 reel_url 열을 순회할 XLSX 파일")
+    source.add_argument(
+        "--sync-key-pool",
+        action="store_true",
+        help=".env의 키 별칭을 Google Sheets 프로젝트 설정과 동기화",
+    )
     parser.add_argument(
         "--model",
         choices=ALLOWED_MODELS,
@@ -80,7 +95,7 @@ def ensure_api_keys(pool: GeminiKeyPool):
         print("=" * 60)
         print("[오류] GEMINI_API_KEYS가 설정되어 있지 않습니다.")
         print(".env.example 파일을 복사해서 .env 파일을 만든 뒤,")
-        print("GEMINI_API_KEYS=키1,키2,키3 형태로 값을 채워주세요.")
+        print("GEMINI_API_KEYS를 큰따옴표로 감싸 키를 한 줄씩 입력하세요.")
         print("API 키 발급: https://aistudio.google.com/apikey")
         print("=" * 60)
         sys.exit(1)
@@ -437,23 +452,24 @@ def analyze_video(pool: GeminiKeyPool, video_bytes: bytes, mime_type: str = "vid
 # ---------------------------------------------------------------------------
 
 def save_result(shortcode: str, result: dict) -> str:
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    records = []
-    if os.path.exists(OUTPUT_FILE):
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-            records = json.load(f)
-        if not isinstance(records, list):
-            raise ValueError(f"누적 결과 파일은 JSON 배열이어야 합니다: {OUTPUT_FILE}")
+    with OUTPUT_LOCK:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        records = []
+        if os.path.exists(OUTPUT_FILE):
+            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+                records = json.load(f)
+            if not isinstance(records, list):
+                raise ValueError(f"누적 결과 파일은 JSON 배열이어야 합니다: {OUTPUT_FILE}")
 
-    records.append({
-        "reel_id": shortcode or "reel",
-        "analyzed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "analysis": result,
-    })
-    temp_path = OUTPUT_FILE + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
-    os.replace(temp_path, OUTPUT_FILE)
+        records.append({
+            "reel_id": shortcode or "reel",
+            "analyzed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "analysis": result,
+        })
+        temp_path = OUTPUT_FILE + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+        os.replace(temp_path, OUTPUT_FILE)
     return OUTPUT_FILE
 
 
@@ -522,6 +538,61 @@ def process_safely(pool: GeminiKeyPool, reel_url: str) -> bool:
     return False
 
 
+def run_interactive(status_pool: GeminiKeyPool, worker_pools: list[GeminiKeyPool]):
+    """URL 입력은 계속 받고, 각 워커가 자신의 키 풀 예약으로 분석한다."""
+    work_queue = Queue()
+
+    def consume(worker_pool):
+        while True:
+            reel_url = work_queue.get()
+            try:
+                if reel_url is None:
+                    return
+                process_safely(worker_pool, reel_url)
+            finally:
+                work_queue.task_done()
+
+    workers = [
+        threading.Thread(target=consume, args=(worker_pool,), name=f"gemini-worker-{i + 1}")
+        for i, worker_pool in enumerate(worker_pools)
+    ]
+    for worker in workers:
+        worker.start()
+
+    print("Reel URL을 연속으로 입력할 수 있습니다. 입력한 순서대로 대기열에 추가됩니다.")
+    print("'status' 입력 시 현재 사용량 확인. 종료하려면 'quit' 또는 'exit' 입력.\n")
+    try:
+        while True:
+            try:
+                reel_url = input("Reel URL > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n입력된 분석을 마친 뒤 종료합니다.")
+                break
+
+            if not reel_url:
+                continue
+            if reel_url.lower() in ("quit", "exit", "q"):
+                print("입력된 분석을 마친 뒤 종료합니다.")
+                break
+            if reel_url.lower() == "status":
+                try:
+                    print(status_pool.status())
+                except RuntimeError as e:
+                    print(f"[시트 오류] {e}\n")
+                continue
+            if not is_instagram_reel_url(reel_url):
+                print(f"[경고] Instagram Reel URL이 아닙니다: {reel_url}\n")
+                continue
+            work_queue.put(reel_url)
+            print(f"  - 대기열 추가 완료 (대기 {work_queue.qsize()}건)")
+    finally:
+        for _ in workers:
+            work_queue.put(None)
+        work_queue.join()
+        for worker in workers:
+            worker.join()
+
+
 def main(argv=None):
     options = parse_args(argv)
     if options.model:
@@ -531,6 +602,26 @@ def main(argv=None):
     except RuntimeError as e:
         print(f"[설정 오류] {e}")
         return
+    if options.sync_key_pool:
+        if not hasattr(pool, "sync_keys"):
+            print("[설정 오류] 키 동기화는 GEMINI_POOL_MODE=sheets에서만 사용할 수 있습니다.")
+            return
+        try:
+            result = pool.sync_keys()
+        except RuntimeError as e:
+            print(f"[시트 오류] {e}")
+            return
+        print(
+            "키 풀 동기화 완료: "
+            f"공유 추가 {result['vault_added']}개 / 공유 갱신 {result['vault_updated']}개 / "
+            f"담당자 변경 {result['owner_renamed']}행 / "
+            f"로컬 추가 {result['local_added']}개 / 로컬 갱신 {result['local_updated']}개 / "
+            f"추가 {result['added']}행 / 정보 정리 {result['updated']}행 / "
+            f"기록 정리 {result['log_updated']}행 / 사용 전환 {result['enabled']}행 / "
+            f"중지 {result['stopped']}행"
+        )
+        return
+
     ensure_api_keys(pool)
 
     print("Instagram Reels Analyzer")
@@ -558,27 +649,14 @@ def main(argv=None):
         print(f"\n[XLSX 완료] 성공 {succeeded}건 / 실패 {len(urls) - succeeded}건 / 전체 {len(urls)}건")
         return
 
-    print("Reel URL을 입력하세요. 'status' 입력 시 현재 사용량 확인. 종료하려면 'quit' 또는 'exit' 입력.\n")
-
-    while True:
-        try:
-            reel_url = input("Reel URL > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n종료합니다.")
-            break
-
-        if not reel_url:
-            continue
-        if reel_url.lower() in ("quit", "exit", "q"):
-            print("종료합니다.")
-            break
-        if reel_url.lower() == "status":
-            try:
-                print(pool.status())
-            except RuntimeError as e:
-                print(f"[시트 오류] {e}\n")
-            continue
-        process_safely(pool, reel_url)
+    sheets_mode = os.getenv("GEMINI_POOL_MODE", "sheets").strip().lower() == "sheets"
+    worker_count = INTERACTIVE_WORKERS if sheets_mode else 1
+    try:
+        worker_pools = [create_pool() for _ in range(worker_count)]
+    except RuntimeError as e:
+        print(f"[설정 오류] {e}")
+        return
+    run_interactive(pool, worker_pools)
 
 
 if __name__ == "__main__":
