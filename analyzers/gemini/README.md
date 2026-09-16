@@ -77,7 +77,13 @@ python reel_analyzer.py --xlsx "C:\path\to\reels.xlsx" --model gemini-3.6-flash
 ```
 
 지원 모델은 `gemini-3.5-flash`, `gemini-3.6-flash`, `gemini-3.7-flash`입니다.
-`gemini-3.8-flash`는 운영 안정성 확인 전까지 비활성화되어 있습니다. XLSX의 한 URL이 실패해도 다음 URL 분석은 계속됩니다.
+`gemini-3.8-flash`는 운영 안정성 확인 전까지 비활성화되어 있습니다. 누적 결과의 공통점을 찾는 `reel_insights.py`는 기본적으로 `gemini-3.6-flash`와 공용 시트 풀을 사용합니다. XLSX의 한 URL이 실패해도 다음 URL 분석은 계속됩니다.
+
+누적 결과를 즉시 다시 분석하고 HTML 보고서를 만들려면 다음 명령을 사용합니다. 자동 실행은 새 결과가 10건 이상 쌓이면 한 번에 10건씩 처리합니다.
+
+```powershell
+python reel_insights.py --input "..\..\collectors\unified\data_web\fashion_reel_analyses.json" --output "..\..\collectors\unified\data_web\fashion_reel_insights.json" --report "..\..\collectors\unified\data_web\fashion_reel_insights.html" --state "..\..\collectors\unified\data_web\.datasets\fashion\.collector\fashion_reel_insights_state.json" --force
+```
 
 ## 프로젝트 구조
 

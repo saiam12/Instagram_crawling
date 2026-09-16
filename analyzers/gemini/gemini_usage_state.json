@@ -6,22 +6,24 @@
     "minute_count": 1
   },
   "acct1:gemini-3.6-flash": {
-    "day": "2026-09-12",
-    "day_count": 0,
-    "minute_window_start": 1789208602.189131,
-    "minute_count": 0
+    "day": "2026-09-14",
+    "day_count": 2,
+    "minute_window_start": 1789453343.2689693,
+    "minute_count": 1
   },
   "acct1:gemini-3.7-flash": {
-    "day": "2026-09-12",
-    "day_count": 0,
-    "minute_window_start": 1789208602.189131,
-    "minute_count": 0
+    "day": "2026-09-14",
+    "day_count": 1,
+    "minute_window_start": 1789453004.472752,
+    "minute_count": 1,
+    "cooldown_until": 1789453009.3070145
   },
   "acct1:gemini-3.8-flash": {
-    "day": "2026-09-12",
-    "day_count": 0,
-    "minute_window_start": 1789208602.189131,
-    "minute_count": 0
+    "day": "2026-09-14",
+    "day_count": 7,
+    "minute_window_start": 1789452734.9235713,
+    "minute_count": 1,
+    "cooldown_until": 1789452742.5351775
   },
   "acct2:gemini-3.5-flash": {
     "day": "2026-09-12",
@@ -36,15 +38,31 @@
     "minute_count": 0
   },
   "acct2:gemini-3.7-flash": {
-    "day": "2026-09-12",
-    "day_count": 0,
-    "minute_window_start": 1789208602.189131,
-    "minute_count": 0
+    "day": "2026-09-14",
+    "day_count": 1,
+    "minute_window_start": 1789453007.3090847,
+    "minute_count": 1,
+    "cooldown_until": 1789453012.0080051
   },
   "acct2:gemini-3.8-flash": {
-    "day": "2026-09-12",
-    "day_count": 0,
-    "minute_window_start": 1789208602.189131,
-    "minute_count": 0
+    "day": "2026-09-14",
+    "day_count": 5,
+    "minute_window_start": 1789452740.5363986,
+    "minute_count": 1,
+    "cooldown_until": 1789452751.971272
+  },
+  "acct3:gemini-3.8-flash": {
+    "day": "2026-09-14",
+    "day_count": 4,
+    "minute_window_start": 1789451022.3033717,
+    "minute_count": 2,
+    "cooldown_until": 1789451066.7434669
+  },
+  "acct4:gemini-3.8-flash": {
+    "day": "2026-09-14",
+    "day_count": 4,
+    "minute_window_start": 1789451024.5897446,
+    "minute_count": 2,
+    "cooldown_until": 1789451076.9970038
   }
 }
