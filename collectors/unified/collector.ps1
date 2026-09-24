@@ -9,6 +9,8 @@ Runs the Python Instagram collector with this project's virtual environment.
 .\collector.ps1 hashtag-posts --hashtag-query '오오티디 OR 패션'
 .\collector.ps1 hashtag-posts --preset fashion-beauty
 .\collector.ps1 fashion
+.\collector.ps1 fashion --collector-mode web
+.\collector.ps1 fashion --collector-mode android
 .\collector.ps1 -fashion --background
 #>
 
@@ -24,7 +26,7 @@ $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $launcher = Join-Path $projectRoot "scripts\instagram_reels_python.py"
 
 if (-not (Test-Path -LiteralPath $python)) {
-    Write-Error "Python virtual environment was not found. Run .\repair_venv.ps1 from $projectRoot first."
+    Write-Error "Python virtual environment was not found. Run .\scripts\repair_venv.ps1 from $projectRoot first."
     exit 1
 }
 
@@ -47,9 +49,33 @@ try {
         $argumentsToPass = @("collect") + $argumentsToPass
     }
     $androidCommands = @('collect', 'refresh', 'android-worker', 'hashtag-posts', 'fashion', 'beauty', 'fashion-beauty')
-    if ($androidCommands -contains $argumentsToPass[0].ToLowerInvariant()) {
+    $collectorMode = 'hybrid'
+    $explicitCollectorMode = $false
+    for ($index = 0; $index -lt $argumentsToPass.Count; $index++) {
+        $argument = [string]$argumentsToPass[$index]
+        if ($argument -eq '--android-only') {
+            $collectorMode = 'android'
+            $explicitCollectorMode = $true
+        }
+        elseif ($argument -eq '--collector-mode' -and ($index + 1) -lt $argumentsToPass.Count) {
+            $collectorMode = ([string]$argumentsToPass[$index + 1]).ToLowerInvariant()
+            $explicitCollectorMode = $true
+            $index++
+        }
+        elseif ($argument.StartsWith('--collector-mode=')) {
+            $collectorMode = $argument.Split('=', 2)[1].ToLowerInvariant()
+            $explicitCollectorMode = $true
+        }
+        elseif ($argument -eq '--no-android-metrics' -and -not $explicitCollectorMode) {
+            $collectorMode = 'web'
+        }
+    }
+    if (@('hybrid', 'web', 'android') -notcontains $collectorMode) {
+        throw "Unknown collector mode '$collectorMode'. Choose hybrid, web, or android."
+    }
+    if ($androidCommands -contains $argumentsToPass[0].ToLowerInvariant() -and $collectorMode -ne 'web' -and -not ($argumentsToPass -contains '--no-android-metrics')) {
         $androidNoWindow = $argumentsToPass -contains '--background'
-        & (Join-Path $projectRoot 'start-android.ps1') -Avd $Avd -NoWindow:$androidNoWindow
+        & (Join-Path $projectRoot 'scripts\start-android.ps1') -Avd $Avd -NoWindow:$androidNoWindow
     }
     & $python $launcher @argumentsToPass
     exit $LASTEXITCODE

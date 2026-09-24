@@ -12,7 +12,6 @@ Instagram-crawling/
 │   ├── gemini/          # Gemini API 분석
 │   ├── local_llm/       # 로컬 LLM 분석
 │   └── reel_downloader.py # 분석 없이 영상만 다운로드
-├── docs/                # 설계·구현 계획·리뷰
 ├── data_web/            # 기존 루트 데이터
 └── temp/                # 임시 작업 및 결과물 보관
 ```
@@ -46,8 +45,8 @@ python reel_downloader.py
 
 - 각 도구의 가상환경, 로그인 프로필, 데이터와 결과물은 해당 도구 폴더에서 관리합니다.
 - 웹·Android·통합 수집기의 데이터는 자동으로 합치지 않으며, 각 수집기의 출력 폴더에 따로 저장합니다.
-- 수집기 내부 `collectors/`, `android_collector/`, `exporters/`, `scripts/`는 Python 모듈과 실행 진입점입니다.
-- `examples/`와 `data_web_test/`는 예제·검증 자료입니다.
+- 수집기 내부 `reels/`, `android_collector/`, `exporters/`, `scripts/`는 Python 모듈과 실행 진입점입니다. 테스트는 각 도구의 `tests/`에 둡니다.
+- 웹 수집기의 `examples/`와 `data_web_test/`는 예제·검증 자료입니다.
 - 루트 `data_web/`에는 기존 패션·뷰티 수집 결과가 남아 있습니다. 각 수집기의 기본 출력 폴더는 해당 도구 아래의 데이터 폴더입니다.
 - `temp/`에는 임시 작업 폴더와 다운로드·출력 자료가 보존되어 있습니다.
 - 과거 설계·계획 문서의 경로는 작성 당시 기준이며, 현재 실행 경로는 위 표를 따릅니다.

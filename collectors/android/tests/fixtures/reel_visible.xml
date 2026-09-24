@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.instagram.android" content-desc="">
+    <node index="0" text="odi.pigi" resource-id="com.instagram.android:id/username" class="android.widget.TextView" package="com.instagram.android" content-desc="odi.pigi, profile" bounds="[16,680][180,728]" />
+    <node index="1" text="갈비뼈를 표현해 봤습니다 ..." resource-id="com.instagram.android:id/caption" class="android.widget.TextView" package="com.instagram.android" content-desc="" bounds="[16,728][680,776]" />
+    <node index="2" text="original audio" resource-id="com.instagram.android:id/audio_name" class="android.widget.TextView" package="com.instagram.android" content-desc="" bounds="[16,776][680,812]" />
+    <node index="3" text="4,699" resource-id="com.instagram.android:id/like_count" class="android.widget.TextView" package="com.instagram.android" content-desc="4,699 likes" bounds="[650,400][720,448]" />
+    <node index="4" text="32" resource-id="com.instagram.android:id/comment_count" class="android.widget.TextView" package="com.instagram.android" content-desc="32 comments" bounds="[650,452][720,500]" />
+    <node index="5" text="68" resource-id="com.instagram.android:id/share_count" class="android.widget.TextView" package="com.instagram.android" content-desc="68 shares" bounds="[650,504][720,552]" />
+    <node index="6" text="Likes and plays" resource-id="com.instagram.android:id/metric_panel_title" class="android.widget.TextView" package="com.instagram.android" content-desc="" bounds="[50,100][650,148]" />
+    <node index="7" text="32,357" resource-id="com.instagram.android:id/metric_panel_count" class="android.widget.TextView" package="com.instagram.android" content-desc="" bounds="[50,150][650,198]" />
+  </node>
+</hierarchy>

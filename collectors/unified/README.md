@@ -19,25 +19,26 @@ python -m venv .venv
 기존 `.venv`의 패키지 또는 Python 연결이 꼬였을 때는 다음 명령으로 Python 3.12 환경만 복구합니다. 수집 결과와 로그인 프로필은 유지됩니다.
 
 ```powershell
-.\repair_venv.ps1
+.\scripts\repair_venv.ps1
 ```
 
 ## 폴더 구조
 
 | 경로 | 용도 |
 |---|---|
-| `collectors` | 웹·팔로워 수집, Android 지표 보강, 일시정지·진단 코드 |
+| `reels` | 웹·팔로워 수집, Android 지표 보강, 일시정지·진단 코드 |
 | `exporters` | CSV·JSON·XLSX 저장 코드 |
-| `scripts` | 실행 목적별 진입점 |
+| `scripts` | 실행 목적별 진입점과 PowerShell 보조 스크립트 |
 | `data_web` | 실제 수집 결과(처음 실행할 때 자동 생성) |
-| `.instagram_chrome_profile` | Chrome 전용 로그인 프로필(자동 생성, 최초 실행 시 로그인 필요) |
-| `examples` | 출력 예시와 검증 자료 |
-| `data_web_test` | 수집 출력 검증용 데이터 |
+| `browser_profile/.instagram_chrome_profile` | Chrome 전용 로그인 프로필(자동 생성, 최초 실행 시 로그인 필요) |
+| `browser_profile/.instagram_browser_profile` | 기존 브라우저 로그인 프로필 |
 | `collector.ps1` | PowerShell 실행 진입점 |
-| `start-android.ps1` | 에뮬레이터 준비 스크립트 |
-| `repair_venv.ps1` | 가상환경 복구 스크립트 |
+| `scripts/start-android.ps1` | 에뮬레이터 준비 스크립트 |
+| `scripts/repair_venv.ps1` | 가상환경 복구 스크립트 |
 
-통합 수집기의 Android 보강 코드는 이 폴더의 `collectors/android_reel_metrics.py`에 있습니다. 독립 Android 수집기는 `../android/`에서 별도로 관리합니다.
+통합 수집기의 Android 보강 코드는 이 폴더의 `reels/android_reel_metrics.py`에 있습니다. 독립 Android 수집기는 `../android/`에서 별도로 관리합니다.
+
+`reels/instagram_reels_browser.py`는 기존 CLI와 전체 실행 순서를 유지합니다. 순수 Reel 값·URL·파생 필드는 `reels/reel_records.py`, 원자적 저장 헬퍼는 `reels/reel_store.py`, Android 큐의 파일 배치는 `reels/android_metric_queue.py`, Playwright 실행 환경과 종료 처리는 `reels/browser_runtime.py`가 담당합니다. 테스트는 `tests/`에 모았습니다.
 
 ## 기본 실행
 
@@ -101,11 +102,16 @@ Android 워커는 Reel 화면이 열린 직후 화면 중앙을 한 번 탭해 �
 .\collector.ps1 --max-items 50 --background --android-device-id emulator-5554
 .\collector.ps1 --max-items 50 --background --android-metrics-required
 .\collector.ps1 --max-items 50 --background --no-android-metrics
+.\collector.ps1 fashion --collector-mode hybrid --background
+.\collector.ps1 fashion --collector-mode web --background
+.\collector.ps1 fashion --collector-mode android --background
 .\collector.ps1 hashtag-posts --hashtag-query '오오티디 OR 패션'
 .\collector.ps1 hashtag-posts --preset fashion
 .\collector.ps1 hashtag-posts --preset beauty
 .\collector.ps1 hashtag-posts --preset fashion-beauty
 ```
+
+`--collector-mode`는 `hybrid`(기본값), `web`, `android`를 지원합니다. `hybrid`는 브라우저 수집 뒤 Android 지표를 보강하고, `web`은 수집기 전용 Playwright 브라우저만 사용하며 Android 에뮬레이터를 시작하지 않습니다. `android`는 unified 진입점에서 Android 앱 수집을 실행합니다. 기존 `--no-android-metrics`는 `web` 모드 별칭으로 유지됩니다.
 
 `hashtag-posts`는 Android가 검색어 하나의 **Tags** 목록을 끝까지 수집하면, 다음 검색어로 넘어가기 전에 그 관련 태그들을 웹에서 하나씩 정확 일치 검색해 `media_count`를 보완합니다. 웹에 없는 태그는 Android의 축약 게시물 수를 유지하며, 이미 확인한 태그는 같은 실행 안에서 다시 웹 검색하지 않습니다. 결과는 `data_web\hashtags.csv`, `hashtags.json`, `hashtags.xlsx`에 누적됩니다.
 
@@ -138,7 +144,7 @@ data_web/
 
 브라우저 수집기는 Instagram 페이지가 스스로 발생시킨 Playwright 응답만 수동 관찰합니다. request body, cookie, authorization/session token은 기록하지 않고 URL query도 제거합니다. 실제 응답 status가 429일 때만 `HTTP_429_CONFIRMED`를 기록합니다. 문서·Fetch·XHR 응답과 오류 응답의 host, path, status, resource type, 확인 가능한 duration은 최초 제한 snapshot에 최근 50건까지 함께 저장됩니다.
 
-웹 Reel 탐색 시작은 60초당 최대 12개로 제한됩니다. HTTP 429가 확인되면 브라우저와 프로그램을 열린 상태로 유지하고 전체 수집을 일시정지합니다. 신규 탐색, 프로필 조회, 예약 재수집과 연결된 Android 워커의 조작도 함께 대기합니다. 후속조치를 마친 뒤 실행 터미널에 `resume`을 입력하고 Enter를 눌러야 재개합니다. 시간이 지나도 자동 재개하지 않으며, 다시 429가 발생하면 다시 일시정지합니다. 이미 전송된 요청과 Instagram 앱 자체의 백그라운드 통신까지 되돌리거나 중단하는 기능은 아닙니다.
+웹 Reel 탐색 시작은 60초당 최대 12개로 제한됩니다. HTTP 429가 확인되면 브라우저와 프로그램을 열린 상태로 유지하고 전체 수집을 일시정지합니다. 신규 탐색, 프로필 조회, 예약 재수집과 연결된 Android 워커의 조작도 함께 대기합니다. 후속조치를 마친 뒤 실행 터미널에 `resume`을 입력하고 Enter를 눌러야 한 번 재개합니다. 재개 후 다시 429가 발생하면 추가 대기 없이 해당 실행을 종료하고, 그 시점까지 저장된 행만 남겨 `refresh`로 재수집할 수 있게 합니다. 이미 전송된 요청과 Instagram 앱 자체의 백그라운드 통신까지 되돌리거나 중단하는 기능은 아닙니다.
 
 Android worker는 ADB/UIAutomator로 앱 화면만 읽기 때문에 `NETWORK_STATUS_UNAVAILABLE`을 기록합니다. 앱 화면에서 `429`, `Too Many Requests`, `rate limit`, `throttled`, `Please wait a few minutes`, `Try again later`, `잠시 후 다시` 등의 문구를 발견하면 HTTP status로 단정하지 않고 `RATE_LIMIT_SUSPECTED`로 기록합니다.
 
@@ -172,7 +178,12 @@ Get-Content .\data_web\diagnostics\rate_limit_*.json
 ```text
 data_web/fashion_reel_analyses.json
 data_web/.datasets/fashion/.collector/fashion_analyzer_state.json
+data_web/fashion_reel_insights.json
+data_web/fashion_reel_insights.html
+data_web/.datasets/fashion/.collector/fashion_reel_insights_state.json
 ```
+
+누적 분석 결과 중 새 영상이 기본 10개 이상 쌓이면 `gemini-3.6-flash` 메타 분석이 공용 시트 풀을 통해 10개씩 실행됩니다. 영상별 특징과 scene·movement·hook 공통점을 정규화하고, 건수와 비율을 막대그래프로 표시한 HTML 보고서를 생성합니다. 이미 처리한 영상은 원본 분석이 바뀌지 않는 한 다시 전송하지 않습니다. 실행 간격은 `FASHION_INSIGHTS_BATCH_SIZE`, 모델은 `FASHION_INSIGHTS_MODEL` 환경 변수로 변경할 수 있습니다. 메타 분석 실패는 수집 및 개별 Reel 분석을 중단시키지 않습니다.
 
 기본 `fashion --background` 실행에 이 동작이 포함됩니다. Gemini 분석기 가상환경을 별도로 사용하려면 `FASHION_ANALYZER_PYTHON` 환경 변수에 해당 Python 실행 파일 경로를 지정하세요. API 키·모델 풀 설정은 `analyzers/gemini/.env`를 사용합니다.
 
@@ -282,7 +293,7 @@ Reel 파일은 최초 수집과 재수집을 각각 별도 행으로 추가하�
 순서로 대기합니다. 같은 작업이 한 실행에서 5회 연속 실패하면 남은 실행 동안 재시도를 보류합니다.
 실행 중 Instagram `429`가 감지되면 예약 재수집도 전체 일시정지에 포함됩니다.
 일시정지 중에는 예약 호출의 제한 시간 때문에 브라우저를 닫지 않습니다.
-터미널의 `resume` + Enter 입력으로만 수집 동작을 다시 허용합니다.
+터미널의 `resume` + Enter 입력으로 한 번만 수집 동작을 다시 허용합니다. 재개 뒤 429가 재발하면 실행을 종료하며, 직전까지 저장된 행은 `refresh` 명령으로만 재수집할 수 있습니다.
 
 ## 공개 출력 동기화
 
@@ -387,7 +398,7 @@ Instagram 로그인을 초기화하지 않습니다.
 ```
 
 ```powershell
-.\start-android.ps1
+.\scripts\start-android.ps1
 ```
 
 두 명령은 대안이며 동시에 실행하지 않습니다. 2026-09-07 검증에서 일부 릴스의
@@ -395,5 +406,5 @@ Instagram 로그인을 초기화하지 않습니다.
 pending 작업을 꺼내거나 해당 작업의 재시도 횟수를 소진하지 않습니다.
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest collectors.test_instagram_reels_browser exporters.test_instagram_collector
+.\.venv\Scripts\python.exe -B -m unittest tests.test_instagram_reels_browser tests.test_instagram_collector
 ```

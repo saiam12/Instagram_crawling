@@ -8,7 +8,7 @@ key_pool.py
 - model_limits.json 에 모델별 RPM/RPD 한도를 적어두면, 그 한도를 넘기지 않는 선에서
   현재 조합을 유지하고 사용 불가 시 같은 키의 다음 모델, 다음 키 순서로 전환한다.
 - 429 중 일일 제한만 소진 처리하고, 분당/토큰 제한은 잠시 대기 후 재사용한다.
-- 사용량은 gemini_usage_state.json 파일에 저장되어 프로그램을 껐다 켜도 유지된다.
+- 사용량은 output/gemini_usage_state.json 파일에 저장되어 프로그램을 껐다 켜도 유지된다.
 
 주의: Gemini API의 비율 제한(rate limit)은 "API 키" 단위가 아니라 "프로젝트" 단위로 걸립니다.
       키 여러 개를 써도 같은 프로젝트 소속이면 한도가 공유되어 로테이션 효과가 없습니다.
@@ -30,17 +30,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-STATE_PATH = BASE_DIR / "gemini_usage_state.json"
+STATE_PATH = BASE_DIR / "output" / "gemini_usage_state.json"
 LIMITS_PATH = BASE_DIR / "model_limits.json"
 
 # 일일 한도(RPD)는 태평양 시간 자정에 초기화됩니다. (Gemini API 공식 정책)
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
-# model_limits.json이 없을 때 사용할 기본값.
-# 실제 한도는 모델/계정마다 다를 수 있으니, AI Studio > Usage 페이지에서
-# 확인한 뒤 model_limits.json을 직접 만들어 맞는 값으로 수정하는 걸 권장합니다.
+# 로컬 풀의 기본 추정치. model_limits.json이 있으면 해당 값을 사용합니다.
 DEFAULT_LIMITS = {
-    "gemini-3.5-flash": {"rpm": 5, "rpd": 20},
+    "gemini-3.5-flash": {"rpm": 10, "rpd": 20},
     "gemini-3.6-flash": {"rpm": 5, "rpd": 20},
     "gemini-3.7-flash": {"rpm": 5, "rpd": 20},
 }
@@ -54,9 +52,6 @@ def _load_limits() -> dict:
         merged.update(user_limits)
         return merged
 
-    # 최초 실행 시 기본값으로 파일을 만들어줘서, 사용자가 바로 열어 수정할 수 있게 한다.
-    with open(LIMITS_PATH, "w", encoding="utf-8") as f:
-        json.dump(DEFAULT_LIMITS, f, indent=2, ensure_ascii=False)
     return dict(DEFAULT_LIMITS)
 
 
@@ -72,6 +67,7 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 

@@ -20,7 +20,7 @@ $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $launcher = Join-Path $projectRoot "scripts\instagram_reels_python.py"
 
 if (-not (Test-Path -LiteralPath $python)) {
-    Write-Error "Python virtual environment was not found. Run .\repair_venv.ps1 from $projectRoot first."
+    Write-Error "Python virtual environment was not found. Run .\scripts\repair_venv.ps1 from $projectRoot first."
     exit 1
 }
 

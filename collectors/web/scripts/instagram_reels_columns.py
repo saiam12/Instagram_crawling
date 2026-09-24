@@ -9,7 +9,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from collectors.instagram_reels_browser import main as collector_main  # noqa: E402
+from reels.instagram_reels_browser import main as collector_main  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:

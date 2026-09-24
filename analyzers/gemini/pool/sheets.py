@@ -23,21 +23,51 @@ ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 HEARTBEAT_INTERVAL_SEC = 60
 
 
-def _write_keys_to_env(keys, path=ENV_PATH):
-    """다른 설정을 보존하면서 GEMINI_API_KEYS 블록만 원자적으로 교체한다."""
+def _write_env_mappings(mappings, path):
     content = path.read_bytes().decode("utf-8") if path.exists() else ""
     newline = "\r\n" if "\r\n" in content else "\n"
-    value = 'GEMINI_API_KEYS="{' + ("," + newline).join(
-        f"{label}:{key}" for label, key in keys
-    ) + '}"'
-    pattern = re.compile(r'(?m)^GEMINI_API_KEYS[ \t]*=[ \t]*(?:"[^"]*"|[^\r\n]*)')
-    if pattern.search(content):
-        content = pattern.sub(lambda _: value, content, count=1)
-    else:
-        content += ("" if not content or content.endswith(("\n", "\r")) else newline) + value + newline
+    for name, items in mappings.items():
+        value = f'{name}="{{' + ("," + newline).join(
+            f"{label}:{item}" for label, item in items
+        ) + '}"'
+        pattern = re.compile(rf'(?m)^{name}[ \t]*=[ \t]*(?:"[^"]*"|[^\r\n]*)')
+        if pattern.search(content):
+            content = pattern.sub(lambda _: value, content, count=1)
+        else:
+            separator = "" if not content or content.endswith(("\n", "\r")) else newline
+            content += separator + value + newline
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_bytes(content.encode("utf-8"))
     os.replace(temporary, path)
+
+
+def _write_keys_to_env(keys, path=ENV_PATH):
+    """다른 설정을 보존하면서 GEMINI_API_KEYS 블록만 원자적으로 교체한다."""
+    _write_env_mappings({"GEMINI_API_KEYS": keys}, path)
+
+
+def _write_key_owners_to_env(owners, path=ENV_PATH):
+    """다른 설정은 보존하면서 키별 담당자 블록만 원자적으로 교체한다."""
+    _write_env_mappings({"GEMINI_API_KEY_OWNERS": owners}, path)
+
+
+def _load_key_owners():
+    raw = os.getenv("GEMINI_API_KEY_OWNERS", "").strip()
+    if not raw:
+        return {}
+    if not (raw.startswith("{") and raw.endswith("}")):
+        raise SheetsPoolError("GEMINI_API_KEY_OWNERS는 {키별칭:담당자,...} 형식으로 입력하세요.")
+    owners = {}
+    for entry in raw[1:-1].split(","):
+        label, separator, owner = entry.partition(":")
+        label, owner = label.strip(), owner.strip()
+        if (not separator or not label or not owner or any(c in label for c in "{}:, \t\r\n")
+                or any(c in owner for c in "{}:,\r\n")):
+            raise SheetsPoolError("GEMINI_API_KEY_OWNERS는 {키별칭:담당자,...} 형식으로 입력하세요.")
+        if label in owners:
+            raise SheetsPoolError("GEMINI_API_KEY_OWNERS의 키 별칭이 중복되었습니다.")
+        owners[label] = owner
+    return owners
 
 
 class SheetsKeyPool(GeminiKeyPool):
@@ -54,6 +84,7 @@ class SheetsKeyPool(GeminiKeyPool):
         self.url = os.getenv("GEMINI_POOL_URL", "").strip()
         self.token = os.getenv("GEMINI_POOL_TOKEN", "").strip()
         self.user = os.getenv("GEMINI_POOL_USER", "").strip()
+        self.key_owners = _load_key_owners()
         parsed = urlparse(self.url)
         if (parsed.scheme != "https" or parsed.hostname != "script.google.com"
                 or not parsed.path.endswith("/exec") or not self.token or not self.user):
@@ -112,10 +143,6 @@ class SheetsKeyPool(GeminiKeyPool):
                 self._active = selected["request_id"]
                 self._outcome = {}
                 self._start_heartbeat()
-                print("  - 무작위 후보: " + ", ".join(
-                    f"{c['key_label']}:{c['model']} (잔여 {c.get('remaining', '?')}회, 일일 사용 {c['day_count']}회)"
-                    for c in result["sampled"]))
-                print(f"  - 선택: {combo.combo_id}; 미선택 후보 예약 해제 완료")
                 return combo
             if time.monotonic() >= deadline or result.get("terminal"):
                 raise KeyPoolExhaustedError(result.get("reason", "시트에서 사용 가능한 조합이 없습니다."))
@@ -188,7 +215,9 @@ class SheetsKeyPool(GeminiKeyPool):
         """스크립트 속성의 공유 키와 병합하고 로컬 .env를 갱신한다."""
         before = dict(self.keys)
         result = self._post("sync", keys=[
-            {"key_label": label, "api_key": key} for label, key in self.keys
+            {"key_label": label, "api_key": key,
+             "owner": self.key_owners.get(label, self.user)}
+            for label, key in self.keys
         ])
         shared = result.pop("keys", None)
         if not isinstance(shared, list):
@@ -197,15 +226,20 @@ class SheetsKeyPool(GeminiKeyPool):
         for item in shared:
             label = item.get("key_label") if isinstance(item, dict) else None
             key = item.get("api_key") if isinstance(item, dict) else None
+            owner = item.get("owner") if isinstance(item, dict) else None
             if (not isinstance(label, str) or not label or any(c in label for c in "{}:, \t\r\n")
-                    or not isinstance(key, str) or not key or any(c in key for c in "{},:\"\r\n")):
-                raise SheetsPoolError("공유 키 동기화 응답에 잘못된 별칭 또는 키가 있습니다.")
-            keys.append((label, key))
-        if len(dict(keys)) != len(keys):
+                    or not isinstance(key, str) or not key or any(c in key for c in "{},:\"\r\n")
+                    or not isinstance(owner, str) or not owner or any(c in owner for c in "{}:,\r\n")):
+                raise SheetsPoolError("공유 키 동기화 응답에 잘못된 별칭, 키 또는 담당자가 있습니다.")
+            keys.append((label, key, owner))
+        if len({label for label, _, _ in keys}) != len(keys):
             raise SheetsPoolError("공유 키 동기화 응답의 별칭이 중복되었습니다.")
-        result["local_added"] = sum(label not in before for label, _ in keys)
-        result["local_updated"] = sum(label in before and before[label] != key for label, key in keys)
-        _write_keys_to_env(keys, ENV_PATH)
+        result["local_added"] = sum(label not in before for label, _, _ in keys)
+        result["local_updated"] = sum(label in before and before[label] != key for label, key, _ in keys)
+        _write_env_mappings({
+            "GEMINI_API_KEYS": [(label, key) for label, key, _ in keys],
+            "GEMINI_API_KEY_OWNERS": [(label, owner) for label, _, owner in keys],
+        }, ENV_PATH)
         return result
 
 

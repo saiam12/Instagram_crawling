@@ -200,9 +200,10 @@ function mergeSharedKeys(stored, submitted, user, now) {
   });
   const storedLabels = new Set(stored.map(item => item.key_label));
   const submittedByLabel = new Map(submitted.map(item => [item?.key_label, item?.api_key]));
+  const hasExplicitOwners = submitted.some(item => item?.owner != null && String(item.owner).trim());
   const owners = new Set(stored.map(item => item.owner));
   let owner_renamed = 0;
-  if (stored.length && owners.size === 1 && !owners.has(user) &&
+  if (!hasExplicitOwners && stored.length && owners.size === 1 && !owners.has(user) &&
       submittedByLabel.size === storedLabels.size &&
       stored.every(item => submittedByLabel.get(item.key_label) === item.api_key)) {
     byLabel.forEach(item => { item.owner = user; });
@@ -211,16 +212,32 @@ function mergeSharedKeys(stored, submitted, user, now) {
   let vault_added = 0, vault_updated = 0;
   submitted.forEach(item => {
     const label = clean(item?.key_label), key = String(item?.api_key || '');
+    const owner = clean(item?.owner || user).trim();
     if (!label || !key || key.length > 500 || /[{},:\"\r\n]/.test(key))
       throw new Error('동기화할 키 별칭 또는 API 키 형식이 올바르지 않습니다.');
+    if (!owner || /[{},:\r\n]/.test(owner)) throw new Error('키 담당자 값이 올바르지 않습니다.');
     const current = byLabel.get(label);
     if (!current) {
-      byLabel.set(label, {key_label: label, api_key: key, owner: user,
+      byLabel.set(label, {key_label: label, api_key: key, owner,
         updated_at: new Date(now).toISOString()});
       vault_added++;
-    } else if (current.owner === user && current.api_key !== key) {
-      byLabel.set(label, {...current, api_key: key, updated_at: new Date(now).toISOString()});
-      vault_updated++;
+    } else {
+      const next = {...current};
+      let changed = false;
+      if (current.owner === user && current.api_key !== key) {
+        next.api_key = key;
+        vault_updated++;
+        changed = true;
+      }
+      if (hasExplicitOwners && current.owner !== owner) {
+        next.owner = owner;
+        owner_renamed++;
+        changed = true;
+      }
+      if (changed) {
+        next.updated_at = new Date(now).toISOString();
+        byLabel.set(label, next);
+      }
     }
   });
   return {keys: [...byLabel.values()], vault_added, vault_updated, owner_renamed};
@@ -336,7 +353,9 @@ function doPost(e) {
       result.vault_added = merged.vault_added;
       result.vault_updated = merged.vault_updated;
       result.owner_renamed = merged.owner_renamed;
-      result.keys = merged.keys.map(item => ({key_label: item.key_label, api_key: item.api_key}));
+      result.keys = merged.keys.map(item => ({
+        key_label: item.key_label, api_key: item.api_key, owner: item.owner,
+      }));
     }
     else {
       const config = settingsFrom(readRows(settings, 9));

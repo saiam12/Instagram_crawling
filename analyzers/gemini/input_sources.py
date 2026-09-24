@@ -1,6 +1,10 @@
 """Reel URL 입력 소스 처리."""
 
+import re
 from pathlib import Path
+
+
+SHORTCODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 def is_instagram_reel_url(value: object) -> bool:
     url = str(value or "").strip().lower()
@@ -9,8 +13,18 @@ def is_instagram_reel_url(value: object) -> bool:
         "https://www.instagram.com/reels/",
         "https://instagram.com/reel/",
         "https://instagram.com/reels/",
+        "https://instagram.com/p/",
     )
     return url.startswith(prefixes)
+
+
+def normalize_reel_url(value: object) -> str:
+    text = str(value or "").strip()
+    if is_instagram_reel_url(text):
+        return text
+    if SHORTCODE_PATTERN.fullmatch(text):
+        return f"https://www.instagram.com/reels/{text}/"
+    return ""
 
 
 def read_reel_urls_from_xlsx(path: Path) -> list[str]:
@@ -33,8 +47,8 @@ def read_reel_urls_from_xlsx(path: Path) -> list[str]:
                 continue
             for row in rows:
                 value = row[url_index] if url_index < len(row) else None
-                url = str(value or "").strip()
-                if is_instagram_reel_url(url) and url not in seen:
+                url = normalize_reel_url(value)
+                if url and url not in seen:
                     seen.add(url)
                     urls.append(url)
     finally:

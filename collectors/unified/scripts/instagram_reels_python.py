@@ -14,23 +14,28 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from collectors.instagram_reels_browser import (  # noqa: E402
+from reels.instagram_reels_browser import (  # noqa: E402
     append_collection_log,
     main as collector_main,
     parse_hashtag_query,
     reconcile_reel_exports,
     run_android_metric_worker,
 )
-from collectors.fashion_beauty_collection import run_fashion_beauty_collection  # noqa: E402
-from collectors.fashion_beauty_scheduler import (  # noqa: E402
+from reels.fashion_beauty_collection import run_fashion_beauty_collection  # noqa: E402
+from reels.fashion_beauty_scheduler import (  # noqa: E402
     BEAUTY_KEYWORDS,
     FASHION_KEYWORDS,
     KEYWORDS_PER_WINDOW,
     RunConfig,
     SIX_HOUR_NEW_ONLY_KEYWORDS_PER_WINDOW,
 )
-from collectors.instagram_hashtag_search import collect_hashtag_count_report  # noqa: E402
+from reels.instagram_hashtag_search import collect_hashtag_count_report  # noqa: E402
 from exporters.instagram_collector import DataStore, read_reel_urls_from_xlsx  # noqa: E402
+from reels.collector_modes import (  # noqa: E402
+    MODE_COMMANDS,
+    extract_collector_mode,
+    run_android_collection,
+)
 
 
 USAGE = """usage: instagram_reels_python.py {collect,refresh,followers,xlsx,reconcile,android-worker,hashtag-posts,fashion,beauty,fashion-beauty} [collector options]
@@ -49,6 +54,8 @@ commands:
 
 All options after the command are passed to the Python collector. Examples:
   python scripts/instagram_reels_python.py collect --max-items 50 --background
+  python scripts/instagram_reels_python.py fashion --collector-mode web --background
+  python scripts/instagram_reels_python.py fashion --collector-mode android --background
   python scripts/instagram_reels_python.py refresh --background --direct-concurrency 2
   python scripts/instagram_reels_python.py followers --follower-interval-seconds 8
   python scripts/instagram_reels_python.py reconcile
@@ -103,7 +110,17 @@ def _positive_integer(value: str) -> int:
     return number
 
 
-def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
+def parse_scheduled_command(
+    command: str,
+    arguments: list[str],
+    *,
+    collector_mode: str = "hybrid",
+) -> RunConfig:
+    if collector_mode == "hybrid":
+        detected_mode, remaining = extract_collector_mode(arguments)
+        if detected_mode != "hybrid" or len(remaining) != len(arguments):
+            collector_mode = detected_mode
+            arguments = remaining
     domains = SCHEDULED_COMMAND_DOMAINS[command]
     parser = argparse.ArgumentParser(
         prog=f"instagram_reels_python.py {command}",
@@ -155,6 +172,10 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
     )
     parser.add_argument("--fashion-hashtag-query")
     parser.add_argument("--beauty-hashtag-query")
+    if collector_mode not in {"hybrid", "web"}:
+        parser.error(f"Scheduled browser collection does not support collector mode: {collector_mode}")
+    if collector_mode == "web" and "--collect-hashtag-media-count" in arguments:
+        parser.error("--collect-hashtag-media-count requires hybrid collector mode")
     options = parser.parse_args(arguments)
     keywords_per_window = KEYWORDS_PER_WINDOW
     if options.six_hour_new_only:
@@ -243,12 +264,14 @@ def parse_scheduled_command(command: str, arguments: list[str]) -> RunConfig:
         fashion_keywords=fashion_keywords,
         beauty_keywords=beauty_keywords,
         domains=domains,
+        collector_mode=collector_mode,
     )
 
 
 def parse_fashion_command(arguments: list[str]) -> RunConfig:
     """Backward-compatible parser entry point for the fashion-only command."""
-    return parse_scheduled_command("fashion", arguments)
+    collector_mode, remaining = extract_collector_mode(arguments)
+    return parse_scheduled_command("fashion", remaining, collector_mode=collector_mode)
 
 
 def sync_xlsx(data_dir: Path) -> int:
@@ -272,9 +295,24 @@ def main(argv: list[str] | None = None) -> int:
     if command not in {"collect", "refresh", "followers", "xlsx", "reconcile", "android-worker", "hashtag-posts", *SCHEDULED_COMMAND_DOMAINS}:
         print(f"Unknown command: {command}\n\n{USAGE}", file=sys.stderr)
         return 2
+    try:
+        collector_mode, arguments = extract_collector_mode(arguments)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    if collector_mode == "android":
+        try:
+            return run_android_collection(command, arguments)
+        except Exception as error:
+            print(str(error), file=sys.stderr)
+            return 2
     if command in SCHEDULED_COMMAND_DOMAINS:
         try:
-            return asyncio.run(run_fashion_beauty_collection(parse_scheduled_command(command, arguments)))
+            return asyncio.run(
+                run_fashion_beauty_collection(
+                    parse_scheduled_command(command, arguments, collector_mode=collector_mode)
+                )
+            )
         except KeyboardInterrupt:
             print("Scheduled collection stopped; latest checkpoint outputs were preserved.")
             return 130
@@ -294,6 +332,9 @@ def main(argv: list[str] | None = None) -> int:
             print(str(error), file=sys.stderr)
             return 1
     if command == "android-worker":
+        if collector_mode == "web":
+            print("android-worker requires Android and cannot use web collector mode", file=sys.stderr)
+            return 2
         parser = argparse.ArgumentParser(prog="instagram_reels_python.py android-worker")
         parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data_web")
         parser.add_argument("--android-adb-path", type=Path)
@@ -311,6 +352,9 @@ def main(argv: list[str] | None = None) -> int:
             attach_existing=not worker_options.detached,
         )
     if command == "hashtag-posts":
+        if collector_mode == "web":
+            print("hashtag-posts requires Android and cannot use web collector mode", file=sys.stderr)
+            return 2
         parser = argparse.ArgumentParser(prog="instagram_reels_python.py hashtag-posts")
         parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data_web")
         hashtag_source = parser.add_mutually_exclusive_group(required=True)
@@ -340,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             rows, paths, android_summaries = asyncio.run(collect_hashtag_count_report(
                 hashtag_options.data_dir,
                 hashtags,
-                profile_dir=PROJECT_ROOT / ".instagram_chrome_profile",
+                profile_dir=PROJECT_ROOT / "browser_profile" / ".instagram_chrome_profile",
                 adb_path=hashtag_options.android_adb_path,
                 device_id=hashtag_options.android_device_id,
                 ui_delay_seconds=hashtag_options.android_ui_delay_seconds,
@@ -411,6 +455,8 @@ def main(argv: list[str] | None = None) -> int:
             arguments.extend(["--followers-only", "--background"])
         if "--data-dir" not in arguments:
             arguments.extend(["--data-dir", str(data_dir)])
+        if collector_mode == "web" and command in MODE_COMMANDS:
+            arguments.append("--no-android-metrics")
         return collector_main(arguments)
     except Exception as error:
         print(str(error), file=sys.stderr)

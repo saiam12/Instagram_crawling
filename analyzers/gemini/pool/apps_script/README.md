@@ -33,12 +33,14 @@
 F 사용 여부(`사용` 또는 `중지`) / G 비고 / H 초기 집계일 / I 초기 사용량.
 
 - A열은 로컬 `.env`의 `GEMINI_API_KEYS`에 적은 별칭과 정확히 일치해야 합니다.
-- `.env` 변경 후 `python reel_analyzer.py --sync-key-pool`을 실행하면 공유 키와 설정이 자동 병합됩니다.
-  중앙에 없는 키는 최초 실행자가 소유자로 등록하고, 이후 그 소유자만 키 값을 갱신할 수 있습니다.
-  중앙에만 있거나 값이 변경된 키는 팀원의 로컬 `.env`에 추가·갱신됩니다.
-  중앙에 등록된 키 별칭은 `acct1` 형식으로 표시하고, 담당자는 최초 등록자로 통일됩니다.
-  모든 공유 키가 한 담당자 소유이고 키 값은 그대로인 상태에서 `GEMINI_POOL_USER`만 바꾸면
-  담당자 표시명을 새 값으로 일괄 변경합니다.
+- `.env`의 `GEMINI_API_KEY_OWNERS`에 `{키별칭:담당자,...}`를 지정하고
+  `python reel_analyzer.py --sync-key-pool`을 실행하면 공유 키와 설정이 자동 병합됩니다.
+  중앙에 없는 키는 `GEMINI_API_KEY_OWNERS`의 담당자로 등록하며, 매핑이 없으면
+  현재 실행자인 `GEMINI_POOL_USER`를 담당자로 사용합니다. 이후 키 값은 현재 담당자만 갱신할 수 있습니다.
+  중앙에만 있거나 값·담당자가 변경된 키는 팀원의 로컬 `.env`에 추가·갱신됩니다.
+  중앙에 등록된 키 별칭은 `acct1` 형식으로 표시하고, 담당자는 키별 매핑 값으로 표시됩니다.
+  이전 설정처럼 `GEMINI_API_KEY_OWNERS`를 생략한 경우, 모든 공유 키가 한 담당자 소유이고
+  키 값은 그대로인 상태에서 `GEMINI_POOL_USER`만 바꾸면 담당자 표시명을 일괄 변경합니다.
   기존 요청 기록의 프로젝트 별칭도 함께 변경되어 과거 사용량 집계가 유지됩니다.
   새 별칭에는 모델 3.5/3.6/3.7, RPM 5, RPD 20 행이 추가됩니다.
   로컬에서만 키를 지우면 다음 동기화에서 중앙값이 다시 추가됩니다.
@@ -85,6 +87,8 @@ GEMINI_POOL_TOKEN=스크립트속성과동일한비밀값
 GEMINI_POOL_USER=사용자별칭
 GEMINI_API_KEYS="{acct1:실제키1,
 acct2:실제키2}"
+GEMINI_API_KEY_OWNERS="{acct1:담당자1,
+acct2:담당자2}"
 GEMINI_MODELS=gemini-3.5-flash,gemini-3.6-flash,gemini-3.7-flash
 ```
 

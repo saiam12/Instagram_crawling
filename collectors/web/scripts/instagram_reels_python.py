@@ -14,13 +14,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from collectors.instagram_reels_browser import (  # noqa: E402
+from reels.instagram_reels_browser import (  # noqa: E402
     main as collector_main,
     parse_hashtag_query,
     reconcile_reel_exports,
 )
-from collectors.fashion_beauty_collection import run_fashion_beauty_collection  # noqa: E402
-from collectors.fashion_beauty_scheduler import (  # noqa: E402
+from reels.fashion_beauty_collection import run_fashion_beauty_collection  # noqa: E402
+from reels.fashion_beauty_scheduler import (  # noqa: E402
     BEAUTY_KEYWORDS,
     FASHION_KEYWORDS,
     KEYWORDS_PER_WINDOW,

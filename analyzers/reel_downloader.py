@@ -8,15 +8,16 @@ Instagram Reel Downloader (CLI)
     python reel_downloader.py
 """
 
+import argparse
 import os
-import sys
 import yt_dlp
+from gemini.input_sources import normalize_reel_url
 
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 
 
-def download_reel(reel_url: str) -> str:
+def download_reel(reel_url: str, cookies_browser: str | None = None) -> str:
     """Instagram Reel을 downloads/ 폴더에 mp4로 저장하고 저장된 파일 경로를 반환한다."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -25,9 +26,10 @@ def download_reel(reel_url: str) -> str:
         "no_warnings": True,
         "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        # 비공개 계정/로그인 필요 시 아래 주석을 해제하고 브라우저를 지정하세요.
-        # "cookiesfrombrowser": ("edge", None, None, None),
     }
+
+    if cookies_browser:
+        ydl_opts["cookiesfrombrowser"] = (cookies_browser, None, None, None)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(reel_url, download=True)
@@ -41,6 +43,14 @@ def download_reel(reel_url: str) -> str:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Instagram Reel Downloader")
+    parser.add_argument(
+        "--cookies-from-browser",
+        choices=("brave", "chrome", "chromium", "edge", "firefox", "opera", "vivaldi", "whale"),
+        help="선택한 브라우저의 Instagram 로그인 쿠키를 사용합니다.",
+    )
+    args = parser.parse_args()
+
     print("Instagram Reel Downloader")
     print("Reel URL을 입력하세요. 종료하려면 'quit' 또는 'exit' 입력.\n")
 
@@ -56,14 +66,17 @@ def main():
         if reel_url.lower() in ("quit", "exit", "q"):
             print("종료합니다.")
             break
-        if "instagram.com" not in reel_url:
+        reel_url = normalize_reel_url(reel_url)
+        if not reel_url:
             print("[경고] Instagram URL이 아닌 것 같습니다. 다시 확인해주세요.\n")
             continue
 
         try:
-            download_reel(reel_url)
+            download_reel(reel_url, args.cookies_from_browser)
             print("[완료]\n")
         except yt_dlp.utils.DownloadError as e:
+            if not args.cookies_from_browser and "isn't available to everyone" in str(e):
+                print("[안내] 로그인 계정으로 다시 실행하세요: python reel_downloader.py --cookies-from-browser edge")
             print(f"[오류] 영상을 가져오지 못했습니다: {e}")
             print("      비공개 계정이거나 삭제된 게시물일 수 있습니다.\n")
         except Exception as e:

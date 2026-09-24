@@ -19,22 +19,23 @@ python -m venv .venv
 기존 `.venv`의 패키지 또는 Python 연결이 꼬였을 때는 다음 명령으로 Python 3.12 환경만 복구합니다. 수집 결과와 로그인 프로필은 유지됩니다.
 
 ```powershell
-.\repair_venv.ps1
+.\scripts\repair_venv.ps1
 ```
 
 ## 폴더 구조
 
 | 경로 | 용도 |
 |---|---|
-| `collectors` | Python 릴스 및 팔로워 수집 코드 |
+| `reels` | Python 릴스 및 팔로워 수집 코드 |
 | `exporters` | CSV·JSON·XLSX 저장 코드 |
-| `scripts` | 실행 목적별 진입점 |
+| `scripts` | 실행 목적별 진입점과 가상환경 복구 스크립트 |
+| `tests` | 수집기와 저장 코드 테스트 |
 | `data_web` | 실제 수집 결과(처음 실행할 때 자동 생성) |
-| `.instagram_browser_profile` | Python 버전 전용 로그인 프로필(자동 생성) |
+| `browser_profile/.instagram_browser_profile` | 브라우저 로그인 프로필(자동 생성) |
 | `examples` | 출력 예시와 검증 자료 |
 | `data_web_test` | 수집 출력 검증용 데이터 |
 | `collector.ps1` | PowerShell 실행 진입점 |
-| `repair_venv.ps1` | 가상환경 복구 스크립트 |
+| `scripts/repair_venv.ps1` | 가상환경 복구 스크립트 |
 
 ## 기본 실행
 
@@ -273,5 +274,5 @@ Instagram `429` 요청 제한이 확인되면 계정의 대기 중인 재수집 
 ## 테스트
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest collectors.test_instagram_reels_browser exporters.test_instagram_collector
+.\.venv\Scripts\python.exe -B -m unittest tests.test_instagram_reels_browser tests.test_instagram_collector
 ```

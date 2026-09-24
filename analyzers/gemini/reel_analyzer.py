@@ -22,19 +22,21 @@ import threading
 from queue import Queue
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Literal, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 import yt_dlp
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from google.genai import errors as genai_errors
 
 from google import genai
 from google.genai import types
 
-from pool import GeminiKeyPool, KeyPoolExhaustedError, Combo, create_pool
-from input_sources import is_instagram_reel_url, read_reel_urls_from_xlsx
+from pool import GeminiKeyPool, KeyPoolExhaustedError, create_pool
+from input_sources import normalize_reel_url, read_reel_urls_from_xlsx
+from prompts import ANALYSIS_PROMPT
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,9 @@ INLINE_SIZE_LIMIT_MB = 18
 # 풀에서 쓸 수 있는 조합이 당장 없을 때(RPM 제한), 최대 몇 초까지 기다릴지
 POOL_WAIT_MAX_SEC = 90
 
+# 최초 호출을 포함한 API 최대 시도 횟수.
+MAX_API_ATTEMPTS = 5
+
 # 대화형 입력과 분석을 분리하되 프로젝트별 API 한도를 과도하게 밀어붙이지 않는다.
 INTERACTIVE_WORKERS = 2
 
@@ -57,12 +62,11 @@ INTERACTIVE_WORKERS = 2
 SCENE_ANALYSIS_FPS = 5
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+DEFAULT_OUTPUT_FILE = os.path.join(OUTPUT_DIR, "reel_analyses.json")
 # Batch callers can give each worker an isolated file.  The normal CLI keeps
 # the historical output path and behavior.
-OUTPUT_FILE = os.getenv(
-    "GEMINI_OUTPUT_FILE",
-    os.path.join(OUTPUT_DIR, "reel_analyses.json"),
-)
+OUTPUT_FILE = os.getenv("GEMINI_OUTPUT_FILE", DEFAULT_OUTPUT_FILE)
+WRITE_READABLE_OUTPUT = "GEMINI_OUTPUT_FILE" not in os.environ
 OUTPUT_LOCK = threading.Lock()
 ALLOWED_MODELS = (
     "gemini-3.5-flash",
@@ -74,7 +78,7 @@ ALLOWED_MODELS = (
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Instagram Reel 영상을 Gemini로 분석합니다.")
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--url", help="분석할 Instagram Reel URL 한 건")
+    source.add_argument("-url", "--url", help="분석할 Instagram Reel URL 또는 shortcode 한 건")
     source.add_argument("--xlsx", type=Path, help="url 또는 reel_url 열을 순회할 XLSX 파일")
     source.add_argument(
         "--sync-key-pool",
@@ -85,6 +89,18 @@ def parse_args(argv=None):
         "--model",
         choices=ALLOWED_MODELS,
         help="지정한 Flash 모델만 사용합니다. 생략하면 공용 풀이 자동 선택합니다.",
+    )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="한 번의 Gemini 호출로 분석할 영상 수 (기본값: 1)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="재현 가능한 출력을 위한 고정 seed (생략하면 API 기본값 사용)",
     )
     return parser.parse_args(argv)
 
@@ -131,10 +147,25 @@ def get_instagram_video(reel_url: str) -> dict:
     response = requests.get(video_url, headers=headers, timeout=60)
     response.raise_for_status()
 
+    thumbnail_bytes = None
+    thumbnail_mime_type = None
+    thumbnail_url = info.get("thumbnail")
+    if thumbnail_url:
+        try:
+            thumbnail_response = requests.get(thumbnail_url, headers=headers, timeout=30)
+            thumbnail_response.raise_for_status()
+            thumbnail_bytes = thumbnail_response.content
+            thumbnail_mime_type = thumbnail_response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0]
+            print("  - thumbnail : Instagram 메타데이터 커버 이미지 사용")
+        except requests.exceptions.RequestException as e:
+            print(f"  - thumbnail : 커버 다운로드 실패, 영상 첫 프레임으로 대체 ({e})")
+
     return {
         "id": info.get("id"),
         "video_bytes": response.content,
         "mime_type": "video/mp4",
+        "thumbnail_bytes": thumbnail_bytes,
+        "thumbnail_mime_type": thumbnail_mime_type,
         "metadata": info,
     }
 
@@ -150,8 +181,14 @@ class Hook(BaseModel):
 
 class Camera(BaseModel):
     main_composition: str = Field(description="영상 전체의 주요 카메라 구도")
-    angles: List[str] = Field(default_factory=list, description="등장하는 카메라 앵글 목록")
-    movements: List[str] = Field(default_factory=list, description="등장하는 카메라 움직임 목록")
+    angles: List[str] = Field(
+        default_factory=list,
+        description="scene_details.camera의 angle 영문 코드만 중복 없이 나열",
+    )
+    movements: List[str] = Field(
+        default_factory=list,
+        description="scene_details.camera_movement의 type 영문 코드만 중복 없이 나열",
+    )
 
 
 class Editing(BaseModel):
@@ -166,14 +203,30 @@ class Subtitle(BaseModel):
     style: Optional[str] = Field(default=None, description="자막/텍스트 오버레이 스타일 (말풍선 여부 등)")
 
 
+class SubjectPerson(BaseModel):
+    subject_id: str = Field(description="영상 전체에서 동일하게 사용하는 인물 A, 인물 B 등의 이름표")
+    gender_presentation: Literal["male", "female", "unknown"] = Field(
+        description="영상에서 확인되는 남성형/여성형 표현. 모호하면 unknown이며 실제 성별·성 정체성을 뜻하지 않음"
+    )
+
+
 class Subjects(BaseModel):
     people_count: int
     main_subject: str = Field(description="주요 피사체 (인물, 캐릭터, 상품 등)")
+    people: List[SubjectPerson] = Field(description="등장하는 실제 인물을 이름표별로 한 번씩 기록")
 
 
 class Product(BaseModel):
     exists: bool
     description: Optional[str] = None
+
+
+class SceneWornOutfit(BaseModel):
+    subject_id: str = Field(description="이 의상을 실제로 입은 인물의 이름표")
+    gender_presentation: Literal["male", "female", "unknown"] = Field(
+        description="해당 인물의 subjects.people.gender_presentation과 동일한 코드"
+    )
+    clothing_items: List[str] = Field(min_length=1, description="이 장면에서 해당 인물이 실제로 착용한 옷, 신발, 액세서리")
 
 
 class SceneDetail(BaseModel):
@@ -182,15 +235,26 @@ class SceneDetail(BaseModel):
     end_second: float
     section: str = Field(description="이 장면이 속하는 구간. 'hook' 또는 'body' 중 하나")
     visual_description: str = Field(description="장면에 대한 상세 시각적 묘사 (인물/캐릭터, 동작, 배경, 소품 포함)")
-    layout_type: str = Field(
-        description="이 장면의 구도/포맷 유형. 예: mirror_selfie, flat_lay_outfit_grid, closeup, "
-        "talking_head, product_shot 등 실제 관찰되는 형태를 자유롭게 기술"
+    worn_outfits: List[SceneWornOutfit] = Field(
+        description="장면에서 실제 착용 중인 인물별 의상. 플랫레이, 마네킹, 단독 상품만 보이면 빈 목록"
     )
-    camera: str = Field(description="카메라 구도/앵글")
-    camera_movement: str = Field(description="카메라 움직임 (없으면 '없음')")
+    layout_type: str = Field(
+        description="mirror_selfie | flat_lay_outfit_grid | closeup | talking_head | product_shot | "
+        "full_body_fashion_shot | split_screen | text_only | scenery | other 중 하나"
+    )
+    camera: str = Field(
+        description="shot_size=<표준 코드>; angle=<표준 코드>; composition=<표준 코드> 형식"
+    )
+    camera_movement: str = Field(
+        description="type=<표준 코드>; direction=<표준 코드>; speed=<표준 코드> 형식. "
+        "움직임이 없으면 type=static; direction=none; speed=none"
+    )
     on_screen_text: Optional[str] = Field(default=None, description="화면에 표시된 자막/말풍선 텍스트 원문")
     audio_or_dialogue: Optional[str] = Field(default=None, description="대사, 나레이션, 배경음악 특징")
-    transition_in: str = Field(description="이전 장면에서 넘어올 때 사용된 전환 기법 (없으면 '없음')")
+    transition_in: str = Field(
+        description="none | hard_cut | jump_cut | match_cut | dissolve | fade_in | fade_out | wipe | "
+        "whip_pan | graphic_match | other 중 하나"
+    )
     emotional_tone: str = Field(description="이 장면이 전달하는 감정/분위기")
     purpose: str = Field(description="이 장면이 영상 전체에서 하는 역할")
 
@@ -208,10 +272,89 @@ class VideoGenerationPrompts(BaseModel):
     )
 
 
+class TranscriptSegment(BaseModel):
+    start_second: float
+    end_second: float
+    speaker: str = Field(description="인물 A, 인물 B, narrator 또는 unknown")
+    text: str = Field(description="들리는 대사나 내레이션의 원문. 노래 가사는 제외")
+
+
+class SoundEvent(BaseModel):
+    start_second: float
+    end_second: float
+    type: str = Field(
+        description="laughter | clap | snap | footsteps | impact | whoosh | click | object_handling | "
+        "animal | vehicle | ambient | other 중 하나"
+    )
+    description: str = Field(description="실제로 들리는 비언어 소리에 대한 한국어 설명")
+
+
+class BackgroundMusic(BaseModel):
+    exists: bool
+    mood: Optional[str] = Field(
+        default=None,
+        description="neutral | upbeat | calm | dark | dramatic | romantic | playful | energetic | sad | other | unknown",
+    )
+    tempo: str = Field(description="none | slow | medium | fast | variable | unknown")
+    vocals: Optional[bool] = Field(default=None, description="보컬 존재 여부. 확인할 수 없으면 null")
+
+
+class AudioAnalysis(BaseModel):
+    speech_present: bool
+    language: Optional[str] = Field(default=None, description="ISO 639-1 언어 코드, mixed, unknown 또는 null")
+    transcript: List[TranscriptSegment] = Field(default_factory=list)
+    sound_events: List[SoundEvent] = Field(default_factory=list)
+    background_music: BackgroundMusic
+
+
+class SellingPoint(BaseModel):
+    point: str = Field(description="영상이 강조하는 구체적인 판매 포인트")
+    evidence: str = Field(description="판매 포인트를 뒷받침하는 음성, 화면, 자막 근거의 종합 설명")
+    spoken_evidence: Optional[str] = Field(description="실제로 들리는 핵심 대사 원문. 음성 근거가 없으면 null")
+    visual_evidence: Optional[str] = Field(description="같은 구간에서 직접 보이는 행동, 상품, 전후 변화. 없으면 null")
+    on_screen_text_evidence: Optional[str] = Field(description="같은 구간에서 판독되는 화면 문구 원문. 없으면 null")
+    start_second: float
+    end_second: float
+    appeal_type: str = Field(
+        description="product_feature | product_variety | styling_inspiration | transformation | convenience | "
+        "price_value | scarcity | social_proof | aspiration | novelty | brand_identity | other 중 하나"
+    )
+    evidence_confidence: float = Field(
+        ge=0,
+        le=1,
+        description="판매 성과 예측값이 아니라 관찰 근거가 해석을 지지하는 정도. 0에서 1 사이",
+    )
+
+
 class MarketingAnalysis(BaseModel):
     strengths: List[str] = Field(default_factory=list)
     weaknesses: List[str] = Field(default_factory=list)
     notable_elements: List[str] = Field(default_factory=list)
+    selling_points: List[SellingPoint] = Field(default_factory=list)
+
+    @field_validator("selling_points")
+    @classmethod
+    def discard_unsupported_selling_points(cls, points: List[SellingPoint]) -> List[SellingPoint]:
+        return [point for point in points if point.evidence_confidence >= 0.5]
+
+
+class RecommendedAudience(BaseModel):
+    age_group: Literal["10s", "20s", "30s", "20s_30s", "40s_plus", "all", "unknown"]
+    gender: Literal["male", "female", "all", "unknown"]
+    evidence: str = Field(min_length=1, description="화면 문구, 대사, 상품 또는 스타일을 근거로 이 대상을 추천한 이유")
+
+
+class ThumbnailAnalysis(BaseModel):
+    source: str = Field(description="provided_cover_image | video_first_frame")
+    visual_description: str = Field(description="대표 화면에서 관찰되는 인물, 상품, 배경, 색상과 배치")
+    on_screen_text: Optional[str] = Field(default=None, description="대표 화면에서 판독되는 텍스트 원문")
+    focal_point: str = Field(description="가장 먼저 시선이 가는 핵심 대상과 그 이유")
+    composition: str = Field(description="구도, 피사체 크기와 위치, 여백, 대비에 대한 설명")
+    selling_point: Optional[str] = Field(default=None, description="대표 화면이 전달하는 판매 포인트 또는 null")
+    strengths: List[str] = Field(default_factory=list)
+    weaknesses: List[str] = Field(default_factory=list)
+    effectiveness: str = Field(description="strong | medium | weak")
+    evidence_confidence: float = Field(ge=0, le=1, description="대표 화면에서 직접 확인되는 근거의 신뢰도")
 
 
 class VideoAnalysis(BaseModel):
@@ -228,117 +371,50 @@ class VideoAnalysis(BaseModel):
     subjects: Subjects
     product: Product
     scene_details: List[SceneDetail] = Field(description="씬별 상세 분석 목록. 훅과 바디를 모두 포함해야 함")
+    audio_analysis: AudioAnalysis
     content_type: str
+    thumbnail_analysis: ThumbnailAnalysis
     marketing_analysis: MarketingAnalysis
+    recommended_audience: List[RecommendedAudience] = Field(
+        description="영상의 의도된 추천 대상. 대상이 여러 개면 각각 기록하며 판단 근거가 없으면 빈 목록"
+    )
     generation_prompts: VideoGenerationPrompts
 
-
-ANALYSIS_PROMPT = """
-이 Instagram Reel 영상을 분석하세요.
-
-주어진 JSON 스키마에 맞춰 결과를 반환해야 합니다. 아래 지침을 반드시 지키세요.
-분석 목적은 원본의 인물/캐릭터 외형, 상품 외형, 움직임을 재현할 수 있게 관찰 정보를 남기는 것입니다.
-기존 JSON 필드 안에 상세 내용을 기록하고, 스키마에 없는 필드는 추가하지 마세요.
-보이지 않는 부분이나 흐려서 확인할 수 없는 특징은 추측하지 말고 '확인 불가'로 표시하세요.
-브랜드, 제품명, 인물의 신원은 추정하지 마세요. 시간과 위치는 관찰 가능한 범위에서만 기술하세요.
-모든 설명은 한국어로 작성하되, generation_prompts.video_prompt_en만 영어로 작성하세요.
-
-[분석 절차]
-1. 출력을 작성하기 전에 영상을 처음부터 끝까지 확인하고, 실제 영상 길이와 모든 시각적·청각적 전환 시점을 먼저 파악하세요.
-2. 커트, 구도, 대상, 의상/상품, 텍스트가 바뀌는 순간을 기준으로 신 경계를 먼저 확정하세요.
-3. 확정한 타임라인을 기준으로 scene_details를 완성한 뒤, 요약 필드와 generation_prompts를 작성하세요.
-4. visual_description은 화면에서 확인한 사실만 적고, emotional_tone, purpose, marketing_analysis에서만 근거 있는 해석을 제공하세요.
-
-[인물/캐릭터 외형 기록]
-1. subjects.main_subject에 주요 인물/캐릭터 각각을 구별할 수 있는 이름표(인물 A, 캐릭터 A 등)를 붙이고,
-   얼굴 윤곽, 눈/눈썹/코/입의 보이는 형태, 헤어스타일과 색, 체형과 신체 비율을 구체적으로 적으세요.
-   인형 탈이나 마스코트라면 실제 사람의 얼굴로 해석하지 말고 머리 형태, 귀, 눈/입의 배치,
-   털/천/플라스틱 등 보이는 표면 질감과 색 구획을 기록하세요.
-2. 의상은 상의/하의/신발/액세서리별 색, 핏, 길이, 소재의 시각적 특징, 무늬와 장식 위치를 기록하세요.
-   여러 인물이 있으면 각 인물의 특징을 섞지 말고 장면마다 동일한 이름표를 사용하세요.
-3. scene_details의 visual_description에도 해당 장면에서 보이는 외형, 의상, 표정, 시선 방향을 기록하세요.
-   장면 사이 의상이나 외형이 실제로 달라지면 그 변화도 명시하세요.
-
-[상품 외형과 배치 기록]
-1. product.description에 상품 A, 상품 B처럼 개별 상품을 구분해 기록하세요. 코디 세트도 개별 품목으로 나누고,
-   각 상품의 종류, 실루엣, 가로/세로 비율, 색 구획, 재질과 표면 질감, 패턴, 부속품을 설명하세요.
-   로고/문구는 읽히는 경우만 원문과 위치를 적고, 읽히지 않으면 판독 불가로 표시하세요.
-2. visual_description에는 해당 상품의 화면 내 위치, 다른 물체 대비 크기, 방향, 앞/뒷면 노출,
-   겹침과 가림 상태를 기록하세요. 실측 크기를 추정하지 마세요.
-3. 플랫레이 장면은 상의/하의/신발/소품의 상대적 배치와 간격, 배경색, 그림자 방향까지 설명하세요.
-   정지된 상품 배치를 사람이 착용하거나 손으로 움직이는 장면으로 해석하지 마세요.
-
-[움직임 기록]
-1. 각 visual_description에 '시작 상태 / 시간별 동작 / 종료 상태' 순서로 자세와 움직임을 기록하세요.
-   영상 전체 기준 초 단위 시점을 사용하고, 동작 변화가 보이는 시점만 구분하세요.
-2. 어느 신체 부위가 무엇을 잡고 어디에서 어디로 움직이는지, 이동 방향, 회전, 속도 변화,
-   멈춤과 놓는 순간을 기술하세요. 좌우는 화면 기준임을 명시하고, 실제 오른손/왼손은 확실할 때만 적으세요.
-   거울 셀카의 좌우 반전을 고려하고, 가려진 동작이나 샘플 사이 동작을 만들어내지 마세요.
-3. 피사체 움직임은 visual_description에, 카메라 이동은 camera_movement에 분리해 기록하세요.
-   정지 장면은 '움직임 없음'으로 명시하고, 컷으로 상품이 바뀐 것을 물체가 변형되거나 이동한 것으로 쓰지 마세요.
-
-[구조 판별 지침]
-1. 영상이 인물/캐릭터가 등장하는 훅(hook) 이후, 인물 없이 상품이나 코디를 배치한
-   플랫레이(flat lay) 이미지/영상 전환 구조로 바뀌는지 반드시 확인하고 body_structure에 명시하세요.
-   훅 구간과 바디 구간의 시각적 구성(등장 인물 유무, 구도, 배경)이 다르다면 그 차이를 구체적으로 설명하세요.
-2. 영상의 0초 이상 3초 미만은 hook, 3초 이상은 body로 분류하세요. 3초를 가로지르는 장면은 3초 경계에서 나누고,
-   영상이 3초보다 짧으면 모든 장면을 hook으로 분류하세요.
-
-[씬 분석 지침]
-1. 컷이 바뀌거나(화면 전환), 카메라 구도가 바뀌거나, 인물 유무가 바뀌거나, 새로운 텍스트/자막이
-   등장하는 시점마다 반드시 새로운 scene_detail 항목을 만드세요. 뭉뚱그려서 크게 나누지 마세요.
-2. scene_number는 1부터 시작해 시간순으로 1씩 증가해야 하며, 모든 장면은 start_second < end_second여야 합니다.
-3. 첫 장면은 start_second=0으로 시작하고, 다음 장면의 start_second는 바로 앞 장면의 end_second와 같아야 합니다.
-   빈 구간이나 겹치는 구간을 만들지 마세요. 마지막 장면의 end_second는 실제 영상 종료 시각과 일치해야 합니다.
-4. 하나의 시각적 상태가 3초를 넘게 유지되면 동작의 자연스러운 하위 단계를 기준으로 3초 이하의 연속 장면으로 나누세요.
-   이 분할은 새로운 커트를 의미하지 않으며, transition_in에 임의의 전환 효과를 만들지 마세요.
-5. layout_type에는 mirror_selfie, flat_lay_outfit_grid, closeup, talking_head, product_shot 등
-   실제 관찰되는 형태를 최대한 정확한 표현으로 적으세요.
-6. visual_description은 "사람이 말한다" 같은 뭉뚱그린 표현 대신, 무엇을 어떻게 하고 있는지 구체적으로 서술하세요.
-7. on_screen_text에는 화면에서 확실히 판독되는 텍스트만 원문 그대로 옮기세요. 일부만 판독되면 확인된 부분과 '[판독 불가]'를 구분하고,
-   텍스트가 없거나 전혀 판독할 수 없으면 null을 사용하세요.
-
-[필드 간 일관성]
-1. subjects.people_count는 영상 전체에서 구별되는 실제 인물의 수입니다. 거울이나 반사에 나타난 같은 인물을 두 명으로 세지 마세요.
-2. subtitle.exists는 판독 여부와 관계없이 텍스트 오버레이가 한 번이라도 보이면 true입니다. false인 경우 position과 style은 null이어야 합니다.
-3. camera, editing, subjects, product, body_structure는 scene_details에 기록한 사실을 요약해야 하며, scene_details에 없는 대상이나 전환을 추가하지 마세요.
-4. product.exists가 false면 description은 null이어야 하며, true면 실제로 보이는 상품만 description에 포함하세요.
-5. marketing_analysis의 강점·약점·특이 요소는 관찰된 훅, 편집, 상품 노출, CTA에 근거해야 하며 성과나 시청자 반응을 지어내지 마세요.
-
-[영상 생성 프롬프트(generation_prompts) 지침]
-1. video_prompt_en에는 이 영상을 AI 영상 생성 모델(Veo, Sora, Runway 등)로 재현하기 위한 영문 프롬프트를
-   작성하세요. 주제, 캐릭터(의상/외형 포함), 구도, 씬 전환 순서를 명확하게 기술하세요.
-2. 'video of', 'a video showing' 같은 불필요한 표현은 쓰지 말고, 주제와 장면을 바로 묘사하세요.
-3. 텍스트 오버레이나 한글 말풍선처럼 AI 영상 생성 모델이 재현하기 어려운 요소는 video_prompt_en에
-   포함하지 말고, 대신 graphic_post_processing_needed를 true로 표시하고 post_processing_notes에
-   별도로 어떤 후처리(자막 합성, 누끼 합성 등)가 필요한지 설명하세요.
-4. video_prompt_en은 짧은 전체 요약으로 축약하지 마세요. 하나의 문자열 안에 줄바꿈으로
-   'Appearance and setting', 'Shot timeline', 'Continuity constraints' 구간을 구성하세요.
-   Appearance and setting에는 관찰된 인물/캐릭터와 상품의 구별되는 외형, 배경, 조명을 영문으로 옮기세요.
-5. Shot timeline에는 모든 scene_details를 순서대로 반영하고 각 장면의 시작/종료 초, 등장 대상,
-   구도와 상품 배치, 시작 자세, 동작 순서와 속도, 종료 자세, 카메라 움직임, 전환 기법을 적으세요.
-   단순 분석용 분할로 나눈 연속 장면에는 새로운 컷을 지시하지 말고 동작이 연속됨을 명시하세요.
-6. Continuity constraints에는 동일 대상의 얼굴/캐릭터 형태, 의상, 상품 실루엣/색/패턴을
-   원본에서 관찰된 변화 외에는 유지하고, 추가 인물/상품/몸짓/카메라 움직임을 만들지 않도록 적으세요.
-   원본이 정지 이미지나 플랫레이 컷이면 그 정적 특성을 유지하도록 지시하세요.
-7. 원본에서 확인하지 못한 특징을 생성 프롬프트에서 확정하지 마세요. 분위기를 꾸미기 위해
-   조명, 외형, 동작을 추가하지 말고, 분석 내용과 생성 지시가 일치하는지 확인하세요.
-   후처리가 필요한 자막/로고/그래픽의 위치와 등장 시간은 post_processing_notes에 기록하세요.
-
-[출력 전 자체 검증]
-출력 직전에 다음을 내부적으로 검사하고, 어긋나는 항목은 수정한 뒤 JSON만 반환하세요.
-- scene_number가 1부터 연속적인가?
-- 모든 장면이 start_second < end_second이고, 0초부터 실제 종료 시각까지 빈틈이나 겹침 없이 연결되는가?
-- 3초 경계에서 hook과 body가 올바르게 나뉘었는가?
-- 요약 필드, scene_details, video_prompt_en 사이에 인물·상품·의상·동작·시간의 모순이 없는가?
-- 확인하지 못한 신원, 브랜드, 텍스트, 신체 특징, 동작을 추정하지 않았는가?
-"""
+    @model_validator(mode="after")
+    def validate_worn_outfit_links(self):
+        genders = {person.subject_id: person.gender_presentation for person in self.subjects.people}
+        if len(genders) != len(self.subjects.people):
+            raise ValueError("subjects.people의 subject_id는 중복될 수 없습니다")
+        if self.subjects.people_count != len(self.subjects.people):
+            raise ValueError("subjects.people_count와 subjects.people의 인원수가 일치하지 않습니다")
+        for scene in self.scene_details:
+            for outfit in scene.worn_outfits:
+                if outfit.subject_id not in genders:
+                    raise ValueError(f"scene {scene.scene_number}: 알 수 없는 착용자 {outfit.subject_id}")
+                if outfit.gender_presentation != genders[outfit.subject_id]:
+                    raise ValueError(f"scene {scene.scene_number}: 착용자의 성별 표현 코드가 일치하지 않습니다")
+        return self
 
 
-def _build_config() -> types.GenerateContentConfig:
+class GroupedVideoAnalysis(BaseModel):
+    input_index: int = Field(description="입력 영상 번호. VIDEO_1은 1, VIDEO_2는 2")
+    analysis: VideoAnalysis
+
+
+class GroupedVideoAnalyses(BaseModel):
+    analyses: List[GroupedVideoAnalysis]
+
+
+def _build_config(response_schema=VideoAnalysis) -> types.GenerateContentConfig:
+    raw_seed = os.getenv("GEMINI_SEED", "").strip()
+    try:
+        seed = int(raw_seed) if raw_seed else None
+    except ValueError:
+        raise RuntimeError("GEMINI_SEED는 정수여야 합니다.") from None
     return types.GenerateContentConfig(
         response_mime_type="application/json",
-        response_schema=VideoAnalysis,
+        response_schema=response_schema,
+        seed=seed,
     )
 
 
@@ -350,7 +426,7 @@ def _call_with_pool(pool: GeminiKeyPool, call_fn, max_attempts: Optional[int] = 
     일일 한도는 소진 처리하고, 일시적 제한은 대기 후 재사용한다.
     인증/모델 오류는 제외하고 요청 자체의 오류는 즉시 반환한다.
     """
-    max_attempts = max_attempts or len(pool.combos) * 2
+    max_attempts = max_attempts or MAX_API_ATTEMPTS
     last_exc = None
 
     for attempt in range(1, max_attempts + 1):
@@ -398,7 +474,23 @@ def _call_with_pool(pool: GeminiKeyPool, call_fn, max_attempts: Optional[int] = 
     raise last_exc or RuntimeError("모든 (키, 모델) 조합 시도가 실패했습니다.")
 
 
-def _analyze_inline(pool: GeminiKeyPool, video_bytes: bytes, mime_type: str) -> dict:
+def _thumbnail_parts(thumbnail_bytes: Optional[bytes], thumbnail_mime_type: Optional[str]) -> list[types.Part]:
+    if not thumbnail_bytes:
+        return []
+    return [
+        types.Part(text="INSTAGRAM_COVER_IMAGE_START"),
+        types.Part(inline_data=types.Blob(data=thumbnail_bytes, mime_type=thumbnail_mime_type or "image/jpeg")),
+        types.Part(text="INSTAGRAM_COVER_IMAGE_END"),
+    ]
+
+
+def _analyze_inline(
+    pool: GeminiKeyPool,
+    video_bytes: bytes,
+    mime_type: str,
+    thumbnail_bytes: Optional[bytes] = None,
+    thumbnail_mime_type: Optional[str] = None,
+) -> dict:
     """작은 영상: base64 inline으로 바로 전송."""
 
     def _call(client: genai.Client, model: str):
@@ -406,17 +498,24 @@ def _analyze_inline(pool: GeminiKeyPool, video_bytes: bytes, mime_type: str) -> 
             inline_data=types.Blob(data=video_bytes, mime_type=mime_type),
             video_metadata=types.VideoMetadata(fps=SCENE_ANALYSIS_FPS),
         )
+        parts = [video_part, *_thumbnail_parts(thumbnail_bytes, thumbnail_mime_type), types.Part(text=ANALYSIS_PROMPT)]
         return client.models.generate_content(
             model=model,
-            contents=types.Content(parts=[video_part, types.Part(text=ANALYSIS_PROMPT)]),
+            contents=types.Content(parts=parts),
             config=_build_config(),
         )
 
     response = _call_with_pool(pool, _call)
-    return json.loads(response.text)
+    return VideoAnalysis.model_validate_json(response.text).model_dump()
 
 
-def _analyze_via_files_api(pool: GeminiKeyPool, video_bytes: bytes, mime_type: str) -> dict:
+def _analyze_via_files_api(
+    pool: GeminiKeyPool,
+    video_bytes: bytes,
+    mime_type: str,
+    thumbnail_bytes: Optional[bytes] = None,
+    thumbnail_mime_type: Optional[str] = None,
+) -> dict:
     """큰 영상: Files API로 업로드 후 처리 완료를 기다렸다가 분석."""
     tmp_path = None
     try:
@@ -446,6 +545,7 @@ def _analyze_via_files_api(pool: GeminiKeyPool, video_bytes: bytes, mime_type: s
                             ),
                             video_metadata=types.VideoMetadata(fps=SCENE_ANALYSIS_FPS),
                         ),
+                        *_thumbnail_parts(thumbnail_bytes, thumbnail_mime_type),
                         types.Part(text=ANALYSIS_PROMPT),
                     ]),
                     config=_build_config(),
@@ -459,24 +559,242 @@ def _analyze_via_files_api(pool: GeminiKeyPool, video_bytes: bytes, mime_type: s
 
         response = _call_with_pool(pool, _call)
 
-        return json.loads(response.text)
+        return VideoAnalysis.model_validate_json(response.text).model_dump()
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
-def analyze_video(pool: GeminiKeyPool, video_bytes: bytes, mime_type: str = "video/mp4") -> dict:
+def analyze_video(
+    pool: GeminiKeyPool,
+    video_bytes: bytes,
+    mime_type: str = "video/mp4",
+    thumbnail_bytes: Optional[bytes] = None,
+    thumbnail_mime_type: Optional[str] = None,
+) -> dict:
     size_mb = len(video_bytes) / (1024 * 1024)
     print(f"  - 영상 용량 : {size_mb:.2f} MB")
 
     if size_mb > INLINE_SIZE_LIMIT_MB:
-        return _analyze_via_files_api(pool, video_bytes, mime_type)
-    return _analyze_inline(pool, video_bytes, mime_type)
+        return _analyze_via_files_api(pool, video_bytes, mime_type, thumbnail_bytes, thumbnail_mime_type)
+    return _analyze_inline(pool, video_bytes, mime_type, thumbnail_bytes, thumbnail_mime_type)
+
+
+def _group_prompt(count: int) -> str:
+    return f"""
+아래에는 VIDEO_1부터 VIDEO_{count}까지 서로 다른 Instagram Reel 영상이 있습니다.
+각 영상을 완전히 독립적으로 분석하고 다른 영상의 인물, 상품, 장면, 음성, 타임스탬프를 섞지 마세요.
+VIDEO_N_INSTAGRAM_COVER 이미지는 번호가 같은 VIDEO_N에만 속하며 다른 영상의 썸네일로 사용하지 마세요.
+analyses 배열에 입력 영상과 같은 순서로 정확히 {count}개를 반환하세요.
+각 항목의 input_index는 VIDEO_N의 N과 정확히 같아야 합니다.
+
+{ANALYSIS_PROMPT}
+"""
+
+
+def _group_parts(reels: list[dict], file_parts: Optional[list[types.Part]] = None) -> list[types.Part]:
+    parts = []
+    for index, reel in enumerate(reels, 1):
+        parts.append(types.Part(text=f"VIDEO_{index}_START"))
+        parts.append(
+            file_parts[index - 1] if file_parts else types.Part(
+                inline_data=types.Blob(data=reel["video_bytes"], mime_type=reel["mime_type"]),
+                video_metadata=types.VideoMetadata(fps=SCENE_ANALYSIS_FPS),
+            )
+        )
+        parts.append(types.Part(text=f"VIDEO_{index}_END"))
+        if reel.get("thumbnail_bytes"):
+            parts.append(types.Part(text=f"VIDEO_{index}_INSTAGRAM_COVER_START"))
+            parts.append(types.Part(inline_data=types.Blob(
+                data=reel["thumbnail_bytes"],
+                mime_type=reel.get("thumbnail_mime_type") or "image/jpeg",
+            )))
+            parts.append(types.Part(text=f"VIDEO_{index}_INSTAGRAM_COVER_END"))
+    parts.append(types.Part(text=_group_prompt(len(reels))))
+    return parts
+
+
+def _parse_grouped_response(response_text: str, count: int) -> list[dict]:
+    grouped = GroupedVideoAnalyses.model_validate_json(response_text)
+    by_index = {item.input_index: item.analysis for item in grouped.analyses}
+    expected = set(range(1, count + 1))
+    if len(grouped.analyses) != count or set(by_index) != expected:
+        raise ValueError(f"묶음 분석 결과 인덱스가 입력과 다릅니다: expected={sorted(expected)}, actual={sorted(by_index)}")
+    return [by_index[index].model_dump() for index in range(1, count + 1)]
+
+
+def _analyze_group_inline(pool: GeminiKeyPool, reels: list[dict]) -> list[dict]:
+    def _call(client: genai.Client, model: str):
+        return client.models.generate_content(
+            model=model,
+            contents=types.Content(parts=_group_parts(reels)),
+            config=_build_config(GroupedVideoAnalyses),
+        )
+
+    response = _call_with_pool(pool, _call)
+    return _parse_grouped_response(response.text, len(reels))
+
+
+def _analyze_group_via_files_api(pool: GeminiKeyPool, reels: list[dict]) -> list[dict]:
+    temp_paths = []
+    try:
+        for reel in reels:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                tmp.write(reel["video_bytes"])
+                temp_paths.append(tmp.name)
+
+        def _call(client: genai.Client, model: str):
+            uploaded_files = []
+            try:
+                for index, path in enumerate(temp_paths, 1):
+                    print(f"  - VIDEO_{index}을 Files API로 업로드합니다...")
+                    uploaded = client.files.upload(file=path)
+                    while uploaded.state.name == "PROCESSING":
+                        time.sleep(5)
+                        uploaded = client.files.get(name=uploaded.name)
+                    if uploaded.state.name != "ACTIVE":
+                        raise RuntimeError(f"VIDEO_{index}의 Files API 처리에 실패했습니다.")
+                    uploaded_files.append(uploaded)
+
+                file_parts = [
+                    types.Part(
+                        file_data=types.FileData(file_uri=item.uri, mime_type=item.mime_type),
+                        video_metadata=types.VideoMetadata(fps=SCENE_ANALYSIS_FPS),
+                    )
+                    for item in uploaded_files
+                ]
+                return client.models.generate_content(
+                    model=model,
+                    contents=types.Content(parts=_group_parts(reels, file_parts)),
+                    config=_build_config(GroupedVideoAnalyses),
+                )
+            finally:
+                for uploaded in uploaded_files:
+                    try:
+                        client.files.delete(name=uploaded.name)
+                    except Exception:
+                        print("  - 임시 업로드 파일 삭제에 실패했습니다.")
+
+        response = _call_with_pool(pool, _call)
+        return _parse_grouped_response(response.text, len(reels))
+    finally:
+        for path in temp_paths:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+def analyze_reels(pool: GeminiKeyPool, reels: list[dict]) -> list[dict]:
+    if not 1 <= len(reels) <= 2:
+        raise ValueError("한 번에 분석할 영상은 1개 또는 2개여야 합니다.")
+    if len(reels) == 1:
+        reel = reels[0]
+        return [analyze_video(
+            pool,
+            reel["video_bytes"],
+            reel["mime_type"],
+            reel.get("thumbnail_bytes"),
+            reel.get("thumbnail_mime_type"),
+        )]
+
+    total_mb = sum(len(reel["video_bytes"]) for reel in reels) / (1024 * 1024)
+    print(f"  - 묶음 영상 {len(reels)}개 / 합산 용량 {total_mb:.2f} MB / Gemini 호출 1회")
+    if total_mb > INLINE_SIZE_LIMIT_MB:
+        return _analyze_group_via_files_api(pool, reels)
+    return _analyze_group_inline(pool, reels)
 
 
 # ---------------------------------------------------------------------------
 # 3. 결과 저장
 # ---------------------------------------------------------------------------
+
+def _append_readable_output(shortcode: str, analyzed_at: str, result: dict):
+    from openpyxl import Workbook, load_workbook
+
+    path = Path(OUTPUT_FILE).with_suffix(".xlsx")
+    audience_headers = ("subject_genders", "scene_worn_outfits", "recommended_audience")
+    if path.exists():
+        workbook = load_workbook(path)
+        sheet = workbook.active
+    else:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Reel analyses"
+        sheet.append([
+            "reel_id", "analyzed_at", "summary", "hook", "hook_strength", "body_structure",
+            "content_type", "scene_count", "transcript", "background_music", "selling_points",
+            *audience_headers,
+        ])
+        sheet.freeze_panes = "A2"
+        widths = (18, 24, 50, 45, 14, 55, 22, 12, 60, 35, 60)
+        for column, width in enumerate(widths, 1):
+            sheet.column_dimensions[chr(64 + column)].width = width
+    for column, header in enumerate(audience_headers, 12):
+        sheet.cell(row=1, column=column, value=header)
+    for column, width in enumerate((32, 70, 55), 12):
+        sheet.column_dimensions[chr(64 + column)].width = width
+    sheet.auto_filter.ref = "A1:N1"
+
+    audio = result.get("audio_analysis") or {}
+    transcript = "\n".join(
+        f"[{item.get('start_second')}-{item.get('end_second')}] {item.get('speaker')}: {item.get('text')}"
+        for item in audio.get("transcript") or []
+    )
+    selling_points = "\n".join(
+        f"[{item.get('start_second')}-{item.get('end_second')}] {item.get('point')} "
+        f"(confidence={item.get('evidence_confidence')}): {item.get('evidence')}\n"
+        f"  음성: {item.get('spoken_evidence') or '없음'}\n"
+        f"  화면: {item.get('visual_evidence') or '없음'}\n"
+        f"  문구: {item.get('on_screen_text_evidence') or '없음'}"
+        for item in (result.get("marketing_analysis") or {}).get("selling_points") or []
+    )
+    hook = result.get("hook") or {}
+    presentation_labels = {"male": "남성형", "female": "여성형", "unknown": "확인 불가"}
+    age_labels = {
+        "10s": "10대", "20s": "20대", "30s": "30대", "20s_30s": "20~30대",
+        "40s_plus": "40대 이상", "all": "전 연령", "unknown": "연령 확인 불가",
+    }
+    audience_gender_labels = {"male": "남성", "female": "여성", "all": "모두", "unknown": "성별 확인 불가"}
+    subjects = (result.get("subjects") or {}).get("people") or []
+    scenes = result.get("scene_details") or []
+    subject_genders = "\n".join(
+        f"{person.get('subject_id')}: {presentation_labels.get(person.get('gender_presentation'), '확인 불가')}"
+        for person in subjects
+    )
+    scene_worn_outfits = "\n".join(
+        f"씬 {scene.get('scene_number')} - {outfit.get('subject_id')} "
+        f"({presentation_labels.get(outfit.get('gender_presentation'), '확인 불가')}): "
+        f"{', '.join(outfit.get('clothing_items') or [])}"
+        for scene in scenes for outfit in scene.get("worn_outfits") or []
+    )
+    recommended_audience = "\n".join(
+        f"{age_labels.get(item.get('age_group'), '연령 확인 불가')} "
+        f"{audience_gender_labels.get(item.get('gender'), '성별 확인 불가')}: {item.get('evidence')}"
+        for item in result.get("recommended_audience") or []
+    )
+    sheet.append([
+        shortcode or "reel",
+        analyzed_at,
+        result.get("summary"),
+        hook.get("description"),
+        hook.get("strength"),
+        result.get("body_structure"),
+        result.get("content_type"),
+        len(scenes),
+        transcript,
+        json.dumps(audio.get("background_music") or {}, ensure_ascii=False),
+        selling_points,
+        subject_genders,
+        scene_worn_outfits,
+        recommended_audience,
+    ])
+    temporary = path.with_name(path.stem + ".tmp.xlsx")
+    try:
+        workbook.save(temporary)
+        os.replace(temporary, path)
+    finally:
+        workbook.close()
+        temporary.unlink(missing_ok=True)
+
 
 def save_result(shortcode: str, result: dict) -> str:
     with OUTPUT_LOCK:
@@ -488,15 +806,21 @@ def save_result(shortcode: str, result: dict) -> str:
             if not isinstance(records, list):
                 raise ValueError(f"누적 결과 파일은 JSON 배열이어야 합니다: {OUTPUT_FILE}")
 
+        analyzed_at = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d, %H:%M:%S")
         records.append({
             "reel_id": shortcode or "reel",
-            "analyzed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "analyzed_at": analyzed_at,
             "analysis": result,
         })
         temp_path = OUTPUT_FILE + ".tmp"
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
         os.replace(temp_path, OUTPUT_FILE)
+        if WRITE_READABLE_OUTPUT:
+            try:
+                _append_readable_output(shortcode, analyzed_at, result)
+            except Exception as e:
+                print(f"  - XLSX 요약 저장 실패: {e}")
     return OUTPUT_FILE
 
 
@@ -537,7 +861,13 @@ def process_one(pool: GeminiKeyPool, reel_url: str):
     reel = get_instagram_video(reel_url)
 
     print("2) Gemini 분석 중...")
-    result = analyze_video(pool, reel["video_bytes"], reel["mime_type"])
+    result = analyze_video(
+        pool,
+        reel["video_bytes"],
+        reel["mime_type"],
+        reel.get("thumbnail_bytes"),
+        reel.get("thumbnail_mime_type"),
+    )
 
     print("3) 결과 저장 중...")
     filepath = save_result(reel["id"], result)
@@ -547,8 +877,10 @@ def process_one(pool: GeminiKeyPool, reel_url: str):
 
 
 def process_safely(pool: GeminiKeyPool, reel_url: str) -> bool:
-    if not is_instagram_reel_url(reel_url):
-        print(f"[경고] Instagram Reel URL이 아닙니다: {reel_url}\n")
+    original = reel_url
+    reel_url = normalize_reel_url(reel_url)
+    if not reel_url:
+        print(f"[경고] Instagram Reel URL 또는 shortcode가 아닙니다: {original}\n")
         return False
     try:
         process_one(pool, reel_url)
@@ -565,19 +897,75 @@ def process_safely(pool: GeminiKeyPool, reel_url: str) -> bool:
     return False
 
 
-def run_interactive(status_pool: GeminiKeyPool, worker_pools: list[GeminiKeyPool]):
+def process_group_safely(pool: GeminiKeyPool, reel_urls: list[str]) -> int:
+    if len(reel_urls) == 1:
+        return int(process_safely(pool, reel_urls[0]))
+
+    reels = []
+    for index, reel_url in enumerate(reel_urls, 1):
+        original = reel_url
+        reel_url = normalize_reel_url(reel_url)
+        if not reel_url:
+            print(f"[경고] Instagram Reel URL 또는 shortcode가 아닙니다: {original}\n")
+            continue
+        try:
+            print(f"\n[묶음 다운로드 {index}/{len(reel_urls)}] {reel_url}")
+            reels.append(get_instagram_video(reel_url))
+        except yt_dlp.utils.DownloadError as e:
+            print(f"[오류] 영상을 가져오지 못했습니다: {e}\n")
+        except requests.exceptions.RequestException as e:
+            print(f"[오류] 영상 다운로드 중 네트워크 오류: {e}\n")
+        except Exception as e:
+            print(f"[오류] 영상 준비 중 예상치 못한 문제가 발생했습니다: {e}\n")
+
+    if not reels:
+        return 0
+
+    try:
+        print(f"\n[묶음 분석] 영상 {len(reels)}개를 Gemini 호출 1회로 처리합니다.")
+        results = analyze_reels(pool, reels)
+    except KeyPoolExhaustedError as e:
+        print(f"[오류] {e}\n")
+        return 0
+    except Exception as e:
+        print(f"[오류] 묶음 분석 중 예상치 못한 문제가 발생했습니다: {e}\n")
+        return 0
+
+    succeeded = 0
+    for reel, result in zip(reels, results):
+        try:
+            filepath = save_result(reel["id"], result)
+            print(f"  - {reel['id']} 저장 완료: {filepath}")
+            print_summary(result)
+            succeeded += 1
+        except Exception as e:
+            print(f"[오류] {reel['id']} 결과 저장 실패: {e}\n")
+    return succeeded
+
+
+def run_interactive(
+    status_pool: GeminiKeyPool,
+    worker_pools: list[GeminiKeyPool],
+    group_size: int = 1,
+):
     """URL 입력은 계속 받고, 각 워커가 자신의 키 풀 예약으로 분석한다."""
     work_queue = Queue()
+    pending_urls = []
 
     def consume(worker_pool):
         while True:
-            reel_url = work_queue.get()
+            reel_urls = work_queue.get()
             try:
-                if reel_url is None:
+                if reel_urls is None:
                     return
-                process_safely(worker_pool, reel_url)
+                process_group_safely(worker_pool, list(reel_urls))
             finally:
                 work_queue.task_done()
+
+    def enqueue_pending():
+        if pending_urls:
+            work_queue.put(tuple(pending_urls))
+            pending_urls.clear()
 
     workers = [
         threading.Thread(target=consume, args=(worker_pool,), name=f"gemini-worker-{i + 1}")
@@ -586,8 +974,8 @@ def run_interactive(status_pool: GeminiKeyPool, worker_pools: list[GeminiKeyPool
     for worker in workers:
         worker.start()
 
-    print("Reel URL을 연속으로 입력할 수 있습니다. 입력한 순서대로 대기열에 추가됩니다.")
-    print("'status' 입력 시 현재 사용량 확인. 종료하려면 'quit' 또는 'exit' 입력.\n")
+    print(f"Reel URL을 연속으로 입력할 수 있습니다. {group_size}개씩 한 번의 Gemini 호출로 처리합니다.")
+    print("'flush' 입력 시 모인 URL 즉시 처리, 'status' 입력 시 사용량 확인, 종료는 'quit' 또는 'exit'.\n")
     try:
         while True:
             try:
@@ -601,18 +989,27 @@ def run_interactive(status_pool: GeminiKeyPool, worker_pools: list[GeminiKeyPool
             if reel_url.lower() in ("quit", "exit", "q"):
                 print("입력된 분석을 마친 뒤 종료합니다.")
                 break
+            if reel_url.lower() == "flush":
+                enqueue_pending()
+                continue
             if reel_url.lower() == "status":
                 try:
                     print(status_pool.status())
                 except RuntimeError as e:
                     print(f"[시트 오류] {e}\n")
                 continue
-            if not is_instagram_reel_url(reel_url):
-                print(f"[경고] Instagram Reel URL이 아닙니다: {reel_url}\n")
+            normalized_url = normalize_reel_url(reel_url)
+            if not normalized_url:
+                print(f"[경고] Instagram Reel URL 또는 shortcode가 아닙니다: {reel_url}\n")
                 continue
-            work_queue.put(reel_url)
-            print(f"  - 대기열 추가 완료 (대기 {work_queue.qsize()}건)")
+            pending_urls.append(normalized_url)
+            if len(pending_urls) == group_size:
+                enqueue_pending()
+                print(f"  - {group_size}개 묶음 대기열 추가 완료 (대기 묶음 {work_queue.qsize()}개)")
+            else:
+                print(f"  - 묶음 대기 중 ({len(pending_urls)}/{group_size})")
     finally:
+        enqueue_pending()
         for _ in workers:
             work_queue.put(None)
         work_queue.join()
@@ -624,6 +1021,8 @@ def main(argv=None):
     options = parse_args(argv)
     if options.model:
         os.environ["GEMINI_MODELS"] = options.model
+    if options.seed is not None:
+        os.environ["GEMINI_SEED"] = str(options.seed)
     try:
         pool = create_pool()
     except RuntimeError as e:
@@ -655,6 +1054,9 @@ def main(argv=None):
     print(f"등록된 키 {len(pool.keys)}개 x 모델 {len(pool.models)}개 = 총 {len(pool.combos)}개 조합 사용 가능")
     if options.model:
         print(f"선택 모델: {options.model}")
+    if os.getenv("GEMINI_SEED", "").strip():
+        print(f"고정 seed: {os.environ['GEMINI_SEED']}")
+    print(f"Gemini 호출당 영상 수: {options.group_size}")
 
     if options.url:
         process_safely(pool, options.url)
@@ -670,9 +1072,10 @@ def main(argv=None):
             print("[XLSX 오류] url 또는 reel_url 열에서 Instagram Reel URL을 찾지 못했습니다.")
             return
         succeeded = 0
-        for index, reel_url in enumerate(urls, 1):
-            print(f"\n[XLSX {index}/{len(urls)}]")
-            succeeded += process_safely(pool, reel_url)
+        for start in range(0, len(urls), options.group_size):
+            group = urls[start:start + options.group_size]
+            print(f"\n[XLSX {start + 1}-{start + len(group)}/{len(urls)}]")
+            succeeded += process_group_safely(pool, group)
         print(f"\n[XLSX 완료] 성공 {succeeded}건 / 실패 {len(urls) - succeeded}건 / 전체 {len(urls)}건")
         return
 
@@ -683,7 +1086,7 @@ def main(argv=None):
     except RuntimeError as e:
         print(f"[설정 오류] {e}")
         return
-    run_interactive(pool, worker_pools)
+    run_interactive(pool, worker_pools, options.group_size)
 
 
 if __name__ == "__main__":
