@@ -1059,8 +1059,7 @@ def main(argv=None):
     print(f"Gemini 호출당 영상 수: {options.group_size}")
 
     if options.url:
-        process_safely(pool, options.url)
-        return
+        return 0 if process_safely(pool, options.url) else 1
 
     if options.xlsx:
         try:
@@ -1090,4 +1089,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

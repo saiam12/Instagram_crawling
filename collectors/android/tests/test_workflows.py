@@ -171,7 +171,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.store.rows[-1]["source_mode"], "refresh")
         self.assertEqual(self.store.rows[-1]["biography"], "saved bio")
         self.assertEqual(self.store.rows[-1]["follower_count"], 1_169)
-        self.assertEqual(self.store.rows[-1]["like_count"], 4_699)
+        self.assertEqual(self.store.rows[-1]["like_count"], 4_000)
 
     def test_run_refresh_rejects_a_history_without_reel_urls(self) -> None:
         self.store.append(
@@ -293,7 +293,7 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertTrue({"MEDIA_START", "MEDIA_RENDER_OK", "STAGE_START", "STAGE_SUCCESS", "STATS", "COLLECTOR_FINISH"} <= names)
         self.assertTrue(any(event.get("stage") == "SAVE_RESULT" for event in events))
-        self.assertTrue(any(event.get("stage") == "READ_REPOST_COUNT" for event in events))
+        self.assertTrue(any(event.get("stage") == "READ_SAVED_COUNT" for event in events))
         self.assertTrue(any(event.get("stage") == "READ_SHARE_COUNT" for event in events))
         self.assertEqual(result["media_index"], 1)
         self.assertEqual(result["result"], "SUCCESS")
@@ -319,55 +319,22 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(AccessBlockedError, "login_required"):
             preflight(FakeDriver(['<hierarchy><node text="Log in to continue"/></hierarchy>']))
 
-    def test_capture_merges_exact_likes_and_views_from_the_detail_panel(self) -> None:
-        panel_xml = """
-        <hierarchy>
-          <node text="Likes and plays" resource-id="com.instagram.android:id/title_text_view" />
-          <node text="15,691" resource-id="com.instagram.android:id/like_count_text" content-desc="15691 likes" />
-          <node text="624,267" resource-id="com.instagram.android:id/video_view_count_text" content-desc="624267 views" />
-        </hierarchy>
-        """
-        driver = FakeDriver([REEL_XML, panel_xml], metric_panel_available=True)
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertEqual(observed.metrics["like_count"].value, 15_691)
-        self.assertEqual(observed.metrics["view_count"].value, 624_267)
-        self.assertFalse(observed.like_count_is_private)
-        self.assertEqual(driver.back_count, 1)
-        self.assertNotEqual(observed.detail_evidence_paths.xml_path, observed.evidence_paths.xml_path)
-        self.assertTrue(Path(observed.detail_evidence_paths.xml_path).exists())
-        self.assertTrue(Path(observed.detail_evidence_paths.png_path).exists())
-
-    def test_capture_reads_metrics_before_opening_the_author_profile(self) -> None:
-        panel_xml = """
-        <hierarchy>
-          <node text="Likes and plays" resource-id="com.instagram.android:id/title_text_view" />
-          <node text="15,691" resource-id="com.instagram.android:id/like_count_text" content-desc="15691 likes" />
-          <node text="624,267" resource-id="com.instagram.android:id/video_view_count_text" content-desc="624267 views" />
-        </hierarchy>
-        """
-        profile_xml = """
-        <hierarchy>
-          <node text="odi.pigi" resource-id="com.instagram.android:id/action_bar_title" />
-          <node text="7" resource-id="com.instagram.android:id/profile_header_familiar_post_count_value" />
-        </hierarchy>
-        """
-        # This sequence is only valid when the Likes and plays panel is opened
-        # before the profile.  It prevents a profile round trip from making
-        # the exact view-count control disappear.
-        driver = FakeDriver(
-            [REEL_XML, panel_xml, REEL_XML, profile_xml, REEL_XML],
-            metric_panel_available=True,
-            profile_available=True,
+    def test_capture_reads_only_share_and_saved_without_detail_or_profile_taps(self) -> None:
+        reel_xml = REEL_XML.replace(
+            "</hierarchy>",
+            '<node text="4" resource-id="com.instagram.android:id/save_count" /></hierarchy>',
         )
+        driver = FakeDriver([reel_xml], metric_panel_available=True, profile_available=True,
+                            caption_detail_available=True, comment_panel_available=True)
 
         observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
 
-        self.assertEqual(observed.metrics["like_count"].value, 15_691)
-        self.assertEqual(observed.metrics["view_count"].value, 624_267)
-        self.assertEqual(observed.profile.post_count, 7)
-        self.assertEqual(driver.back_count, 2)
+        self.assertEqual(set(observed.metrics), {"share_count", "save_count"})
+        self.assertEqual(observed.metrics["save_count"].value, 4)
+        self.assertFalse(any("Like number is" in labels for labels in driver.tapped_label_sets))
+        self.assertFalse(any("comment_button" in markers or "clips_author_username" in markers
+                             for markers in driver.tapped_resource_sets))
+        self.assertEqual(driver.back_count, 0)
 
     def test_capture_uses_visible_share_copy_link_to_store_a_reel_url(self) -> None:
         share_sheet_xml = '<hierarchy><node text="Copy link" resource-id="com.instagram.android:id/copy_link_button" /></hierarchy>'
@@ -395,226 +362,6 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(observed.reel_url, "")
         self.assertEqual(observed.username, "odi.pigi")
         self.assertEqual(driver.back_count, 1)
-
-    def test_capture_reads_the_caption_sheet_upload_date_then_returns_to_reel(self) -> None:
-        caption_sheet_xml = '<hierarchy><node text="April 28" /></hierarchy>'
-        driver = FakeDriver(
-            [REEL_XML, caption_sheet_xml, REEL_XML],
-            caption_detail_available=True,
-        )
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertEqual(observed.uploaded_at, "2026-04-28")
-        self.assertIn(("clips_caption_component", "caption_component"), driver.tapped_resource_sets)
-        self.assertEqual(driver.back_count, 1)
-
-    def test_capture_opens_comment_sheet_to_store_an_empty_thread_as_zero(self) -> None:
-        reel_without_comment_count = re.sub(
-            r'<node(?=[^>]*comment_count)[^>]*/>',
-            '',
-            REEL_XML,
-        )
-        comments_xml = '<hierarchy><node text="No comments yet" /><node text="Start the conversation." /></hierarchy>'
-        driver = FakeDriver(
-            [reel_without_comment_count, comments_xml, reel_without_comment_count],
-            comment_panel_available=True,
-        )
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertEqual(observed.metrics["comment_count"].value, 0)
-        self.assertIn(("comment_button", "comment_count", "comments_count"), driver.tapped_resource_sets)
-        self.assertEqual(driver.back_count, 1)
-
-    def test_capture_marks_a_disabled_comment_thread_as_unavailable(self) -> None:
-        reel_without_comment_count = re.sub(
-            r'<node(?=[^>]*comment_count)[^>]*/>',
-            '',
-            REEL_XML,
-        )
-        comments_xml = '<hierarchy><node text="Comments are turned off." /></hierarchy>'
-        driver = FakeDriver(
-            [reel_without_comment_count, comments_xml, reel_without_comment_count],
-            comment_panel_available=True,
-        )
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertNotIn("comment_count", observed.metrics)
-        self.assertEqual(observed.visible_metrics["comment_count"], "comments_disabled")
-        self.assertEqual(
-            _metric_field_progress_value(observed, "comment_count"),
-            "comment_count=unavailable(disabled)",
-        )
-
-    def test_likes_panel_return_recovers_a_reel_when_hashtag_navigation_lands_on_grid(self) -> None:
-        panel_xml = """
-        <hierarchy>
-          <node text="Likes and plays" resource-id="com.instagram.android:id/title_text_view" />
-          <node text="624,267" resource-id="com.instagram.android:id/video_view_count_text" content-desc="624267 views" />
-        </hierarchy>
-        """
-        hashtag_grid_xml = """
-        <hierarchy>
-          <node resource-id="com.instagram.android:id/grid_card_layout_container" content-desc="Reel by creator at row 0, column 0" />
-        </hierarchy>
-        """
-        driver = FakeDriver(
-            [REEL_XML, panel_xml, hashtag_grid_xml, REEL_XML],
-            metric_panel_available=True,
-            hashtag_grid_available=True,
-        )
-
-        observed = capture_current_reel(
-            CollectorOptions(delay_seconds=0, source_mode="hashtag", source_query="패션"),
-            driver,
-            self.store,
-        )
-
-        self.assertEqual(observed.metrics["view_count"].value, 624_267)
-        self.assertIn(("grid_card_layout_container",), driver.tapped_resource_sets)
-        self.assertEqual(driver.back_count, 1)
-
-    def test_capture_reads_public_profile_fields_then_returns_to_reel(self) -> None:
-        profile_xml = """
-        <hierarchy>
-          <node text="odi.pigi" resource-id="com.instagram.android:id/action_bar_title" />
-          <node text="소개 문구" resource-id="com.instagram.android:id/profile_header_bio_text" />
-          <node text="Artist" resource-id="com.instagram.android:id/profile_header_category_text" />
-          <node text="7" resource-id="com.instagram.android:id/profile_header_familiar_post_count_value" />
-          <node text="321" resource-id="com.instagram.android:id/profile_header_familiar_following_value" />
-          <node text="1,169" resource-id="com.instagram.android:id/profile_header_familiar_followers_value" />
-        </hierarchy>
-        """
-        driver = FakeDriver([REEL_XML, profile_xml, REEL_XML], profile_available=True)
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertEqual(observed.profile.username, "odi.pigi")
-        self.assertEqual(observed.profile.biography, "소개 문구")
-        self.assertEqual(observed.profile.profile_category, "Artist")
-        self.assertEqual(observed.profile.post_count, 7)
-        self.assertEqual(observed.profile.following_count, 321)
-        self.assertEqual(observed.profile.follower_count, 1_169)
-        self.assertEqual(driver.back_count, 1)
-
-    def test_capture_reuses_a_same_run_profile_without_opening_the_profile_again(self) -> None:
-        cached_profile = ObservedProfile(
-            biography="cached bio",
-            profile_category="Clothing (Brand)",
-            account_country="South Korea",
-            post_count=101,
-            following_count=29,
-            follower_count=1_242,
-        )
-        driver = FakeDriver([REEL_XML])
-
-        observed = capture_current_reel(
-            CollectorOptions(delay_seconds=0, capture_screenshots=False),
-            driver,
-            self.store,
-            profile_cache={"odi.pigi": cached_profile},
-        )
-
-        self.assertEqual(observed.profile.biography, "cached bio")
-        self.assertEqual(observed.profile.follower_count, 1_242)
-        self.assertNotIn(("clips_author_username", "author_username"), driver.tapped_resource_sets)
-        self.assertEqual(observed.evidence_paths.png_path, "")
-
-    def test_profile_return_recovers_a_reel_when_hashtag_navigation_lands_on_grid(self) -> None:
-        profile_xml = """
-        <hierarchy>
-          <node text="odi.pigi" resource-id="com.instagram.android:id/action_bar_title" />
-          <node text="7" resource-id="com.instagram.android:id/profile_header_familiar_post_count_value" />
-        </hierarchy>
-        """
-        hashtag_grid_xml = """
-        <hierarchy>
-          <node resource-id="com.instagram.android:id/grid_card_layout_container" content-desc="Reel by creator at row 0, column 0" />
-        </hierarchy>
-        """
-        driver = FakeDriver(
-            [REEL_XML, profile_xml, hashtag_grid_xml, REEL_XML],
-            profile_available=True,
-            hashtag_grid_available=True,
-        )
-
-        observed = capture_current_reel(
-            CollectorOptions(delay_seconds=0, source_mode="hashtag", source_query="패션"),
-            driver,
-            self.store,
-        )
-
-        self.assertEqual(observed.profile.post_count, 7)
-        self.assertIn(("grid_card_layout_container",), driver.tapped_resource_sets)
-        self.assertEqual(driver.back_count, 1)
-
-    def test_capture_reads_account_country_through_the_profile_about_menu(self) -> None:
-        profile_xml = """
-        <hierarchy>
-          <node text="odi.pigi" resource-id="com.instagram.android:id/action_bar_title" />
-          <node text="7" resource-id="com.instagram.android:id/profile_header_familiar_post_count_value" />
-        </hierarchy>
-        """
-        menu_xml = '<hierarchy><node text="About this account" /></hierarchy>'
-        about_xml = """
-        <hierarchy>
-          <node text="Account based in" />
-          <node text="Argentina" />
-        </hierarchy>
-        """
-        driver = FakeDriver(
-            [REEL_XML, profile_xml, menu_xml, about_xml, REEL_XML],
-            profile_available=True,
-            account_country_available=True,
-        )
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertEqual(observed.profile.account_country, "Argentina")
-        # Current Android returns from About this account directly to the
-        # profile.  The only remaining Back is profile -> Reel.
-        self.assertEqual(driver.back_count, 2)
-
-    def test_country_flow_dismisses_an_options_menu_only_when_it_remains(self) -> None:
-        profile_xml = """
-        <hierarchy>
-          <node text="odi.pigi" resource-id="com.instagram.android:id/action_bar_title" />
-          <node text="7" resource-id="com.instagram.android:id/profile_header_familiar_post_count_value" />
-        </hierarchy>
-        """
-        menu_xml = '<hierarchy><node text="About this account" /></hierarchy>'
-        about_xml = """
-        <hierarchy>
-          <node text="Account based in" />
-          <node text="Argentina" />
-        </hierarchy>
-        """
-        # Some app versions return About -> options menu.  In that variant the
-        # helper has to close the menu before the profile helper returns to
-        # the Reel, so three Back operations are correct.
-        driver = FakeDriver(
-            [REEL_XML, profile_xml, menu_xml, about_xml, menu_xml, REEL_XML],
-            profile_available=True,
-            account_country_available=True,
-        )
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertEqual(observed.profile.account_country, "Argentina")
-        self.assertEqual(driver.back_count, 3)
-
-    def test_capture_returns_to_reel_when_metric_sheet_is_still_loading(self) -> None:
-        loading_sheet = '<hierarchy><node text="Likes and plays" /></hierarchy>'
-        driver = FakeDriver([REEL_XML, loading_sheet], metric_panel_available=True)
-
-        observed = capture_current_reel(CollectorOptions(delay_seconds=0), driver, self.store)
-
-        self.assertEqual(observed.username, "odi.pigi")
-        self.assertEqual(driver.back_count, 1)
-        self.assertEqual(observed.metrics["like_count"].value, 4_699)
-        self.assertNotIn("view_count", observed.metrics)
 
     def test_run_feed_does_not_save_a_loading_screen_without_an_author(self) -> None:
         empty = '<hierarchy><node text="Likes and plays" /></hierarchy>'

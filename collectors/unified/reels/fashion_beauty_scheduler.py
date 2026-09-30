@@ -54,8 +54,11 @@ class DatasetConfig:
 @dataclass(frozen=True)
 class RunConfig:
     data_root: Path
+    resume_started_at: datetime | None = None
     duration_hours: float = 16
+    target_snapshots: int = 4
     discovery_hours: float = 4
+    recollection_interval_minutes: float = 240
     discovery_interval_minutes: float = 30
     new_items_per_window: int = 300
     max_new_items_per_window: int = 300
@@ -150,18 +153,28 @@ def _rows_grouped_by_normalized_url(rows: Sequence[dict[str, Any]]) -> dict[str,
     return grouped
 
 
-def due_jobs(dataset: DatasetConfig, rows: list[dict[str, Any]], now: datetime) -> list[DueJob]:
+def due_jobs(
+    dataset: DatasetConfig,
+    rows: list[dict[str, Any]],
+    now: datetime,
+    interval: timedelta = RECOLLECTION_INTERVAL,
+    first_collected_at: datetime | None = None,
+    target_snapshots: int = len(SNAPSHOT_OFFSETS),
+) -> list[DueJob]:
     current = _parse_timestamp(now)
     if current is None:
         return []
     result: list[DueJob] = []
     for url, snapshots in _rows_grouped_by_normalized_url(rows).items():
         snapshots.sort(key=lambda snapshot: snapshot[1])
-        # Keep four snapshots in total: the initial collection followed by
-        # recollections at +4h, +8h, and +12h.
-        if len(snapshots) >= len(SNAPSHOT_OFFSETS):
+        if first_collected_at is not None and (
+            snapshots[0][1] < first_collected_at
+            or str(snapshots[0][0].get("collection_number", "")).strip() not in {"", "1"}
+        ):
             continue
-        due_at = snapshots[0][1] + RECOLLECTION_INTERVAL * len(snapshots)
+        if len(snapshots) >= target_snapshots:
+            continue
+        due_at = snapshots[0][1] + interval * len(snapshots)
         if due_at <= current:
             result.append(DueJob(dataset.name, url, due_at))
     return sorted(result, key=lambda job: (job.due_at, job.dataset, job.url))

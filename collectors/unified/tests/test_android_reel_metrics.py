@@ -12,6 +12,7 @@ from reels.android_reel_metrics import (
     AndroidMetricResult,
     AndroidMetricsError,
     AndroidReelMetricsEnricher,
+    extract_recollection_metrics,
     extract_related_hashtag_post_counts,
     merge_android_metrics,
     parse_hashtag_post_count,
@@ -86,6 +87,24 @@ class FakeDriver:
 
 
 class AndroidReelMetricTests(unittest.TestCase):
+    def test_recollection_prefers_exact_content_desc_and_marks_compact_only_fields(self) -> None:
+        xml = """<hierarchy>
+          <node text="1.2K" content-desc="Like number is 1,234. View likes" resource-id="like_count_text" />
+          <node text="3.4K" resource-id="comment_count_text" />
+          <node text="9" content-desc="9 reposts" resource-id="repost_count_text" />
+          <node text="5.6K" resource-id="share_count_text" />
+          <node text="7.8K" resource-id="save_count_text" />
+          <node text="99K" content-desc="99,001 views" resource-id="video_view_count_text" />
+        </hierarchy>"""
+
+        metrics, compact = extract_recollection_metrics(xml)
+
+        self.assertEqual(metrics, {
+            "like_count": 1234, "comment_count": 3400, "repost_count": 9,
+            "share_count": 5600, "saved_count": 7800,
+        })
+        self.assertEqual(compact, ("comment_count", "saved_count", "share_count"))
+
     @patch.dict("os.environ", {"INSTAGRAM_ANDROID_DEVICE_ID": "emulator-5560"})
     def test_adb_driver_uses_device_selected_by_launcher(self) -> None:
         driver = AdbAndroidUiDriver(Path("adb.exe"))
@@ -271,73 +290,77 @@ class AndroidReelMetricTests(unittest.TestCase):
             with self.assertRaisesRegex(AndroidMetricsError, "search input mismatch"):
                 driver.open_instagram_search("#패션")
 
-    def test_reel_detail_overrides_compact_counts_and_keeps_app_only_metrics(self) -> None:
+    def test_reel_link_reads_four_visible_counts_without_opening_metric_sheets(self) -> None:
         driver = FakeDriver([REEL_XML, LIKES_PANEL_XML])
         enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
 
         result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
 
         self.assertEqual(driver.opened_urls, ["https://www.instagram.com/reel/CODE123/"])
-        self.assertEqual(result.metrics["like_count"], 15_691)
-        self.assertEqual(result.metrics["view_count"], 624_267)
-        self.assertEqual(result.metrics["comment_count"], 32)
-        self.assertEqual(result.metrics["share_count"], 11_300)
-        self.assertEqual(result.metrics["repost_count"], 138)
-        self.assertEqual(result.metrics["saved_count"], 4)
-        self.assertEqual(result.audio_name, "Artist · Track name")
-        self.assertEqual(driver.back_count, 1)
+        self.assertEqual(result.metrics, {"like_count": 4_699, "share_count": 11_300, "repost_count": 138, "saved_count": 4})
+        self.assertEqual(driver.tapped_bounds, [])
+        self.assertEqual(driver.back_count, 0)
 
-    def test_likes_panel_with_plays_but_no_like_icon_is_marked_unavailable(self) -> None:
-        driver = FakeDriver([REEL_XML, LIKES_PANEL_WITH_ZERO_LIKES_XML])
-        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+    def test_recollection_reads_comment_content_desc_and_flags_compact_values(self) -> None:
+        xml = """<hierarchy>
+          <node text="creator" resource-id="com.instagram.android:id/clips_author_username" />
+          <node text="1.2K" content-desc="1,234 likes" resource-id="like_count_text" />
+          <node text="56" content-desc="56 comments" resource-id="comment_count_text" />
+          <node text="2.3K" resource-id="repost_count_text" />
+          <node text="4.5K" resource-id="share_count_text" />
+          <node text="6" content-desc="6 saves" resource-id="save_count_text" />
+        </hierarchy>"""
+        enricher = AndroidReelMetricsEnricher(driver=FakeDriver([xml]), ui_delay_seconds=0.1)
 
-        result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
+        result = enricher.enrich("https://www.instagram.com/reel/CODE123/", recollection=True)
 
-        self.assertEqual(result.metrics["view_count"], 482)
-        self.assertNotIn("like_count", result.metrics)
-        self.assertTrue(result.like_count_private)
-        self.assertEqual(merge_android_metrics({}, result)["like_count"], "X")
-        self.assertEqual(driver.back_count, 1)
+        self.assertTrue(result.recollection)
+        self.assertEqual(result.metrics, {
+            "like_count": 1234, "comment_count": 56, "repost_count": 2300,
+            "share_count": 4500, "saved_count": 6,
+        })
+        self.assertEqual(result.compact_fields, ("repost_count", "share_count"))
 
-    def test_likes_panel_with_empty_like_icon_is_saved_as_zero(self) -> None:
-        driver = FakeDriver([REEL_XML, LIKES_PANEL_WITH_EMPTY_LIKE_CONTROL_XML])
-        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
-
-        result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
-
-        self.assertEqual(result.metrics["view_count"], 482)
-        self.assertEqual(result.metrics["like_count"], 0)
-        self.assertFalse(result.like_count_private)
-        self.assertEqual(driver.back_count, 1)
-
-    def test_empty_comment_sheet_is_saved_as_zero(self) -> None:
-        reel_without_comment = REEL_XML.replace(
-            '<node text="32" resource-id="com.instagram.android:id/comment_count" bounds="[0,300][100,400]" />',
-            '<node content-desc="View comments" bounds="[0,300][100,400]" />',
+    def test_visible_share_and_save_icons_without_counts_are_zero(self) -> None:
+        reel_xml = """<hierarchy>
+          <node text="creator" resource-id="com.instagram.android:id/clips_author_username" />
+          <node text="33" resource-id="com.instagram.android:id/comment_count" />
+          <node content-desc="Share" resource-id="com.instagram.android:id/share_button" />
+          <node content-desc="Save" resource-id="com.instagram.android:id/save_button" />
+        </hierarchy>"""
+        result = AndroidReelMetricsEnricher(driver=FakeDriver([reel_xml]), ui_delay_seconds=0.1).enrich(
+            "https://www.instagram.com/reel/CODE123/"
         )
-        comment_xml = "<hierarchy><node text=\"No comments yet\" /></hierarchy>"
-        driver = FakeDriver([reel_without_comment, LIKES_PANEL_XML, comment_xml])
-        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+        self.assertEqual(result.metrics, {"share_count": 0, "saved_count": 0})
 
-        result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
-
-        self.assertEqual(result.metrics["comment_count"], 0)
-        self.assertEqual(driver.back_count, 2)
-
-    def test_disabled_comment_sheet_is_marked_unavailable(self) -> None:
-        reel_without_comment = REEL_XML.replace(
-            '<node text="32" resource-id="com.instagram.android:id/comment_count" bounds="[0,300][100,400]" />',
-            '<node content-desc="View comments" bounds="[0,300][100,400]" />',
+    def test_numbered_share_and_save_keep_values_with_blank_repost_icon(self) -> None:
+        reel_xml = """<hierarchy>
+          <node text="creator" resource-id="com.instagram.android:id/clips_author_username" />
+          <node content-desc="Repost" resource-id="com.instagram.android:id/repost_button" />
+          <node text="19" resource-id="com.instagram.android:id/share_count" />
+          <node content-desc="Share" resource-id="com.instagram.android:id/share_button" />
+          <node text="4" resource-id="com.instagram.android:id/save_count" />
+          <node content-desc="Save" resource-id="com.instagram.android:id/save_button" />
+        </hierarchy>"""
+        result = AndroidReelMetricsEnricher(driver=FakeDriver([reel_xml]), ui_delay_seconds=0.1).enrich(
+            "https://www.instagram.com/reel/CODE123/"
         )
-        comment_xml = '<hierarchy><node text="Comments are turned off" /></hierarchy>'
-        driver = FakeDriver([reel_without_comment, LIKES_PANEL_XML, comment_xml])
-        enricher = AndroidReelMetricsEnricher(driver=driver, ui_delay_seconds=0.1)
+        self.assertEqual(result.metrics, {"repost_count": 0, "share_count": 19, "saved_count": 4})
+        merged = merge_android_metrics({"view_count": "", "repost_count": "", "share_count": "", "saved_count": ""}, result)
+        self.assertEqual(
+            {field: merged[field] for field in ("repost_count", "share_count", "saved_count")},
+            {"repost_count": 0, "share_count": 19, "saved_count": 4},
+        )
 
-        result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
-
-        self.assertTrue(result.comment_count_disabled)
-        self.assertNotIn("comment_count", result.metrics)
-        self.assertEqual(driver.back_count, 2)
+        numbered_repost_xml = reel_xml.replace(
+            '<node content-desc="Repost" resource-id="com.instagram.android:id/repost_button" />',
+            '<node text="5" resource-id="com.instagram.android:id/repost_count" />'
+            '<node content-desc="Repost" resource-id="com.instagram.android:id/repost_button" />',
+        )
+        numbered = AndroidReelMetricsEnricher(driver=FakeDriver([numbered_repost_xml]), ui_delay_seconds=0.1).enrich(
+            "https://www.instagram.com/reel/CODE123/"
+        )
+        self.assertEqual(numbered.metrics["repost_count"], 5)
 
     def test_metricless_reel_surface_is_reported_as_android_unavailable(self) -> None:
         metricless_reel = "<hierarchy><node text=\"creator\" resource-id=\"com.instagram.android:id/clips_author_username\" /></hierarchy>"
@@ -351,7 +374,7 @@ class AndroidReelMetricTests(unittest.TestCase):
             result = enricher.enrich("https://www.instagram.com/reel/CODE123/")
 
         self.assertEqual(result.status, "unavailable")
-        self.assertIn("no readable metric", result.error)
+        self.assertIn("no readable count", result.error)
         self.assertEqual(len(driver.opened_urls), 1)
 
     def test_unrecognized_surface_reopens_the_reel_before_reporting_unavailable(self) -> None:
@@ -1028,13 +1051,15 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(saved[1]["hours_since_previous"], "2.5")
         self.assertEqual(saved[1]["media_count_change"], 25)
 
-    def test_merge_fills_missing_android_fields_without_overwriting_python_values(self) -> None:
+    def test_merge_preserves_web_values_when_android_count_is_missing(self) -> None:
         browser_record = {
             "url": "https://www.instagram.com/reel/CODE123/",
             "title": "browser caption",
             "hashtags": "#fashion",
             "location_name": "Seoul",
             "view_count": 1,
+            "like_count": 100,
+            "repost_count": 9,
             "audio_name": "browser audio",
         }
 
@@ -1047,18 +1072,26 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(merged["hashtags"], "#fashion")
         self.assertEqual(merged["location_name"], "Seoul")
         self.assertEqual(merged["view_count"], 1)
+        self.assertEqual(merged["like_count"], 100)
+        self.assertEqual(merged["repost_count"], 9)
         self.assertEqual(merged["share_count"], 10)
         self.assertEqual(merged["audio_name"], "browser audio")
 
-    def test_android_replaces_only_missing_or_compact_python_counts(self) -> None:
+    def test_android_overwrites_its_counts_but_preserves_web_only_counts(self) -> None:
         merged = merge_android_metrics(
-            {"view_count": "1.2K", "like_count": "", "comment_count": "123"},
-            AndroidMetricResult(metrics={"view_count": 1_234, "like_count": 50, "comment_count": 125}),
+            {"view_count": 1_200, "like_count": 100, "comment_count": 123, "repost_count": 9,
+             "share_count": "", "saved_count": "", "follower_count": 500},
+            AndroidMetricResult(metrics={"view_count": 1_234, "like_count": 50, "comment_count": 125,
+                                         "repost_count": 0, "share_count": 19, "saved_count": 4}),
         )
 
-        self.assertEqual(merged["view_count"], 1_234)
+        self.assertEqual(merged["view_count"], 1_200)
         self.assertEqual(merged["like_count"], 50)
-        self.assertEqual(merged["comment_count"], "123")
+        self.assertEqual(merged["comment_count"], 123)
+        self.assertEqual(merged["repost_count"], 0)
+        self.assertEqual(merged["share_count"], 19)
+        self.assertEqual(merged["saved_count"], 4)
+        self.assertEqual(merged["follower_count"], 500)
 
     def test_unavailable_android_result_preserves_python_metrics(self) -> None:
         browser_record = {
@@ -1095,7 +1128,7 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(merged["like_count"], "X")
         self.assertEqual(merged["view_count"], 39_240)
 
-    def test_low_like_reel_defaults_missing_engagement_counts_to_zero(self) -> None:
+    def test_low_like_reel_does_not_invent_missing_comment_count(self) -> None:
         merged = merge_android_metrics(
             {
                 "view_count": 1_234,
@@ -1111,7 +1144,7 @@ class AndroidReelMetricTests(unittest.TestCase):
 
         self.assertEqual(
             {field: merged[field] for field in ("comment_count", "repost_count", "share_count", "saved_count")},
-            {"comment_count": 0, "repost_count": 0, "share_count": 0, "saved_count": 0},
+            {"comment_count": "", "repost_count": 0, "share_count": "", "saved_count": ""},
         )
 
     def test_unavailable_android_result_does_not_invent_low_like_zeroes(self) -> None:
@@ -1132,7 +1165,7 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(merged["share_count"], "")
         self.assertEqual(merged["saved_count"], "")
 
-    def test_exact_view_defaults_missing_repost_share_and_saved_counts_to_zero(self) -> None:
+    def test_exact_view_does_not_invent_missing_share_and_saved_counts(self) -> None:
         merged = merge_android_metrics(
             {
                 "view_count": 987_654,
@@ -1147,8 +1180,8 @@ class AndroidReelMetricTests(unittest.TestCase):
         )
 
         self.assertEqual(merged["repost_count"], 0)
-        self.assertEqual(merged["share_count"], 0)
-        self.assertEqual(merged["saved_count"], 0)
+        self.assertEqual(merged["share_count"], "")
+        self.assertEqual(merged["saved_count"], "")
         self.assertEqual(merged["comment_count"], 15)
 
     def test_zero_view_is_still_an_exact_collected_view_count(self) -> None:
@@ -1158,8 +1191,8 @@ class AndroidReelMetricTests(unittest.TestCase):
         )
 
         self.assertEqual(merged["repost_count"], 0)
-        self.assertEqual(merged["share_count"], 0)
-        self.assertEqual(merged["saved_count"], 0)
+        self.assertEqual(merged["share_count"], "")
+        self.assertEqual(merged["saved_count"], "")
 
     def test_ad_without_saved_count_is_marked_x(self) -> None:
         merged = merge_android_metrics(

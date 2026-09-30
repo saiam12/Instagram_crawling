@@ -13,6 +13,20 @@ from reels.instagram_reels_browser import InstagramRateLimitState, append_collec
 
 
 class CollectionDiagnosticsTests(unittest.TestCase):
+    def test_summary_shows_collection_rounds_for_mixed_reel_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()) as output:
+            diagnostics = CollectorDiagnostics(directory, run_mode="background", component="python")
+            diagnostics.begin_media(current_url="https://www.instagram.com/reel/ONE/", collection_number=1)
+            diagnostics.finish_media("SUCCESS", success=True)
+            diagnostics.begin_media(current_url="https://www.instagram.com/reel/TWO/", collection_number=2)
+            diagnostics.finish_media("FAILED", success=False)
+            diagnostics.begin_media(current_url="https://www.instagram.com/reel/THREE/")
+            diagnostics.update_media(collection_number=3)
+            diagnostics.finish_media("SUCCESS", success=True)
+            diagnostics.finish("completed")
+
+            self.assertIn("Collection rounds: #1: 1, #2: 1, #3: 1", output.getvalue())
+
     def test_browser_429_writes_confirmed_event_snapshot_and_sanitized_network_history(self) -> None:
         class Request:
             resource_type = "xhr"

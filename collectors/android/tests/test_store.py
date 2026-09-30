@@ -45,6 +45,8 @@ def observed_reel(evidence_paths: EvidencePaths) -> ObservedReel:
         metrics={
             "likes_and_plays_count": Metric("Likes and plays", 32_357, "32,357"),
             "like_count": Metric("like", 4_699, "4,699"),
+            "share_count": Metric("share", 12, "12"),
+            "save_count": Metric("save", 4, "4"),
         },
         visible_metrics={"Likes and plays": "32,357"},
         evidence_paths=evidence_paths,
@@ -75,6 +77,8 @@ class CollectionStoreTests(unittest.TestCase):
         self.assertEqual(row["title"], "caption")
         self.assertEqual(row["view_count"], "")
         self.assertEqual(row["like_count"], "4699")
+        self.assertEqual(row["share_count"], "12")
+        self.assertEqual(row["saved_count"], "4")
         self.assertEqual(payload[0]["like_count"], 4_699)
         self.assertEqual(payload[0]["uploaded_at"], "2026-04-28")
         self.assertEqual(payload[0]["days_since_upload"], 124)
@@ -94,7 +98,7 @@ class CollectionStoreTests(unittest.TestCase):
             )
             self.assertEqual(workbook.active.freeze_panes, "A2")
             self.assertEqual(workbook.active["A1"].fill.fgColor.rgb, "000F766E")
-            self.assertEqual(workbook.active.auto_filter.ref, f"A1:Z2")
+            self.assertEqual(workbook.active.auto_filter.ref, "A1:AB2")
             self.assertEqual(workbook.active["L2"].value.date().isoformat(), "2026-04-28")
             self.assertEqual(workbook.active["L2"].number_format, "yyyy-mm-dd")
             self.assertEqual(workbook.active["N2"].value, 124)

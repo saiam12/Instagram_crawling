@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,9 +29,14 @@ from .fashion_beauty_scheduler import (
     window_dataset,
 )
 from . import collection_pause
+from .android_reel_metrics import ANDROID_COLLECTION_FIELDS
+from .browser_runtime import load_playwright, locate_browser_executable, safe_close
 from .instagram_reels_browser import (
     REEL_HISTORY_DIRECTORY,
     REEL_HISTORY_FILENAME,
+    apply_metric_visibility_rules,
+    launch_collection_context,
+    normalize_reel_url,
     parse_args,
     process_is_alive,
     relay_new_collection_log_lines,
@@ -61,6 +67,44 @@ _COLLECTOR_RETRY_MAX_SECONDS = 30 * 60.0
 _COLLECTOR_RETRY_MAX_ATTEMPTS = 5
 _RATE_LIMIT_RETRY_SECONDS = 20 * 60.0
 _RECOLLECTION_BATCH_SIZE = 50
+_RECOLLECTION_BROWSER_KEEP_SECONDS = 5 * 60
+
+
+class RecollectionBrowserSession:
+    """Keep the foreground browser open between nearby due recollections."""
+
+    def __init__(self) -> None:
+        self.runtime: Any = None
+        self.browser: Any = None
+        self.context: Any = None
+
+    async def run(self, options: Sequence[Any], stop_event: asyncio.Event | None) -> list[int]:
+        if self.context is None:
+            try:
+                self.runtime = await load_playwright()().start()
+                self.browser, self.context = await launch_collection_context(
+                    self.runtime.chromium, locate_browser_executable(), options[0]
+                )
+            except BaseException:
+                await self.close()
+                raise
+        return await run_collectors_in_shared_context(
+            options,
+            external_stop_event=stop_event,
+            shared_context=self.context,
+            shared_browser=self.browser,
+            shared_playwright_runtime=self.runtime,
+        )
+
+    async def close(self) -> None:
+        await safe_close(self.context)
+        await safe_close(self.browser)
+        if self.runtime is not None:
+            try:
+                await self.runtime.stop()
+            except Exception:
+                pass
+        self.context = self.browser = self.runtime = None
 
 
 @dataclass(frozen=True)
@@ -129,10 +173,30 @@ def dataset_by_name(config: RunConfig, name: str) -> DatasetConfig:
 
 def read_history(dataset: DatasetConfig) -> list[dict[str, Any]]:
     history = dataset.data_root / REEL_HISTORY_DIRECTORY / REEL_HISTORY_FILENAME
-    if not history.exists():
-        return []
-    with history.open("r", newline="", encoding="utf-8-sig") as file:
-        return [dict(row) for row in csv.DictReader(file)]
+    rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+    archives = sorted(history.parent.glob(f"{history.stem}_legacy_*{history.suffix}"))
+    for source in [*archives, history]:
+        if not source.exists():
+            continue
+        with source.open("r", newline="", encoding="utf-8-sig") as file:
+            for row in csv.DictReader(file):
+                key = (str(row.get("url", "")), str(row.get("collected_at", "")), str(row.get("collection_number", "")))
+                if all(key[:2]):
+                    rows[key] = dict(row)
+    seen_pairs = {key[:2] for key in rows}
+    journal = Path(f"{history}.pending.jsonl")
+    if journal.exists():
+        for line in journal.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                key = (str(row.get("url", "")), str(row.get("collected_at", "")))
+                if all(key) and key not in seen_pairs:
+                    rows[(*key, "")] = row
+                    seen_pairs.add(key)
+    return list(rows.values())
 
 
 def _window_bounds_at(now: datetime, interval_minutes: float) -> tuple[datetime, datetime]:
@@ -162,7 +226,7 @@ def decide_next_work(
     used = initial_count_in_window(rows, start, end)
     remaining = max(0, config.max_new_items_per_window - used)
     return WorkDecision(
-        due_jobs=tuple(due_jobs(selected, rows, now)),
+        due_jobs=tuple(due_jobs(selected, rows, now, timedelta(minutes=config.recollection_interval_minutes), target_snapshots=config.target_snapshots)),
         discover=remaining > 0,
         remaining_capacity=remaining,
     )
@@ -290,19 +354,20 @@ def _atomic_write_csv(destination: Path, fields: list[str], rows: list[dict[str,
         temporary.unlink(missing_ok=True)
 
 
-def _atomic_write_xlsx(destination: Path, sheet_name: str, fields: list[str], rows: list[dict[str, Any]]) -> None:
+def _atomic_write_xlsx(destination: Path, sheet_name: str, fields: list[str], rows: list[dict[str, Any]]) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
+    matrix = [fields, *[[str(row.get(field, "") or "") for field in fields] for row in rows]]
+    updated = destination.with_name(f"{destination.stem}_updated{destination.suffix}")
     try:
-        matrix = [fields, *[[str(row.get(field, "") or "") for field in fields] for row in rows]]
-        write_xlsx_workbook(temporary, [(sheet_name, matrix)])
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+        write_xlsx_workbook(destination, [(sheet_name, matrix)])
+    except PermissionError:
+        write_xlsx_workbook(updated, [(sheet_name, matrix)])
+        return updated
+    try:
+        updated.unlink(missing_ok=True)
+    except PermissionError:
+        pass
+    return destination
 
 
 def publish_dataset_outputs(dataset: DatasetConfig) -> dict[str, Path]:
@@ -316,7 +381,42 @@ def publish_dataset_outputs(dataset: DatasetConfig) -> dict[str, Path]:
     # Scheduled domains instead expose their raw append-only history so every
     # recollection is a new row and earlier snapshots never change.
     if reel_history.exists():
-        fields, rows, _changed = _read_csv_projection(reel_history, "reels")
+        rows = read_history(dataset)
+        completed_dir = dataset.data_root / REEL_HISTORY_DIRECTORY / "android_metric_queue" / "completed"
+        by_snapshot = {(str(row.get("url", "")), str(row.get("collected_at", ""))): row for row in rows}
+        for completed in sorted(completed_dir.glob("*.json")):
+            try:
+                result = json.loads(completed.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(result, dict):
+                continue
+            target = result.get("target") if isinstance(result.get("target"), dict) else {}
+            row = by_snapshot.get((str(target.get("url", "")), str(target.get("collected_at", ""))))
+            if row is None:
+                continue
+            metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+            fields_to_apply = (*ANDROID_COLLECTION_FIELDS, "comment_count") if result.get("recollection") else ANDROID_COLLECTION_FIELDS
+            for field in fields_to_apply:
+                if field in metrics and not (
+                    result.get("recollection")
+                    and field in result.get("compact_fields", ())
+                    and field in {"like_count", "comment_count", "repost_count"}
+                ):
+                    row[field] = metrics[field]
+            if result.get("audio_name") and not row.get("audio_name"):
+                row["audio_name"] = result["audio_name"]
+            if result.get("like_count_private") is True:
+                row["like_count"] = "X"
+            if result.get("status") == "collected":
+                row.update(apply_metric_visibility_rules(row, comment_count_disabled=result.get("comment_count_disabled") is True))
+            if result.get("android_mismatch"):
+                row["android_mismatch"] = result["android_mismatch"]
+        with reel_history.open("r", newline="", encoding="utf-8-sig") as file:
+            active_fields = list(csv.DictReader(file).fieldnames or [])
+        fields = list(dict.fromkeys([*active_fields, *(field for row in rows for field in row)]))
+        rows.sort(key=lambda row: (str(row.get("collected_at", "")), str(row.get("url", ""))))
+        fields, rows, _changed = _project_hour_intervals("reels", fields, rows)
         destinations = {
             "reels_csv": public_root / f"{dataset.name}_reels.csv",
             "reels_json": public_root / f"{dataset.name}_reels.json",
@@ -324,7 +424,7 @@ def publish_dataset_outputs(dataset: DatasetConfig) -> dict[str, Path]:
         }
         _atomic_write_csv(destinations["reels_csv"], fields, rows)
         _write_json_atomic(destinations["reels_json"], rows)
-        _atomic_write_xlsx(destinations["reels_xlsx"], "reels", fields, rows)
+        destinations["reels_xlsx"] = _atomic_write_xlsx(destinations["reels_xlsx"], "reels", fields, rows)
         written.update(destinations)
 
     for kind, source_name in _PUBLIC_SOURCES.items():
@@ -360,7 +460,7 @@ def publish_dataset_outputs(dataset: DatasetConfig) -> dict[str, Path]:
         elif kind.endswith("_xlsx") and record_kind in projections:
             fields, rows, changed = projections[record_kind]
             if changed:
-                _atomic_write_xlsx(destination, record_kind, fields, rows)
+                destination = _atomic_write_xlsx(destination, record_kind, fields, rows)
             else:
                 _atomic_copy(source, destination)
         else:
@@ -380,7 +480,14 @@ def _write_json_atomic(destination: Path, value: Any) -> None:
         temporary.write_text(
             json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        os.replace(temporary, destination)
+        for attempt in range(10):
+            try:
+                os.replace(temporary, destination)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -552,6 +659,9 @@ def _generic_collector_options(
     else:
         raise ValueError(f"Unknown collection mode: {mode}")
     options = parse_args(arguments)
+    options.profile_android_recollection = (
+        mode == "recollect" and config.collector_mode == "hybrid"
+    )
     # The long-running scheduler owns one Android log relay for the whole run,
     # including the gaps between individual browser collection invocations.
     options.relay_detached_android_logs = False
@@ -566,6 +676,7 @@ async def invoke_generic_recollection_batches(
     config: RunConfig,
     batches: Sequence[tuple[str, Sequence[str]]],
     stop_event: asyncio.Event | None = None,
+    browser_session: RecollectionBrowserSession | None = None,
 ) -> list[int]:
     """Collect one due-URL batch per domain in a shared authenticated browser."""
     prepared = [
@@ -579,6 +690,8 @@ async def invoke_generic_recollection_batches(
     ]
     try:
         options = [options for options, _urls_file in prepared]
+        if browser_session is not None:
+            return await browser_session.run(options, stop_event)
         if len(options) == 1:
             return [
                 await run_collector(
@@ -663,7 +776,14 @@ def current_status(
     pending = (
         []
         if config.new_only
-        else [job for job in due_jobs(dataset, rows, now) if job.due_at >= started_at]
+        else [
+            job for job in due_jobs(
+                dataset, rows, now, timedelta(minutes=config.recollection_interval_minutes),
+                started_at if config.domains == ("fashion",) else None,
+                config.target_snapshots,
+            )
+            if job.due_at >= started_at
+        ]
     )
     active_keywords: Sequence[str] = ()
     if active_name == dataset.name:
@@ -686,6 +806,7 @@ def current_status(
         "updated_at": _isoformat(now),
         "active_keywords": list(active_keywords),
         "max_upload_age_days": config.max_upload_age_days,
+        "recollection_interval_minutes": config.recollection_interval_minutes,
         "window_target": config.new_items_per_window,
         "window_collected": current_count,
         "window_cap": config.max_new_items_per_window,
@@ -728,6 +849,7 @@ async def _invoke_recollection_batches_before_deadline(
     config: RunConfig,
     batches: Sequence[tuple[str, tuple[DueJob, ...]]],
     stop_event: asyncio.Event,
+    browser_session: RecollectionBrowserSession | None = None,
 ) -> list[tuple[tuple[DueJob, ...], int, str]]:
     """Run the due batches together, preserving a separate outcome per domain."""
     if invoke is not invoke_generic_collector:
@@ -760,6 +882,7 @@ async def _invoke_recollection_batches_before_deadline(
                 config=config,
                 batches=[(dataset, [job.url for job in jobs]) for dataset, jobs in batches],
                 stop_event=stop_event,
+                browser_session=browser_session,
             ),
             timeout=remaining,
         )
@@ -785,9 +908,11 @@ async def run_fashion_beauty_collection(
     invoke: Invocation = invoke_generic_collector,
     clock: Clock = utc_now,
 ) -> int:
-    started_at = clock()
+    started_at = config.resume_started_at or clock()
     discovery_ends_at = started_at + timedelta(hours=config.discovery_hours)
     ends_at = started_at + timedelta(hours=config.duration_hours)
+    recollection_interval = timedelta(minutes=config.recollection_interval_minutes)
+    first_collected_at = started_at if config.domains == ("fashion",) else None
     stop_event = asyncio.Event()
     lock_path = config.data_root / ".datasets" / "fashion_beauty_scheduler.lock.json"
     last_errors = {name: "" for name in config.domains}
@@ -803,6 +928,12 @@ async def run_fashion_beauty_collection(
     previous_sigint = signal.getsignal(signal.SIGINT)
     android_log_relays: list[asyncio.Task[None]] = []
     fashion_analyzer_task: asyncio.Task[None] | None = None
+    browser_session = (
+        RecollectionBrowserSession()
+        if invoke is invoke_generic_collector and not config.background
+        else None
+    )
+    published_outputs: dict[str, dict[str, Path]] = {}
     fashion_analyzer_requested = False
 
     def request_fashion_analysis() -> None:
@@ -848,7 +979,6 @@ async def run_fashion_beauty_collection(
                     asyncio.create_task(relay_new_collection_log_lines(dataset.data_root, "android"))
                     for dataset in datasets(config)
                 ]
-            # Existing Fashion history is eligible on a resumed/default run.
             request_fashion_analysis()
             while not stop_event.is_set() and clock() < ends_at:
                 await collection_pause.wait()
@@ -862,7 +992,10 @@ async def run_fashion_beauty_collection(
                         (
                             job
                             for dataset in configured_datasets
-                            for job in due_jobs(dataset, histories[dataset.name], now)
+                            for job in due_jobs(
+                                dataset, histories[dataset.name], now, recollection_interval, first_collected_at,
+                                config.target_snapshots,
+                            )
                             if job.due_at >= started_at
                         ),
                         key=lambda job: (job.due_at, job.dataset, job.url),
@@ -875,7 +1008,10 @@ async def run_fashion_beauty_collection(
                         (
                             job
                             for dataset in configured_datasets
-                            for job in due_jobs(dataset, histories[dataset.name], ends_at)
+                            for job in due_jobs(
+                                dataset, histories[dataset.name], ends_at, recollection_interval, first_collected_at,
+                                config.target_snapshots,
+                            )
                             if started_at <= job.due_at < ends_at
                         ),
                         key=lambda job: (job.due_at, job.dataset, job.url),
@@ -889,6 +1025,20 @@ async def run_fashion_beauty_collection(
                     for job in pending
                     if retry_not_before.get((job.dataset, job.url, job.due_at), now) <= now
                 ]
+                if browser_session is not None and browser_session.context is not None and not eligible_jobs:
+                    next_recollection_at = min(
+                        [
+                            retry_not_before[(job.dataset, job.url, job.due_at)]
+                            for job in pending
+                        ] + [job.due_at for job in scheduled_before_end if job.due_at > now],
+                        default=None,
+                    )
+                    if (
+                        now < discovery_ends_at
+                        or next_recollection_at is None
+                        or (next_recollection_at - now).total_seconds() > _RECOLLECTION_BROWSER_KEEP_SECONDS
+                    ):
+                        await browser_session.close()
 
                 if eligible_jobs:
                     recollection_during_discovery_rate_limit = bool(
@@ -911,6 +1061,7 @@ async def run_fashion_beauty_collection(
                         config=config,
                         batches=recollection_batches,
                         stop_event=stop_event,
+                        browser_session=browser_session,
                     )
                     for recollection_jobs, result, error in outcomes:
                         dataset_name = recollection_jobs[0].dataset
@@ -959,10 +1110,28 @@ async def run_fashion_beauty_collection(
                         else:
                             if any(job.dataset == "fashion" for job in recollection_jobs):
                                 request_fashion_analysis()
+                            before = Counter(
+                                normalized["url"] for row in histories[dataset_name]
+                                if (normalized := normalize_reel_url(row.get("url"))) is not None
+                            )
+                            after = Counter(
+                                normalized["url"] for row in read_history(dataset_by_name(config, dataset_name))
+                                if (normalized := normalize_reel_url(row.get("url"))) is not None
+                            )
                             for job in recollection_jobs:
                                 job_key = (job.dataset, job.url, job.due_at)
-                                retry_attempts.pop(job_key, None)
-                                retry_not_before.pop(job_key, None)
+                                if after[job.url] > before[job.url]:
+                                    retry_attempts.pop(job_key, None)
+                                    retry_not_before.pop(job_key, None)
+                                else:
+                                    attempt = retry_attempts.get(job_key, 0) + 1
+                                    retry_attempts[job_key] = attempt
+                                    retry_not_before[job_key] = (
+                                        ends_at if attempt >= _COLLECTOR_RETRY_MAX_ATTEMPTS
+                                        else clock() + timedelta(seconds=_due_retry_delay(attempt))
+                                    )
+                                    collector_failures[dataset_name] += 1
+                                    last_errors[dataset_name] = f"Exact profile metrics unavailable for {job.url}"
                 elif pending:
                     wait_seconds = min(
                         30.0,
@@ -1091,7 +1260,7 @@ async def run_fashion_beauty_collection(
                     # reels.* and users.* files atomically for base-output
                     # runs. Do not create domain-prefixed copies there.
                     if not config.base_output:
-                        publish_dataset_outputs(dataset)
+                        published_outputs[dataset.name] = publish_dataset_outputs(dataset)
                     write_dataset_status(
                         dataset,
                         current_status(
@@ -1119,9 +1288,15 @@ async def run_fashion_beauty_collection(
                             min(wait_seconds, remaining_run_seconds),
                         )
     finally:
+        if browser_session is not None:
+            await browser_session.close()
         if fashion_analyzer_task is not None:
+            if not fashion_analyzer_task.done():
+                fashion_analyzer_task.cancel()
             try:
                 await fashion_analyzer_task
+            except asyncio.CancelledError:
+                pass
             except Exception as error:
                 print(f"[ANALYZER] Fashion analysis stopped: {error}", file=sys.stderr)
         for relay in android_log_relays:
@@ -1129,6 +1304,13 @@ async def run_fashion_beauty_collection(
         if android_log_relays:
             await asyncio.gather(*android_log_relays, return_exceptions=True)
         signal.signal(signal.SIGINT, previous_sigint)
+        for dataset in datasets(config):
+            stem = "reels" if config.base_output else f"{dataset.name}_reels"
+            published = published_outputs.get(dataset.name, {})
+            outputs = [published.get(f"reels_{extension}", _public_root(dataset) / f"{stem}.{extension}") for extension in ("xlsx", "csv", "json")]
+            saved_paths = [str(path.resolve()) for path in outputs if path.exists()]
+            if saved_paths:
+                print(f"[{dataset.name.upper()}] 최종 릴스 저장 위치: " + ", ".join(saved_paths))
     return exit_code
 
 

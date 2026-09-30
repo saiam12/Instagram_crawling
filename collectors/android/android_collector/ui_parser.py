@@ -48,9 +48,9 @@ _METRIC_IDS = (
     ("like_count", ("like_count", "likes_count")),
     ("view_count", ("video_view_count", "view_count", "play_count")),
     ("comment_count", ("comment_count", "comments_count")),
-    ("share_count", ("share_count", "shares_count")),
-    ("repost_count", ("repost_count", "reposts_count")),
-    ("save_count", ("save_count", "saves_count")),
+    ("share_count", ("share_count", "shares_count", "share_button", "send_button")),
+    ("repost_count", ("repost_count", "reposts_count", "repost_button")),
+    ("save_count", ("save_count", "saves_count", "save_button", "bookmark_button")),
 )
 _METRIC_LABELS = (
     ("likes_and_plays_count", ("likes and plays", "좋아요 및 재생", "좋아요와 재생")),
@@ -198,6 +198,9 @@ def _metric_key_from_node(node: UiNode) -> str | None:
         if any(marker in resource_id for marker in markers):
             return key
     visible = node.visible_text.casefold()
+    icon_labels = {"repost": "repost_count", "share": "share_count", "send": "share_count", "reshare": "share_count", "save": "save_count", "bookmark": "save_count"}
+    if visible.strip() in icon_labels:
+        return icon_labels[visible.strip()]
     for key, labels in _METRIC_LABELS:
         if any(label in visible for label in labels):
             return key
@@ -221,6 +224,7 @@ def _node_value(node: UiNode) -> tuple[int | None, str]:
 def extract_metrics(nodes: list[UiNode]) -> tuple[dict[str, Metric], dict[str, str]]:
     metrics: dict[str, Metric] = {}
     visible_metrics: dict[str, str] = {}
+    countless = {"repost_count", "share_count", "save_count"}
     for index, node in enumerate(nodes):
         key = _metric_key_from_node(node)
         if key is None:
@@ -233,8 +237,14 @@ def extract_metrics(nodes: list[UiNode]) -> tuple[dict[str, Metric], dict[str, s
                     value, raw = candidate, candidate_raw
                     break
         label = "Likes and plays" if key == "likes_and_plays_count" else key.removesuffix("_count")
+        if key in countless and value is None and key in metrics and metrics[key].value is not None:
+            continue
         metrics[key] = Metric(label=label, value=value, raw_text=raw)
         visible_metrics[label] = raw
+    for key in countless:
+        metric = metrics.get(key)
+        if metric is not None and metric.value is None:
+            metrics[key] = Metric(label=metric.label, value=0, raw_text=metric.raw_text)
     return metrics, visible_metrics
 
 

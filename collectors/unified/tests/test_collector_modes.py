@@ -1,12 +1,48 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from scripts.instagram_reels_python import main as launcher_main
+from exporters.instagram_collector import write_xlsx_workbook
 
 from reels.collector_modes import UNIFIED_ROOT, extract_collector_mode, run_android_collection, translate_android_arguments
 
 
 class CollectorModeTests(unittest.TestCase):
+    def test_refresh_selects_only_requested_analysis_workbook_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = Path(directory) / "analysis.xlsx"
+            write_xlsx_workbook(workbook, [("reels", [
+                ["url"],
+                ["https://www.instagram.com/reels/first/"],
+                ["https://www.instagram.com/reels/second/"],
+                ["https://www.instagram.com/reels/third/"],
+            ])])
+            selected_urls: list[str] = []
+
+            def inspect_urls(arguments: list[str]) -> int:
+                selected_urls.extend(Path(arguments[arguments.index("--urls-file") + 1]).read_text(encoding="utf-8").splitlines())
+                return 0
+
+            with patch("scripts.instagram_reels_python.collector_main", side_effect=inspect_urls) as collector:
+                result = launcher_main([
+                    "refresh", "--input-xlsx", str(workbook), "--start-row", "3", "--end-row", "4",
+                    "--data-dir", directory, "--background",
+                ])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(selected_urls, [
+                "https://www.instagram.com/reels/second/",
+                "https://www.instagram.com/reels/third/",
+            ])
+            arguments = collector.call_args.args[0]
+            self.assertIn("--urls-file", arguments)
+            self.assertNotIn("--input-xlsx", arguments)
+            self.assertNotIn("--start-row", arguments)
+            self.assertNotIn("--end-row", arguments)
+            self.assertIn("--background", arguments)
+
     def test_extracts_mode_aliases_without_forwarding_them(self) -> None:
         self.assertEqual(
             extract_collector_mode(["--collector-mode", "web", "--background"]),

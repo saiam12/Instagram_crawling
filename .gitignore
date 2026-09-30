@@ -2,11 +2,13 @@
 skill.md
 AGENTS.md
 
+# Python environments and caches
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 
+# Generated data and local browser state
 data_web/
 collectors/android/data_android/
 .android/
@@ -14,8 +16,20 @@ outputs/
 /temp/
 graphify-out/
 browser_profile/
-collectors/unified/.collection-paused
 
+# Unified collector runtime files and exports
+/collectors/unified/.collector/
+/collectors/unified/diagnostics/
+/collectors/unified/logs/
+/collectors/unified/data_*/
+/collectors/unified/*.csv
+/collectors/unified/*.json
+/collectors/unified/*.jsonl
+/collectors/unified/*.log
+/collectors/unified/*.xlsx
+/collectors/unified/.collection-paused
+
+# Analyzer runtime files
 analyzers/gemini/.pool_pending/
 analyzers/gemini/.venv-py312-backup/
 analyzers/gemini/model_limits.json

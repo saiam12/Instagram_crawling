@@ -343,22 +343,32 @@ def exact_visible_profile_follower_count(value: Any) -> int | None:
     only used when Instagram visibly renders a complete integer.
     """
     values = value if isinstance(value, (list, tuple, set)) else [value]
-    number = r"(?P<count>\d{1,3}(?:,\d{3})*|\d+)"
-    suffix = r"(?![\d.]|\s*(?:천|만|억|[KMB]))"
-    patterns = [
-        re.compile(rf"(?:팔로워|followers?)\s*[:：]?\s*{number}{suffix}", re.I),
-        re.compile(rf"{number}{suffix}\s*(?:팔로워|followers?)", re.I),
-    ]
+    number = r"\d[\d,]*(?:\.\d+)?\s*(?:천|만|억|[KMB])?"
+    follower = r"(?:팔로워|followers?)"
+    post = r"(?:게시물|posts?)"
+    forward = re.compile(rf"{follower}\s*[:：]?\s*(?P<count>{number})", re.I)
+    reverse = re.compile(rf"(?P<count>{number})\s*{follower}", re.I)
+    post_forward = re.compile(rf"{post}\s*[:：]?\s*{number}", re.I)
+    post_reverse = re.compile(rf"{number}\s*{post}", re.I)
     for raw in values:
         text = str(raw or "").replace("\u00a0", " ")
-        for pattern in patterns:
-            match = pattern.search(text)
-            if not match:
-                continue
-            try:
-                return int(match.group("count").replace(",", ""))
-            except ValueError:
-                continue
+        first_post_forward = post_forward.search(text)
+        first_post_reverse = post_reverse.search(text)
+        if first_post_forward or first_post_reverse:
+            label_first = first_post_forward is not None and (
+                first_post_reverse is None or first_post_forward.start() <= first_post_reverse.start()
+            )
+            match = (forward if label_first else reverse).search(text)
+        else:
+            forward_match = forward.search(text)
+            reverse_match = reverse.search(text)
+            # Without the surrounding post label, conflicting layouts are ambiguous.
+            if forward_match and reverse_match:
+                return None
+            match = forward_match or reverse_match
+        if match:
+            count = match.group("count").strip()
+            return int(count.replace(",", "")) if re.fullmatch(r"\d{1,3}(?:,\d{3})*|\d+", count) else None
     return None
 
 
@@ -627,4 +637,3 @@ def snapshot_labels(fields: Iterable[str]) -> list[str]:
         if parsed and parsed["label"] not in labels:
             labels.append(parsed["label"])
     return labels
-

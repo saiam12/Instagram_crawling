@@ -64,7 +64,7 @@ python -m venv .venv
 
 ### 수집 필드 실시간 확인
 
-`--verbose-progress`(별칭: `--show-collected-data`)를 붙이면 저장된 릴스마다 터미널에 모든 릴스·프로필·지표 필드를 출력합니다. 각 값은 `collected(...)`, 화면상 확인 불가인 경우 `unavailable`로 표시됩니다. `10K`·`1.2M` 같은 축약 표기는 각각 `10,000`·`1,200,000`으로 환산해 저장하므로, 정확 정수가 아닌 표시 기반 값일 수 있습니다.
+`--verbose-progress`(별칭: `--show-collected-data`)를 붙이면 저장된 릴스의 공개 열과 지표를 출력합니다. 새로 읽은 공유·저장 수는 `collected(...)`, 화면상 확인할 수 없으면 `unavailable`로 표시됩니다. `10K`·`1.2M` 같은 축약 표기는 각각 `10,000`·`1,200,000`으로 환산한 표시 기반 값일 수 있습니다.
 
 ```powershell
 .\collector.ps1 collect --fashion --max-items 50 --verbose-progress
@@ -72,7 +72,7 @@ python -m venv .venv
 
 ### 더 빠른 단일 에뮬레이터 수집
 
-`--fast`는 단순히 대기 시간을 낮추는 옵션이 아닙니다. 같은 실행 중 같은 작성자가 다시 나오면 이미 읽은 프로필·팔로워·계정 국가 값을 재사용하여 프로필과 `About this account` 화면을 다시 열지 않습니다. 또한 릴스와 좋아요·조회수 패널의 PNG 캡처 ADB 왕복을 생략하고, 검증에 필요한 원본 UI XML은 그대로 저장합니다. 좋아요·조회수 상세 패널, 공유 링크, 캡션·업로드 날짜, 댓글 확인은 계속 수행합니다.
+`--fast`는 릴스의 PNG 캡처를 생략하고 원본 UI XML만 저장합니다.
 
 ```powershell
 .\collector.ps1 collect --fashion --max-items 50 --fast --verbose-progress
@@ -92,7 +92,7 @@ python -m venv .venv
 
 ### URL 기반 재수집
 
-`refresh`는 기존 `reels.xlsx`(없으면 `instagram_data.xlsx`)의 `url` 열에서 Instagram Reel URL을 읽어 앱에서 하나씩 다시 엽니다. 재수집 결과는 기존 행을 덮어쓰지 않고 같은 URL의 다음 `collection_number` 행으로 추가되며, 조회·좋아요·댓글·리포스트·팔로워 증감값도 계산됩니다. 공유 링크의 `?igsh=...` 같은 쿼리가 달라도 같은 Reel로 연결합니다.
+`refresh`는 기존 `reels.xlsx`(없으면 `instagram_data.xlsx`)의 `url` 열에서 Instagram Reel URL을 읽어 앱에서 하나씩 다시 엽니다. 공유·저장 수를 새로 읽은 결과는 기존 행을 덮어쓰지 않고 같은 URL의 다음 `collection_number` 행으로 추가됩니다. 공유 링크의 `?igsh=...` 같은 쿼리가 달라도 같은 Reel로 연결합니다.
 
 ```powershell
 .\collector.ps1 refresh --max-items 50 --verbose-progress
@@ -137,14 +137,10 @@ URL이 비어 있는 과거 행은 Android가 같은 Reel을 안정적으로 다
 | `.collector\android_observations.json` | Android 전용 원문 지표·수집 방식·XML/PNG 증빙 경로 |
 | `evidence\000001.xml` | 해당 화면의 원본 UIAutomator XML |
 | `evidence\000001.png` | 해당 화면의 원본 스크린샷 |
-| `evidence\000001.likes_and_plays.xml` | 좋아요·조회수 상세 패널의 UIAutomator XML |
-| `evidence\000001.likes_and_plays.png` | 좋아요·조회수 상세 패널의 스크린샷 |
 
-공개 파일의 열 순서는 `collection_number`, `days_since_previous`를 포함해 웹 수집기의 `reels.*`와 같습니다. 접근성 텍스트의 정확한 `Like number`, `Comment number`, `Reposted`, `Reshare number`를 우선 읽습니다. 화면이 `15.6K`·`1.2M`처럼 축약값만 보일 때는 각각 곱셈 단위(K=1,000, M=1,000,000)를 적용한 표시 기반 정수를 저장합니다. 좋아요 수 버튼을 열면 표시되는 `Likes and plays` 상세 패널에서 정확한 `like_count`와 `view_count`를 읽고 바로 원래 릴스로 돌아옵니다.
+공개 파일의 열 순서는 `collection_number`, `days_since_previous`를 포함해 웹 수집기의 `reels.*`와 같습니다. Android는 릴스 화면에 표시된 공유·저장 수만 새로 읽어 `share_count`와 `saved_count`에 저장합니다. 좋아요·조회수·댓글 상세 패널과 작성자 프로필은 열지 않습니다. 화면에 값이 없으면 0으로 추정하지 않고 빈 값으로 둡니다.
 
-상세 패널에 “이 릴스의 총 좋아요 수는 …만 볼 수 있습니다” 또는 같은 의미의 영문 문구가 있으면 `.collector\android_observations.json`의 `like_count_is_private`에 `true`로 기록합니다. 정확한 수치가 표시되면 `false`, 패널을 열 수 없거나 문구를 판별할 수 없으면 `null`입니다. 화면에 댓글 수가 없을 때는 댓글 시트를 열어 `No comments yet`면 `comment_count=0`으로 기록하고, 댓글이 꺼졌거나 제한되었다는 화면 문구면 공개 `comment_count`는 빈 값으로 두되 터미널에는 `unavailable(disabled|limited)`로 표시합니다. 화면 우하단의 독립 `Ad`/`광고` 라벨은 공개 파일의 `ad=true`로, 캡션의 `#협찬`은 `ad=협찬`으로 기록합니다. 둘 다 있으면 명시적 `Ad`를 우선합니다. 신규 릴스마다 작성자 프로필을 열어 공개된 `biography`, `profile_category`, `post_count`, `following_count`, `follower_count`를 읽고, 옵션 메뉴의 `About this account`에서 공개된 `Account based in` 국가를 `account_country`로 저장한 뒤 릴스로 복귀합니다. `About`에서 Back을 눌렀을 때 실제로 옵션 메뉴가 남은 경우에만 한 번 더 Back을 눌러, 릴스가 해시태그 그리드로 빠지는 일을 막습니다.
-
-Android 화면 기반 방식에서는 숫자 `user_id`, 업로드 시각(시간 단위), 영상 길이는 화면에 공개되지 않으면 빈 값으로 둡니다. 릴스의 공유 버튼에서 `Copy link`를 누른 뒤 읽은 Instagram Reel URL은 `url`에 저장합니다. 이 과정은 Android 클립보드 내용을 해당 링크로 바꾸며, Android 이미지가 클립보드 읽기를 허용하지 않으면 URL만 빈 값이고 수집은 계속됩니다. 위치는 현재 Reel UI XML에 `location_name`/`위치:`가 노출되는 경우에만 저장합니다. 캡션 상세에 보이는 게시 날짜는 `uploaded_at`에 `YYYY-MM-DD`로 저장합니다. 예를 들어 `April 28`처럼 연도가 생략되면 수집 연도(2026)를 적용하고, `April 28, 2024`처럼 연도가 표시되면 해당 연도를 그대로 사용합니다. `days_since_upload`는 그 날짜와 한국 시간(KST) 기준 수집 날짜의 달력상 일수 차이입니다. 기존 증빙에 캡션 상세 화면이 없는 과거 행은 이 두 열이 빈 값으로 남고, 새 수집부터 채워집니다. 캡션 본문은 현재 펼치기 전 화면에 보이는 부분만 읽습니다.
+이미 URL이 있는 재수집은 해당 릴스 링크를 열고 두 지표를 읽습니다. 신규 릴스 수집에서 URL이 필요하면 공유 메뉴의 `Copy link`로 확인하며, Android 클립보드에 읽기 권한이 없으면 URL은 빈 값으로 둡니다. 이전 행의 좋아요·조회수·프로필 값은 재수집에서 보존할 수 있지만 Android가 새로 측정한 값은 아닙니다.
 
 이미 만들어진 기존 Android 형식의 `reels.json`이 있더라도 다음 수집 시 자동으로 새 공개 양식으로 변환하고, 기존 Android 원본 필드는 `.collector\android_observations.json`으로 옮겨 보존합니다. 이미 저장된 화면 지문과 같은 릴스는 신규 행으로 추가하지 않습니다.
 

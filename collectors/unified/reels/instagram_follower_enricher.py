@@ -371,6 +371,7 @@ class FollowerEnricher:
         username: Any = "",
         seen_at: str = "",
         enqueue: bool = True,
+        force: bool = False,
     ) -> dict[str, Any] | None:
         await self.ready()
         normalized_id = str(user_id or "").strip()
@@ -383,7 +384,7 @@ class FollowerEnricher:
             return None
         self.tracked.add(str(row["_key"]))
         if enqueue:
-            self._enqueue(row)
+            self._enqueue(row, force=force)
         self._mark_dirty()
         latest = latest_follower_snapshot(row, self.user_fields)
         return {**row, **latest}
@@ -394,13 +395,13 @@ class FollowerEnricher:
         self._mark_dirty()
         return count
 
-    async def enqueue_tracked(self) -> int:
+    async def enqueue_tracked(self, *, force: bool = False) -> int:
         """Queue only users observed from Reels saved during this run."""
         await self.ready()
         count = sum(
             1
             for key in list(self.tracked)
-            if (row := self.users.get(key)) is not None and self._enqueue(row)
+            if (row := self.users.get(key)) is not None and self._enqueue(row, force=force)
         )
         self._mark_dirty()
         return count

@@ -37,7 +37,9 @@ CSV_FIELDS = (
     "view_count",
     "like_count",
     "comment_count",
+    "share_count",
     "repost_count",
+    "saved_count",
     "follower_count",
 )
 REEL_CHANGE_METRICS = (
@@ -489,7 +491,9 @@ class CollectionStore:
             "view_count": _exact_count(raw.get("view_count")),
             "like_count": _exact_count(raw.get("like_count")),
             "comment_count": _exact_count(raw.get("comment_count")),
+            "share_count": _exact_count(raw.get("share_count")),
             "repost_count": _exact_count(raw.get("repost_count")),
+            "saved_count": _exact_count(raw.get("save_count", raw.get("saved_count"))),
             "follower_count": "",
         }
 

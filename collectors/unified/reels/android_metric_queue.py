@@ -31,6 +31,7 @@ def _android_metric_queue_paths(data_dir: Path | str) -> dict[str, Path]:
         "pending": root / "pending",
         "working": root / "working",
         "completed": root / "completed",
+        "recollection_completed": root / "recollection_completed",
         "hashtag_completed": root / "hashtag_completed",
         "worker_starting": root / "worker.starting.json",
         "worker_lock": root / "worker.lock.json",

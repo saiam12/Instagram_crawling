@@ -41,6 +41,7 @@ async def _run_reel_insights(data_root: Path, repo_root: Path) -> None:
     public_root = analysis_path.parent
     environment = os.environ.copy()
     environment["PYTHONUTF8"] = "1"
+    process: asyncio.subprocess.Process | None = None
     try:
         process = await asyncio.create_subprocess_exec(
             _analyzer_python(repo_root),
@@ -55,6 +56,11 @@ async def _run_reel_insights(data_root: Path, repo_root: Path) -> None:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.terminate()
+            await process.communicate()
+        raise
     except OSError as error:
         print(f"[ANALYZER] Reel insights could not start: {error}", file=sys.stderr)
         return
@@ -143,6 +149,7 @@ async def _run_analyzer(
     environment = os.environ.copy()
     environment["GEMINI_OUTPUT_FILE"] = str(output_file)
     environment["PYTHONUTF8"] = "1"
+    process: asyncio.subprocess.Process | None = None
     try:
         process = await asyncio.create_subprocess_exec(
             analyzer_python,
@@ -155,6 +162,11 @@ async def _run_analyzer(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.terminate()
+            await process.communicate()
+        raise
     except OSError as error:
         return url, output_file, 1, str(error)
     detail = (stderr or stdout).decode("utf-8", errors="replace").strip()

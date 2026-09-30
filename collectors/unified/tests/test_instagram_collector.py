@@ -3,10 +3,44 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from exporters.instagram_collector import DataStore, _xlsx_cell, _xlsx_project_rows
+from exporters.instagram_collector import (
+    DataStore, _xlsx_cell, _xlsx_project_rows, read_reel_urls_from_xlsx, write_xlsx_workbook,
+)
 
 
 class XlsxCollectionTimingTests(unittest.TestCase):
+    def test_refresh_urls_use_inclusive_visible_excel_row_numbers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = Path(directory) / "analysis.xlsx"
+            write_xlsx_workbook(workbook, [("reels", [
+                ["url", "title"],
+                ["https://www.instagram.com/reels/first/", "first"],
+                ["https://www.instagram.com/reels/second/", "second"],
+                ["https://www.instagram.com/reels/third/", "third"],
+            ])])
+
+            self.assertEqual(read_reel_urls_from_xlsx(workbook, start_row=3, end_row=4), [
+                "https://www.instagram.com/reels/second/",
+                "https://www.instagram.com/reels/third/",
+            ])
+            self.assertEqual(read_reel_urls_from_xlsx(workbook, start_row=4), [
+                "https://www.instagram.com/reels/third/",
+            ])
+            with self.assertRaisesRegex(ValueError, "end_row"):
+                read_reel_urls_from_xlsx(workbook, start_row=4, end_row=3)
+
+    def test_refresh_urls_accept_a_single_analysis_sheet_with_reel_url_column(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workbook = Path(directory) / "analysis.xlsx"
+            write_xlsx_workbook(workbook, [("analysis", [
+                ["reel_url", "score"],
+                ["https://www.instagram.com/reel/example/", "1"],
+            ])])
+
+            self.assertEqual(read_reel_urls_from_xlsx(workbook), [
+                "https://www.instagram.com/reels/example/",
+            ])
+
     def test_combined_workbook_contains_only_hashtags_reels_and_users_tabs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)

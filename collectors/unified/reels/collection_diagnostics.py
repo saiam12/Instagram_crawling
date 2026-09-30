@@ -6,7 +6,7 @@ import json
 import re
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
@@ -89,6 +89,8 @@ class CollectorDiagnostics:
         self.ui_render_failures = 0
         self.http_429_confirmed = 0
         self.rate_limit_suspected_count = 0
+        self.collection_rounds: Counter[int] = Counter()
+        self.unknown_collection_rounds = 0
         self._media_started_at: float | None = None
         self._media_timestamps: deque[float] = deque()
         self._retry_timestamps: deque[float] = deque()
@@ -215,7 +217,10 @@ class CollectorDiagnostics:
                 pass
             return payload
 
-    def begin_media(self, *, current_url: str = "", shortcode: str = "", username: str = "") -> None:
+    def begin_media(
+        self, *, current_url: str = "", shortcode: str = "", username: str = "",
+        collection_number: int | None = None,
+    ) -> None:
         with self._lock:
             now = time.monotonic()
             self.attempted_media += 1
@@ -230,10 +235,16 @@ class CollectorDiagnostics:
             self._current_stage = ""
             self._stage_started.clear()
             self._ui_status = {key: None for key in self._ui_status}
-            self.update_media(current_url=current_url, shortcode=shortcode, username=username)
+            self.update_media(
+                current_url=current_url, shortcode=shortcode, username=username,
+                collection_number=collection_number,
+            )
             self.emit("MEDIA_START")
 
-    def update_media(self, *, current_url: str = "", shortcode: str = "", username: str = "") -> None:
+    def update_media(
+        self, *, current_url: str = "", shortcode: str = "", username: str = "",
+        collection_number: int | None = None,
+    ) -> None:
         with self._lock:
             if current_url:
                 sanitized = sanitize_url(current_url)
@@ -245,6 +256,8 @@ class CollectorDiagnostics:
                 self._current["shortcode"] = shortcode
             if username:
                 self._current["username"] = username
+            if collection_number is not None and collection_number > 0:
+                self._current["collection_number"] = collection_number
 
     def finish_media(self, result: str, *, success: bool, error: str = "", count_as_failure: bool = True) -> None:
         with self._lock:
@@ -252,6 +265,11 @@ class CollectorDiagnostics:
                 return
             duration = max(0.0, time.monotonic() - self._media_started_at)
             self._media_durations.append(duration)
+            collection_number = self._current.get("collection_number")
+            if isinstance(collection_number, int) and collection_number > 0:
+                self.collection_rounds[collection_number] += 1
+            else:
+                self.unknown_collection_rounds += 1
             if success:
                 self.success_count += 1
                 self._last_successful = {
@@ -428,6 +446,9 @@ class CollectorDiagnostics:
                 rate_limit_suspected_count=self.rate_limit_suspected_count,
                 **stats,
             )
+            rounds = [f"#{number}: {count}" for number, count in sorted(self.collection_rounds.items())]
+            if self.unknown_collection_rounds:
+                rounds.append(f"unknown: {self.unknown_collection_rounds}")
             summary = [
                 "========== COLLECTOR SUMMARY ==========",
                 f"Component: {self.component}",
@@ -437,6 +458,7 @@ class CollectorDiagnostics:
                 f"Attempted media: {self.attempted_media}",
                 f"Successful: {self.success_count}",
                 f"Failed: {self.failed_count}",
+                f"Collection rounds: {', '.join(rounds) or 'none'}",
                 "",
                 f"Average media/min: {stats['media_per_min']}",
                 f"Average success/min: {stats['success_per_min']}",

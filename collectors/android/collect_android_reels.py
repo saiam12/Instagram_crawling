@@ -119,7 +119,7 @@ def _add_android_options(
     target.add_argument(
         "--fast",
         action="store_true",
-        help="Reuse same-run author profiles and keep XML evidence without per-Reel PNG captures.",
+        help="Keep XML evidence without per-Reel PNG captures.",
     )
     target.add_argument(
         "--verbose-progress",
@@ -260,7 +260,6 @@ def collector_options(
         hashtags=tuple(hashtags.values()),
         verbose_progress=options.verbose_progress,
         capture_screenshots=not bool(getattr(options, "fast", False)),
-        reuse_profiles_within_run=bool(getattr(options, "fast", False)),
         diagnostics=diagnostics,
     )
 
@@ -369,6 +368,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Android Reel snapshots {action}: {stored}")
     finally:
         diagnostics.finish(status, error=failure)
+        if options.command == "fashion-beauty":
+            stems = ("reels",) if options.base_output else ("fashion_reels", "beauty_reels")
+        elif options.command in {"fashion", "beauty"}:
+            stems = ("reels",) if options.base_output else (f"{options.command}_reels",)
+        else:
+            stems = (options.reel_stem,)
+        for stem in stems:
+            outputs = [options.data_dir.resolve() / f"{stem}.{extension}" for extension in ("xlsx", "csv", "json")]
+            saved_paths = [str(path) for path in outputs if path.exists()]
+            if saved_paths:
+                print("최종 릴스 저장 위치: " + ", ".join(saved_paths))
     return exit_code
 
 

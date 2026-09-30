@@ -75,11 +75,12 @@ python -m venv .venv
 .\collector.ps1 xlsx
 ```
 
-각 Reel은 먼저 브라우저 상세 페이지에서 URL·작성자·캡션·해시태그·위치·광고 여부·업로드일·영상 길이와 `repost_count`를 수집해 내부 이력에 저장합니다. 영상 길이는 Python 웹 응답을 우선하고, 없으면 현재 릴스의 HTML5 `video.duration`으로 수집합니다. URL은 영속 Android 작업 큐에 즉시 넣고 Python은 다음 Reel·다음 해시태그 작업으로 계속 진행합니다. 별도 Android 워커가 같은 URL을 열어 아래 Android 전용 필드만 같은 행에 나중에 보강합니다.
+각 Reel은 먼저 브라우저 상세 페이지에서 URL·작성자·캡션·해시태그·위치·광고 여부·업로드일·영상 길이와 지표를 수집해 내부 이력에 저장합니다. 영상 길이는 Python 웹 응답을 우선하고, 없으면 현재 릴스의 HTML5 `video.duration`으로 수집합니다. URL은 영속 Android 작업 큐에 즉시 넣고 Python은 다음 Reel·다음 해시태그 작업으로 계속 진행합니다. 별도 Android 워커가 같은 URL을 열어 화면에 표시된 수치를 같은 행에 나중에 반영합니다.
 
-- `like_count`, `view_count`(play), `comment_count`, `share_count`, `saved_count`, `audio_name`
+- 웹: `view_count`(play), `like_count`, `comment_count`, `repost_count`, `follower_count`
+- Android: `like_count`, `share_count`, `repost_count`, `saved_count` (같은 지표는 Android 값 우선)
 
-좋아요·조회수는 `Likes and plays` 패널에 완전한 정수가 있으면 그 값을 우선합니다. 댓글 수가 화면에 없을 때 댓글 시트가 `No comments yet`이면 `0`으로 저장하며, 비활성화된 댓글은 빈 값으로 남깁니다. 앱에 `10K`·`1.2M`처럼 축약 표기만 있는 필드는 K=1,000, M=1,000,000 기준의 표시 환산값이며, 원래의 정확한 정수라고 주장하지 않습니다. 좋아요가 비공개면 `like_count`는 `X`입니다.
+Android는 좋아요·조회수 상세 패널을 열지 않고 Reel 화면의 좋아요·공유·재게시·저장 수를 읽습니다. 화면에 공유·재게시·저장 아이콘만 있고 숫자가 없으면 `0`으로 기록합니다. 좋아요 숫자가 없으면 웹 값을 유지하고, 비공개로 명시된 좋아요는 `X`입니다. 앱에 `10K`·`1.2M`처럼 축약 표기만 있는 필드는 K=1,000, M=1,000,000 기준의 표시 환산값이며, 원래의 정확한 정수라고 주장하지 않습니다.
 
 Android Studio 에뮬레이터를 켜고 Instagram 앱에 로그인한 상태에서 실행하세요. **시작 화면은 홈·검색·릴스 어느 곳이어도 됩니다.** 수집기가 저장된 Reel URL을 직접 열어 자동 이동합니다. 다만 에뮬레이터 화면 잠금을 해제하고, Instagram의 로그인·권한 요청·오류 팝업을 먼저 닫아 두어야 합니다. Android 보강은 기본 활성화되어 있고 앱이 잠시 사용 불가해도 웹 행은 유지됩니다. 기본 모드에서는 데이터셋마다 하나의 영속 큐 워커만 실행되어 Python 종료 뒤에도 남은 URL을 이어 처리하고 `reels.xlsx`를 갱신합니다. Android 워커는 Reel 250개마다 완료 결과를 먼저 저장한 뒤 에뮬레이터 게스트를 재부팅하며 사용자 데이터와 Instagram 로그인은 삭제하지 않습니다. 재부팅 중에는 다음 작업을 pending에 둔 채 부팅 완료를 30초마다 확인하고, 준비되면 남은 큐를 계속 처리합니다. 실제 휴대폰은 자동 재부팅하지 않습니다. ADB 장치가 `offline`·`unauthorized`·`not found`·`error: closed` 상태가 되거나 명령이 타임아웃되면 Reel과 Tags 작업을 큐에 되돌리고, 내부 ADB 드라이버를 새로 만든 뒤 30초마다 실제 연결을 다시 검사합니다. 이 경우를 Reel 수집 5회 연속 실패로 계산하지 않습니다. 일반 UI 인식 실패가 5개 Reel에서 연속 발생해도 Python 수집을 강제 종료하지 않고 Android 워커만 30초 쉬었다가 남은 큐를 계속 처리합니다. 앱 지표가 반드시 필요할 때는 `--android-metrics-required`를 사용하면 이전처럼 현재 명령이 Android 완료를 기다립니다. 브라우저만 쓰려면 `--no-android-metrics`를 붙입니다.
 
@@ -93,7 +94,8 @@ UIAutomator가 연속 두 번 빈 화면을 반환하면 남은 대기를 즉시
 
 CTA가 없는 일반 Reel에서도 접근성 XML이 비면 잔류 UIAutomator를 정리하고 Instagram 앱만 강제 종료한 뒤 같은 URL을 다시 엽니다. 최종 실패 후에도 이 정리를 수행하므로 한 Reel의 UI 계층 고착이 다음 큐 항목으로 이어지지 않으며 Android 에뮬레이터 자체는 종료하지 않습니다.
 
-분리 Android 워커의 결과도 실행 중인 PowerShell에 `[ANDROID] collected | URL | view_count=...` 형식으로 즉시 출력합니다. 명령 실행 전에 이미 다른 터미널에서 워커가 처리 중이면 현재 수집기도 공용 `android.log`의 새 이벤트를 따라가서 표시합니다. 같은 내용의 상세 이벤트는 기존처럼 `.collector\android.log`에도 계속 기록됩니다.
+`collect`, `refresh`, `fashion`, `beauty`, `fashion-beauty`의 하이브리드 수집은 Android 워커의 시작·재시도·기기 대기 로그와 릴스별 지표 결과를 Python 로그와 같은 PowerShell 터미널에 출력합니다. `--android-metrics-required`로 Android를 같은 프로세스에서 실행할 때도 동일합니다. `android-worker`는 자신의 로그를 같은 터미널에 출력하고, `hashtag-posts`는 Android·Python 진행 상황과 저장 이벤트를 같은 터미널에 출력합니다. Android 전용 수집도 실행 프로세스가 진행 상황을 직접 출력합니다. 이미 다른 터미널에서 분리 워커가 처리 중이면 현재 수집기도 공용 `android.log`의 새 이벤트를 따라가서 표시합니다. 로그 파일 기록도 유지됩니다.
+웹·Android가 모두 수집한 좋아요·재게시 수가 달라도 Android 화면의 값으로 갱신합니다. Android가 읽지 않는 조회수·댓글 수에 예상 밖의 값이 들어오면 `android_mismatch` 열에 기록합니다.
 
 Android 워커는 Reel 화면이 열린 직후 화면 중앙을 한 번 탭해 영상을 일시정지한 다음 지표 패널과 UI 계층을 읽습니다. Windows QEMU에서 영상 디코딩과 UIAutomator 검사가 겹치는 시간을 줄이기 위한 동작입니다. 마지막 작업 뒤 큐가 비어도 이미 일시정지한 영상을 다시 탭해 재생하지 않습니다.
 
@@ -115,7 +117,8 @@ Android 워커는 Reel 화면이 열린 직후 화면 중앙을 한 번 탭해 �
 
 `hashtag-posts`는 Android가 검색어 하나의 **Tags** 목록을 끝까지 수집하면, 다음 검색어로 넘어가기 전에 그 관련 태그들을 웹에서 하나씩 정확 일치 검색해 `media_count`를 보완합니다. 웹에 없는 태그는 Android의 축약 게시물 수를 유지하며, 이미 확인한 태그는 같은 실행 안에서 다시 웹 검색하지 않습니다. 결과는 `data_web\hashtags.csv`, `hashtags.json`, `hashtags.xlsx`에 누적됩니다.
 
-해시태그 수집은 각 해시태그의 Reel URL 후보를 찾은 뒤 검사합니다. 카드가 늦게 로드되는 태그를 위해 초기 로딩과 스크롤 재시도를 늘렸고, 기본적으로 태그별 최대 50개 후보를 검사합니다. 더 넓게 찾으려면 `--hashtag-candidates-per-keyword 100`처럼 지정할 수 있습니다.
+해시태그 수집은 검색 화면에서 보이는 Reel 카드를 발견하는 즉시 팝업으로 열어 수집하고 닫은 뒤 다음 카드를 검사합니다. 카드가 늦게 로드되는 태그를 위해 초기 로딩과 스크롤 재시도를 늘렸고, 기본적으로 태그별 최대 50개 카드를 검사합니다. 더 넓게 찾으려면 `--hashtag-candidates-per-keyword 100`처럼 지정할 수 있습니다.
+팝업을 열 수 없으면 해당 카드의 실패를 기록하고, 검색 화면으로 돌아올 수 없으면 수집을 중단합니다.
 
 해시태그 `media_count` 수집은 기본적으로 실행하지 않습니다. 필요한 경우에만 `--collect-hashtag-media-count`를 붙이면 현재 키워드의 Android Instagram **Tags** 결과를 끝까지 스크롤하고 `data_web\hashtags.csv`, `hashtags.json`, `hashtags.xlsx`에 누적합니다. Tags 작업이 끝나면 추가 유휴 해시태그 작업을 만들지 않고 Reel 지표 큐를 우선 처리합니다. 이 옵션이 없으면 Tags 검색을 시작하지 않고 Reel 후보 처리로 바로 넘어갑니다. Android에 여러 에뮬레이터가 실행 중이면 `--android-device-id`가 필요합니다.
 
@@ -144,7 +147,7 @@ data_web/
 
 브라우저 수집기는 Instagram 페이지가 스스로 발생시킨 Playwright 응답만 수동 관찰합니다. request body, cookie, authorization/session token은 기록하지 않고 URL query도 제거합니다. 실제 응답 status가 429일 때만 `HTTP_429_CONFIRMED`를 기록합니다. 문서·Fetch·XHR 응답과 오류 응답의 host, path, status, resource type, 확인 가능한 duration은 최초 제한 snapshot에 최근 50건까지 함께 저장됩니다.
 
-웹 Reel 탐색 시작은 60초당 최대 12개로 제한됩니다. HTTP 429가 확인되면 브라우저와 프로그램을 열린 상태로 유지하고 전체 수집을 일시정지합니다. 신규 탐색, 프로필 조회, 예약 재수집과 연결된 Android 워커의 조작도 함께 대기합니다. 후속조치를 마친 뒤 실행 터미널에 `resume`을 입력하고 Enter를 눌러야 한 번 재개합니다. 재개 후 다시 429가 발생하면 추가 대기 없이 해당 실행을 종료하고, 그 시점까지 저장된 행만 남겨 `refresh`로 재수집할 수 있게 합니다. 이미 전송된 요청과 Instagram 앱 자체의 백그라운드 통신까지 되돌리거나 중단하는 기능은 아닙니다.
+웹 Reel 탐색 시작은 60초당 최대 20개로 제한됩니다. HTTP 429가 확인되면 브라우저와 프로그램을 열린 상태로 유지하고 전체 수집을 일시정지합니다. 신규 탐색, 프로필 조회, 예약 재수집과 연결된 Android 워커의 조작도 함께 대기합니다. 후속조치를 마친 뒤 실행 터미널에 `resume`을 입력하고 Enter를 눌러야 한 번 재개합니다. 재개 후 다시 429가 발생하면 추가 대기 없이 해당 실행을 종료하고, 그 시점까지 저장된 행만 남겨 `refresh`로 재수집할 수 있게 합니다. 이미 전송된 요청과 Instagram 앱 자체의 백그라운드 통신까지 되돌리거나 중단하는 기능은 아닙니다.
 
 Android worker는 ADB/UIAutomator로 앱 화면만 읽기 때문에 `NETWORK_STATUS_UNAVAILABLE`을 기록합니다. 앱 화면에서 `429`, `Too Many Requests`, `rate limit`, `throttled`, `Please wait a few minutes`, `Try again later`, `잠시 후 다시` 등의 문구를 발견하면 HTTP status로 단정하지 않고 `RATE_LIMIT_SUSPECTED`로 기록합니다.
 
@@ -158,11 +161,11 @@ Get-Content .\data_web\diagnostics\rate_limit_*.json
 
 `beauty` 실행은 위 경로의 `fashion`을 `beauty`로 바꿔 확인합니다. `UIAutomator returned an empty or unreadable screen` 또는 `ADB command timed out`가 반복되면 에뮬레이터 잠금, Instagram 팝업, 앱 로그인 상태와 ADB 연결을 확인합니다.
 
-웹 수집 단계는 각 Reel 상세 페이지의 embedded JSON·완전한 DOM 정수·작성자 프로필을 이용해 가능한 필드를 먼저 모두 수집합니다. Python이 얻은 완전한 정수와 문자열은 그대로 유지하며, `view_count`, `like_count`, `comment_count`, `share_count`, `saved_count`, `audio_name` 중 값이 없거나 `1.2K`·`3만` 같은 축약 표시뿐인 필드만 Android 결과로 보강합니다. `repost_count`는 Python이 담당하며 Android가 덮어쓰지 않습니다. Android 보강이 켜진 경우에는 웹 응답의 `play_count` 누락만으로 릴스를 버리지 않습니다. 양쪽 모두 값을 노출하지 않으면 `0`으로 추정하지 않고 빈 값으로 둡니다. `--no-android-metrics` 브라우저 전용 모드에서는 기존처럼 정확한 웹 지표가 없는 후보를 저장하지 않습니다.
+웹 수집 단계는 각 Reel 상세 페이지의 embedded JSON·완전한 DOM 정수·작성자 프로필을 이용해 가능한 필드를 먼저 모두 수집합니다. Android 보강은 Reel 링크를 열어 화면에 보이는 좋아요·공유·재게시·저장 수를 읽고, 겹치는 좋아요·재게시 수는 Android 값으로 덮어씁니다. 조회수·댓글 수·팔로워 수는 웹 수집 또는 작성자 프로필 방문 결과를 사용합니다. 웹 응답의 `play_count` 누락만으로 릴스를 버리지 않으며, 수치가 끝내 보이지 않으면 `0`으로 추정하지 않고 빈 값으로 둡니다. `--no-android-metrics` 브라우저 전용 모드에서도 팔로워 수집이 예정된 경우 조회수·팔로워가 비어 있는 현재 행을 먼저 저장하고 프로필 방문에서 보완합니다. 다른 필수 웹 지표의 저장 조건은 유지합니다.
 
-작성자 팔로워 수와 프로필 정보는 Python 웹 프로필 수집기가 담당합니다. Android 보강은 사용자 프로필을 읽거나 웹의 URL·캡션·해시태그·위치·업로드일을 덮어쓰지 않습니다. Instagram이 리포스트·공유·저장 집계를 표시하지 않으면 `0`으로 추정하지 않고 빈 값으로 둡니다.
+작성자 팔로워 수와 프로필 정보는 Python 웹 프로필 수집기가 담당합니다. Android 보강은 사용자 프로필을 읽거나 웹의 URL·캡션·해시태그·위치·업로드일을 덮어쓰지 않습니다.
 
-일반 로그인 신규 Reel 수집은 저장 조건을 통과한 릴스를 먼저 보존한 뒤, 현재 Reel의 작성자 프로필 링크(프로필 사진 또는 작성자 제목)를 클릭합니다. 캡션의 계정 태그는 클릭 후보에서 제외합니다. 이동한 프로필 URL과 응답의 user ID가 작성자와 일치할 때 기존 정확값 판독기로 팔로워 수 및 users 정보를 저장하고 다음 릴스로 진행합니다. 같은 실행에서 검증한 동일 ID·username의 프로필 결과는 재사용합니다. 프로필 확인이 실패해도 저장한 Reel과 Android 작업은 유지됩니다. 프로필 응답에서 ID를 검증할 수 없는 경우에도 추정값을 쓰지 않습니다. 패션·뷰티 예약 수집은 5개 해시태그 묶음의 Reel 수집을 먼저 마친 뒤, 그 묶음에서 저장한 Reel 작성자를 중복 제거해 팔로워 수를 수집하고 결과를 저장한 다음 다음 해시태그 묶음으로 넘어갑니다.
+해시태그가 아닌 일반 로그인 신규 Reel 수집은 저장 조건을 통과한 릴스를 먼저 보존한 뒤, 현재 Reel의 작성자 프로필 링크(프로필 사진 또는 작성자 제목)를 클릭합니다. 캡션의 계정 태그는 클릭 후보에서 제외합니다. 이동한 프로필 URL과 응답의 user ID가 작성자와 일치할 때 기존 정확값 판독기로 팔로워 수 및 users 정보를 저장하고 다음 릴스로 진행합니다. 같은 실행에서 검증한 동일 ID·username의 프로필 결과는 재사용합니다. 프로필 확인이 실패해도 저장한 Reel과 Android 작업은 유지됩니다. 프로필 응답에서 ID를 검증할 수 없는 경우에도 추정값을 쓰지 않습니다. 해시태그 수집은 해시태그 하나의 Reel 수집을 마칠 때마다 그 해시태그에서 저장한 Reel 작성자를 중복 제거해 팔로워 수를 수집하고 결과를 저장한 뒤 다음 해시태그로 넘어갑니다.
 
 실패한 프로필 조회는 데이터셋의 `.collector/author_profile_pending.json`에 원본 Reel URL, 실패 이유, 시도 횟수와 재시도 시각을 저장합니다. 다음 신규 수집 호출 시작 시 도래한 작업을 최대 5건 재시도합니다. 일반 실패는 60초 이후 다시 시도하며 3회 실패하면 `needs_review`로 남깁니다. 429 uses the manual pause described above; enter `resume` to continue. 이 파일은 프로그램 재시작 후에도 유지되며 독립적인 예약 워커는 아닙니다. 기존에 잘못 저장된 행 전체를 자동 복구하는 기능은 아닙니다. +4시간 URL 재수집과 `followers` 명령은 기존 users 조회 경로를 유지합니다.
 터미널의 릴스 진행 표시는 실제로 저장된 릴스만 `[현재 저장 수/목표] URL` 형식으로 카운트합니다.
@@ -289,6 +292,11 @@ Reel 파일은 최초 수집과 재수집을 각각 별도 행으로 추가하�
 이번 실행에서 최초 수집한 Reel을 `+4시간` 간격으로 재수집합니다. Ctrl+C를 한 번 누르면 실행을 중단하고
 마지막 체크포인트까지 저장된 출력을 보존합니다.
 
+`fashion`·`beauty`의 hybrid 예약 재수집은 저장된 Reel의 제목·해시태그·오디오 등 정적 정보를 재사용합니다.
+웹은 조회수와 작성자 팔로워 수를 읽고, Android는 릴스 화면의 `content-desc`에서 좋아요·댓글·공유·재게시·저장 수를 읽습니다.
+Android에 축약형만 표시된 좋아요·댓글·재게시 수는 실행 중인 웹에서 해당 지표만 다시 읽습니다. 공유·저장 수는 웹에서 다시 읽지 않고 Android 표시 환산값을 유지합니다.
+Android 작업이 끝나기 전에는 새 행의 해당 수치가 빈 값으로 표시됩니다.
+
 일시적 수집 오류로 예약 작업이 실패하면 같은 요청을 즉시 반복하지 않고 `5분`, `10분`, `20분`, `30분`
 순서로 대기합니다. 같은 작업이 한 실행에서 5회 연속 실패하면 남은 실행 동안 재시도를 보류합니다.
 실행 중 Instagram `429`가 감지되면 예약 재수집도 전체 일시정지에 포함됩니다.
@@ -305,16 +313,37 @@ Reel 파일은 최초 수집과 재수집을 각각 별도 행으로 추가하�
 
 ## 기존 데이터 정확값 재수집
 
-기존 `reels.xlsx`의 모든 릴스를 로그인 세션으로 다시 조회하면 새 `2nd collect_*` 등의 열에 정확한 최신 정수가 기록됩니다. 기존 축약값은 원래 자릿수를 역산할 수 없으므로 재수집해야 합니다.
+기존 `reels.xlsx`의 모든 릴스를 로그인 세션으로 다시 조회하면 새 `2nd collect_*` 등의 열에 최신 수치가 기록됩니다. 같은 데이터 폴더의 내부 이력에 요청한 릴스 URL이 모두 있고 Android 보강이 켜져 있으면 위 Android 우선 재수집 방식을 사용합니다. 공유·저장의 Android 축약형은 표시 환산값이므로 정확한 원래 정수가 아닙니다.
 
 ```powershell
 .\collector.ps1 refresh --background
 .\collector.ps1 followers
 ```
 
-`--followers-after-reels`는 신규 Reel 수집 중 작성자를 기록해 두었다가 Reel 탐색이 끝난 뒤 중복 제거하여 일괄 조회합니다. 패션·뷰티 예약 수집은 이 옵션을 사용하므로 기본 5개 해시태그 묶음마다 실행됩니다. URL 재수집에서는 기존 의미를 유지합니다.
+특정 Excel 분석 파일의 행만 재수집하려면 `refresh.ps1`을 사용합니다. `-StartRow`와 `-EndRow`는
+헤더 행을 포함한 Excel 화면의 행 번호이며 양 끝을 포함합니다. 선택된 행의 `url` 또는
+`reel_url` 열에서 릴스 URL을 읽고, 중복 URL은 한 번만 재수집합니다. 범위를 생략하면 파일의
+모든 릴스 URL을 사용합니다.
+
+```powershell
+.\refresh.ps1 -InputXlsx .\analysis.xlsx -StartRow 10 -EndRow 13 -DataDir .\data_web -Background
+```
+
+이 스크립트는 기존 `collector.ps1 refresh`의 웹·Android 재수집 경로를 호출합니다.
+기존 수집 회차와 정적 정보를 이어 쓰려면 `-DataDir`을 해당 릴스의 내부 수집 이력이 있는
+폴더로 지정해야 합니다. URL만 담긴 외부 Excel 파일은 최초 수집 이력을 자동으로 가져오지 않습니다.
+
+해시태그 수집은 작성자를 기록해 두었다가 해시태그 하나가 끝날 때마다 중복 제거하여 팔로워와 `play_count`를 조회합니다. `--followers-after-reels`는 그 외 신규 Reel 수집의 프로필 조회를 Reel 탐색이 끝난 뒤로 미룹니다. URL 재수집에서는 기존 의미를 유지합니다.
 `--direct-concurrency`도 기존 명령 호환을 위해 허용하지만, 정확한 shortcode 연결을 위해 실제 재수집 동시성은 1로 고정됩니다.
 `--hashtag-query`, `--urls-file`, `--followers-only`, `--max-upload-age-days`, `--page-recycle-items`, `--checkpoint-items` 등의 옵션도 사용할 수 있습니다. `--direct-reel-info-wait-seconds`와 정확 지표 재시도 옵션은 이전 수집기 호환을 위해 남아 있지만 기본 수집 경로에서는 별도 endpoint를 호출하지 않습니다.
+
+## 팔로워 수집과 play_count 보완
+
+릴스 탐색에서는 작성자·shortcode와 확보된 지표를 먼저 저장합니다. 팔로워 수집 단계에서 같은 브라우저로 `/username/`의 팔로워를 읽고, 그 페이지에 대상 릴스의 정확한 `play_count`가 있으면 바로 사용합니다. 없으면 `/username/reels/`로 이동해 미수집 조회수를 읽습니다. 프로필 페이지가 자연스럽게 받은 응답과 내부 JSON의 `play_count`만 사용하며 별도 API 호출은 없습니다. `/username/p/shortcode/` 상세 경로에서는 검증한 릴스의 `play_count`가 제공되지 않았습니다.
+
+패션·뷰티는 해시태그마다 작성자를 중복 제거한 후 팔로워와 조회수를 수집합니다. 일반 순차 수집은 작성자 프로필 방문 때 보완합니다. 같은 작성자의 대상 shortcode를 한 번에 조회하며, 최초 목록에 없으면 기존 릴스 목록 스크롤 범위 내에서 탐색합니다. 다른 릴스들이 정상 로드됐는데 대상이 없으면 동일한 전체 스크롤을 반복하지 않습니다. 릴스마다 별도 비로그인 컨텍스트를 만드는 방식은 사용하지 않습니다.
+
+조회수는 해당 실행에서 저장한 URL·수집 시각이 일치하는 행의 빈 `view_count`에 채웁니다. 이전 수집 회차나 이미 확보한 정확값은 덮어쓰지 않으며, 찾지 못하면 빈칸으로 둡니다. Android 보강은 좋아요·공유·재게시·저장 수에 적용됩니다. 팔로워가 최근에 수집된 사용자라도 새 릴스의 조회수가 필요하면 프로필 작업을 다시 수행합니다.
 
 ## 로그인 없이 기존 릴스 재수집
 

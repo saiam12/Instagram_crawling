@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -17,6 +18,8 @@ from scripts.instagram_reels_python import main as launcher_main, parse_fashion_
 
 from reels.fashion_beauty_collection import (
     SupervisorLock,
+    _atomic_write_xlsx,
+    _write_json_atomic,
     _due_retry_delay,
     active_keyword_window_index,
     datasets,
@@ -24,6 +27,7 @@ from reels.fashion_beauty_collection import (
     invoke_generic_collector,
     invoke_generic_recollection_batches,
     publish_dataset_outputs,
+    read_history,
     run_fashion_beauty_collection,
 )
 
@@ -58,12 +62,38 @@ def read_xlsx_rows(path: Path) -> list[list[str]]:
     ]
 
 
+class AtomicJsonTests(unittest.TestCase):
+    def test_retries_transient_windows_permission_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "fashion_collector_status.json"
+            destination.write_text('{"state":"old"}', encoding="utf-8")
+            original_replace = os.replace
+            attempts = 0
+
+            def replace(source: Path, target: Path) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("temporary file lock")
+                original_replace(source, target)
+
+            with patch("reels.fashion_beauty_collection.os.replace", side_effect=replace), patch(
+                "reels.fashion_beauty_collection.time.sleep"
+            ) as sleep:
+                _write_json_atomic(destination, {"state": "completed"})
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {"state": "completed"})
+
+
 class CommandTests(unittest.TestCase):
     def test_scheduled_commands_select_their_requested_domains(self) -> None:
         config = parse_fashion_command([])
 
         self.assertEqual(config.domains, ("fashion",))
         self.assertEqual(config.duration_hours, 16)
+        self.assertEqual(config.target_snapshots, 4)
         self.assertEqual(config.discovery_hours, 4)
         self.assertEqual(config.new_items_per_window, 300)
         self.assertEqual(config.max_new_items_per_window, 300)
@@ -85,6 +115,12 @@ class CommandTests(unittest.TestCase):
             100,
         )
 
+    def test_scheduled_run_can_resume_its_original_start_time(self) -> None:
+        resumed = parse_scheduled_command("fashion", ["--resume-started-at", "2026-09-25T05:00:52Z"])
+        self.assertEqual(resumed.resume_started_at, datetime(2026, 9, 25, 5, 0, 52, tzinfo=timezone.utc))
+        with self.assertRaises(SystemExit):
+            parse_scheduled_command("fashion", ["--resume-started-at", "2026-09-25T05:00:52"])
+
     def test_test_single_hashtag_keeps_only_one_keyword_without_changing_normal_defaults(self) -> None:
         config = parse_scheduled_command("fashion", ["--test-single-hashtag"])
 
@@ -98,6 +134,14 @@ class CommandTests(unittest.TestCase):
             12,
         )
 
+    def test_three_snapshots_allow_a_thirteen_hour_run(self) -> None:
+        config = parse_fashion_command([
+            "--duration-hours", "13", "--target-snapshots", "3", "--discovery-hours", "4",
+        ])
+        self.assertEqual((config.duration_hours, config.target_snapshots, config.discovery_hours), (13, 3, 4))
+        with self.assertRaises(SystemExit):
+            parse_fashion_command(["--duration-hours", "13", "--discovery-hours", "4"])
+
     def test_discovery_cannot_exceed_duration_minus_twelve_hours(self) -> None:
         self.assertEqual(
             parse_fashion_command(["--duration-hours", "24", "--discovery-hours", "12"]).discovery_hours,
@@ -107,6 +151,16 @@ class CommandTests(unittest.TestCase):
             parse_fashion_command(["--duration-hours", "24", "--discovery-hours", "13"])
         with self.assertRaises(SystemExit):
             parse_fashion_command(["--duration-hours", "12"])
+
+    def test_three_minute_recollection_option_allows_a_short_test_run(self) -> None:
+        config = parse_fashion_command([
+            "--recollection-interval-minutes", "3",
+            "--duration-hours", "0.25",
+            "--discovery-hours", "0.1",
+        ])
+        self.assertEqual(config.recollection_interval_minutes, 3)
+        self.assertEqual(config.discovery_hours, 0.1)
+        self.assertEqual(parse_fashion_command([]).recollection_interval_minutes, 240)
 
     def test_six_hour_new_only_preset_uses_shared_standard_outputs(self) -> None:
         config = parse_scheduled_command("fashion-beauty", ["--six-hour-new-only"])
@@ -217,6 +271,46 @@ class SchedulerTests(unittest.TestCase):
         jobs = due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + RECOLLECTION_INTERVAL * len(SNAPSHOT_OFFSETS))
         self.assertEqual(jobs, [])
 
+    def test_configured_schedule_stops_after_three_total_snapshots(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        dataset = DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS)
+        rows = [
+            {"url": "https://www.instagram.com/reels/a/", "collection_number": index + 1,
+             "collected_at": isoformat_utc(base + RECOLLECTION_INTERVAL * index)}
+            for index in range(3)
+        ]
+        self.assertEqual(due_jobs(dataset, rows, base + RECOLLECTION_INTERVAL * 3, target_snapshots=3), [])
+        self.assertEqual(len(due_jobs(dataset, rows[:2], base + RECOLLECTION_INTERVAL * 2,
+                                      target_snapshots=3)), 1)
+
+    def test_three_minute_interval_recollects_three_times_from_first_snapshot(self) -> None:
+        base = datetime(2026, 9, 25, tzinfo=timezone.utc)
+        dataset = DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS)
+        rows = []
+        for index in range(4):
+            if index:
+                jobs = due_jobs(dataset, rows, base + timedelta(minutes=3 * index), timedelta(minutes=3))
+                self.assertEqual([job.due_at for job in jobs], [base + timedelta(minutes=3 * index)])
+            rows.append({"url": "https://www.instagram.com/reels/a/", "collection_number": index + 1,
+                         "collected_at": isoformat_utc(base + timedelta(minutes=3 * index))})
+        self.assertEqual(due_jobs(dataset, rows, base + timedelta(minutes=12), timedelta(minutes=3)), [])
+
+    def test_fashion_run_only_recollects_reels_first_collected_in_that_run(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        dataset = DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS)
+        rows = [
+            {"url": "https://www.instagram.com/reels/older/", "collection_number": 1,
+             "collected_at": isoformat_utc(started - timedelta(hours=1))},
+            {"url": "https://www.instagram.com/reels/current/", "collection_number": 1,
+             "collected_at": isoformat_utc(started)},
+            {"url": "https://www.instagram.com/reels/no-initial/", "collection_number": 2,
+             "collected_at": isoformat_utc(started)},
+        ]
+
+        jobs = due_jobs(dataset, rows, started + RECOLLECTION_INTERVAL, first_collected_at=started)
+
+        self.assertEqual([job.url for job in jobs], ["https://www.instagram.com/reels/current/"])
+
     def test_windows_alternate_and_each_keyword_set_has_48_entries(self) -> None:
         base = datetime(2026, 8, 26, tzinfo=timezone.utc)
         self.assertEqual(window_dataset(base, base), "fashion")
@@ -313,6 +407,227 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             writer.writeheader()
             writer.writerows(rows)
         return destination
+
+    async def test_foreground_browser_stays_open_only_for_nearby_recollections(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        first_url = "https://www.instagram.com/reels/first/"
+        second_url = "https://www.instagram.com/reels/second/"
+        config = replace(
+            self.config, domains=("fashion",), resume_started_at=started,
+            discovery_hours=0, recollection_interval_minutes=10,
+        )
+
+        for gap_minutes in (4, 6):
+            with self.subTest(gap_minutes=gap_minutes):
+                history = self.write_history("fashion", [
+                    {"url": first_url, "collection_number": 1, "collected_at": isoformat_utc(started)},
+                    {"url": second_url, "collection_number": 1,
+                     "collected_at": isoformat_utc(started + timedelta(minutes=gap_minutes))},
+                ])
+                clock = ManualClock(started + timedelta(minutes=10))
+                events: list[str] = []
+                collected_at: dict[str, datetime] = {}
+
+                class FakeSession:
+                    def __init__(self) -> None:
+                        self.context: object | None = None
+
+                    async def run(self, options: object, stop_event: asyncio.Event) -> list[int]:
+                        if self.context is None:
+                            self.context = object()
+                            events.append("open")
+                        urls = options[0].urls_file.read_text(encoding="utf-8").splitlines()
+                        for url in urls:
+                            label = "first" if url == first_url else "second"
+                            events.append(label)
+                            collected_at[label] = clock()
+                            with history.open("a", newline="", encoding="utf-8") as file:
+                                csv.writer(file).writerow([url, 2, isoformat_utc(clock())])
+                            if url == second_url:
+                                stop_event.set()
+                        return [0]
+
+                    async def close(self) -> None:
+                        if self.context is not None:
+                            events.append("close")
+                            self.context = None
+
+                async def fake_wait(_event: object, seconds: float) -> bool:
+                    clock.advance(seconds)
+                    return False
+
+                with (
+                    patch("reels.fashion_beauty_collection.RecollectionBrowserSession", new=FakeSession),
+                    patch("reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait),
+                ):
+                    await run_fashion_beauty_collection(config, clock=clock)
+
+                self.assertEqual(collected_at["second"], started + timedelta(minutes=10 + gap_minutes))
+                self.assertEqual(
+                    events,
+                    ["open", "first", "second", "close"] if gap_minutes == 4
+                    else ["open", "first", "close", "open", "second", "close"],
+                )
+
+    def test_archived_and_pending_rows_keep_their_four_hour_recollection_times(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        archived = {"url": "https://www.instagram.com/reels/early/", "collection_number": 1,
+                    "collected_at": isoformat_utc(started + timedelta(minutes=5))}
+        active = {"url": "https://www.instagram.com/reels/later/", "collection_number": 1,
+                  "collected_at": isoformat_utc(started + timedelta(minutes=57))}
+        journal_row = {"url": "https://www.instagram.com/reels/latest/",
+                       "collected_at": isoformat_utc(started + timedelta(hours=3))}
+        history = self.write_history("fashion", [active])
+        archive = history.with_name("reels_history_active_legacy_20260925T060053Z.csv")
+        with archive.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+            writer.writeheader()
+            writer.writerows([archived, active])
+        Path(f"{history}.pending.jsonl").write_text(json.dumps(journal_row) + "\n", encoding="utf-8")
+
+        rows = read_history(datasets(replace(self.config, domains=("fashion",)))[0])
+        self.assertEqual(len(rows), 3)
+        due = due_jobs(DatasetConfig("fashion", history.parent.parent, ()), rows,
+                       started + timedelta(hours=4, minutes=6))
+        self.assertEqual([job.url for job in due], [archived["url"]])
+
+    async def test_resumed_run_collects_an_overdue_archived_reel(self) -> None:
+        original_start = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        config = replace(self.config, resume_started_at=original_start, duration_hours=16,
+                         discovery_hours=4, domains=("fashion",))
+        history = self.write_history("fashion", [])
+        archive = history.with_name("reels_history_active_legacy_20260925T060053Z.csv")
+        with archive.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+            writer.writeheader()
+            writer.writerow({"url": "https://www.instagram.com/reels/early/", "collection_number": 1,
+                             "collected_at": isoformat_utc(original_start + timedelta(minutes=5))})
+        clock = ManualClock(original_start + timedelta(hours=4, minutes=6))
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            clock.current = original_start + timedelta(hours=16)
+            return 0
+
+        await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([(call["mode"], call["urls"]) for call in calls],
+                         [("recollect", ["https://www.instagram.com/reels/early/"])])
+
+    async def test_fashion_run_skips_previous_runs_due_recollections(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        config = replace(self.config, domains=("fashion",), duration_hours=16, discovery_hours=4,
+                         new_items_per_window=1, max_new_items_per_window=1)
+        history = self.write_history("fashion", [
+            {"url": "https://www.instagram.com/reels/older/", "collection_number": 1,
+             "collected_at": isoformat_utc(started - timedelta(hours=1))},
+        ])
+        clock = ManualClock(started)
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if kwargs["mode"] == "discover":
+                with history.open("a", newline="", encoding="utf-8") as file:
+                    csv.writer(file).writerow([
+                        "https://www.instagram.com/reels/current/", 1, isoformat_utc(started)
+                    ])
+                clock.current = started + timedelta(minutes=1)
+            else:
+                clock.current = started + timedelta(hours=16)
+            return 0
+
+        async def fake_wait(_event: object, _seconds: float) -> bool:
+            clock.current = started + RECOLLECTION_INTERVAL
+            return False
+
+        with patch("reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([(call["mode"], call.get("urls")) for call in calls],
+                         [("discover", None), ("recollect", ["https://www.instagram.com/reels/current/"])])
+
+    async def test_three_minute_run_invokes_each_recollection(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        url = "https://www.instagram.com/reels/quick/"
+        config = replace(self.config, duration_hours=0.25, discovery_hours=0.1,
+                         recollection_interval_minutes=3, domains=("fashion",), resume_started_at=started)
+        history = self.write_history("fashion", [
+            {"url": url, "collection_number": 1, "collected_at": isoformat_utc(started)},
+        ])
+        clock = ManualClock(started + timedelta(minutes=3))
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            with history.open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow([url, len(calls) + 1, isoformat_utc(clock())])
+            clock.advance(3 * 60)
+            return 0
+
+        await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([call["mode"] for call in calls], ["recollect"] * 3)
+
+    async def test_missing_snapshot_retries_only_its_reel_after_successful_batch(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        first = "https://www.instagram.com/reels/first/"
+        missing = "https://www.instagram.com/reels/missing/"
+        config = replace(
+            self.config, duration_hours=0.25, discovery_hours=0.05,
+            recollection_interval_minutes=3, target_snapshots=2,
+            domains=("fashion",), resume_started_at=started,
+        )
+        history = self.write_history("fashion", [
+            {"url": url, "collection_number": 1, "collected_at": isoformat_utc(started)}
+            for url in (first, missing)
+        ])
+        clock = ManualClock(started + timedelta(minutes=3))
+        calls: list[list[str]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            urls = list(kwargs["urls"])
+            calls.append(urls)
+            saved = first if len(calls) == 1 else missing
+            with history.open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow([saved, 2, isoformat_utc(clock())])
+            if len(calls) == 2:
+                clock.current = started + timedelta(hours=config.duration_hours)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(calls, [[first, missing], [missing]])
+
+    async def test_fashion_waits_for_recollection_of_pending_initial_snapshot(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        url = "https://www.instagram.com/reels/pending_initial/"
+        config = replace(self.config, duration_hours=0.25, discovery_hours=0.1,
+                         recollection_interval_minutes=3, domains=("fashion",), resume_started_at=started)
+        history = self.write_history("fashion", [])
+        Path(f"{history}.pending.jsonl").write_text("\n".join(json.dumps(row) for row in [
+            {"url": "https://www.instagram.com/reels/older/",
+             "collected_at": isoformat_utc(started - timedelta(minutes=3))},
+            {"url": url, "collected_at": isoformat_utc(started + timedelta(minutes=5))},
+        ]) + "\n", encoding="utf-8")
+        clock = ManualClock(started + timedelta(minutes=7))
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            clock.current = started + timedelta(minutes=15)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([(call["mode"], call["urls"]) for call in calls], [("recollect", [url])])
 
     async def test_due_jobs_from_both_domains_run_before_active_window_discovery(self) -> None:
         started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
@@ -887,7 +1202,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             data_root=self.data_root,
             duration_hours=4,
             discovery_hours=0,
-            domains=("fashion",),
+            domains=("fashion", "beauty"),
         )
         self.write_history(
             "fashion",
@@ -923,7 +1238,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             data_root=self.data_root,
             duration_hours=21 / 60,
             discovery_hours=0,
-            domains=("fashion",),
+            domains=("fashion", "beauty"),
         )
         self.write_history(
             "fashion",
@@ -967,7 +1282,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             data_root=self.data_root,
             duration_hours=21 / 60,
             discovery_hours=0,
-            domains=("fashion",),
+            domains=("fashion", "beauty"),
         )
         self.write_history(
             "fashion",
@@ -1012,7 +1327,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             duration_hours=31 / 60,
             discovery_hours=31 / 60,
             discovery_interval_minutes=30,
-            domains=("fashion",),
+            domains=("fashion", "beauty"),
         )
         self.write_history(
             "fashion",
@@ -1250,6 +1565,28 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 0)
         self.assertEqual(waits, [])
 
+    async def test_three_completed_snapshots_finish_before_thirteen_hours(self) -> None:
+        started = datetime(2026, 9, 29, 11, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root, resume_started_at=started, duration_hours=13,
+            discovery_hours=4, target_snapshots=3, domains=("fashion",),
+        )
+        self.write_history("fashion", [
+            {"url": "https://www.instagram.com/reels/finished/", "collection_number": index + 1,
+             "collected_at": isoformat_utc(started + RECOLLECTION_INTERVAL * index)}
+            for index in range(3)
+        ])
+        invoke = AsyncMock()
+
+        result = await run_fashion_beauty_collection(
+            config, invoke=invoke, clock=ManualClock(started + timedelta(hours=9)),
+        )
+
+        self.assertEqual(result, 0)
+        invoke.assert_not_awaited()
+        status = json.loads((self.data_root / "fashion_collector_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["state"], "completed")
+
     async def test_scheduler_owns_android_log_relay_for_its_full_run(self) -> None:
         started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
         clock = ManualClock(started_at)
@@ -1349,6 +1686,12 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
                 mode="recollect",
                 urls=["https://www.instagram.com/reels/due/"],
             )
+            await invoke_generic_collector(
+                config=replace(self.config, domains=("fashion",)),
+                dataset="fashion",
+                mode="recollect",
+                urls=["https://www.instagram.com/reels/due/"],
+            )
 
         discover = captured[0]
         recollect = captured[1]
@@ -1372,6 +1715,9 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(getattr(recollect, "max_upload_age_days"), 0)
         self.assertEqual(captured[2], "https://www.instagram.com/reels/due/\n")
         self.assertFalse(Path(getattr(recollect, "urls_file")).exists())
+        self.assertFalse(getattr(discover, "profile_android_recollection", False))
+        self.assertTrue(getattr(recollect, "profile_android_recollection", False))
+        self.assertTrue(getattr(captured[3], "profile_android_recollection", False))
 
     async def test_generic_discovery_enables_only_the_requested_media_count_job(self) -> None:
         captured: list[object] = []
@@ -1441,6 +1787,64 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(published_rows[1]["hours_since_previous"], "+0.5hour")
         self.assertEqual([row["collection_number"] for row in published_json], ["1", "2"])
         self.assertEqual(len(workbook_rows), 3)
+
+    def test_publish_combines_archived_web_rows_and_completed_android_metrics(self) -> None:
+        workspace = self.data_root / ".datasets" / "fashion"
+        history_dir = workspace / ".collector"
+        history_dir.mkdir(parents=True)
+        fields = ["collection_number", "collected_at", "url", "like_count", "view_count", "repost_count", "comment_count"]
+        url = "https://www.instagram.com/reels/archived-test/"
+        first_time = "2026-09-25T08:00:00Z"
+        for name, row in (
+            ("reels_history_active_legacy_20260925T080000Z.csv", ["1", first_time, url, "10", "90", "5", "7"]),
+            ("reels_history_active.csv", ["1", "2026-09-25T09:00:00Z", "https://www.instagram.com/reels/new-test/", "20", "", "", ""]),
+        ):
+            with (history_dir / name).open("w", newline="", encoding="utf-8-sig") as file:
+                csv.writer(file).writerows([fields, row])
+        completed = history_dir / "android_metric_queue" / "completed"
+        completed.mkdir(parents=True)
+        (completed / "job.json").write_text(json.dumps({
+            "target": {"url": url, "collected_at": first_time},
+            "status": "collected",
+            "metrics": {"like_count": 11, "view_count": 100, "comment_count": 99,
+                        "repost_count": 0, "share_count": 19, "saved_count": 4},
+        }), encoding="utf-8")
+
+        publish_dataset_outputs(DatasetConfig("fashion", workspace, FASHION_KEYWORDS))
+
+        with (self.data_root / "fashion_reels.csv").open("r", newline="", encoding="utf-8-sig") as file:
+            rows = list(csv.DictReader(file))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["url"], url)
+        self.assertEqual(rows[0]["like_count"], "11")
+        self.assertEqual(rows[0]["view_count"], "90")
+        self.assertEqual(rows[0]["comment_count"], "7")
+        self.assertEqual(rows[0]["repost_count"], "0")
+        self.assertEqual(rows[0]["share_count"], "19")
+        self.assertEqual(rows[0]["saved_count"], "4")
+        self.assertEqual(len(read_xlsx_rows(self.data_root / "fashion_reels.xlsx")), 3)
+
+    def test_locked_public_workbook_is_written_to_updated_path(self) -> None:
+        destination = self.data_root / "fashion_reels.xlsx"
+        destination.write_bytes(b"open workbook")
+        original_replace = os.replace
+
+        def replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+            if Path(target) == destination:
+                raise PermissionError("workbook is open")
+            original_replace(source, target)
+
+        with patch("reels.fashion_beauty_collection.os.replace", side_effect=replace):
+            saved = _atomic_write_xlsx(destination, "reels", ["url"], [{"url": "test"}])
+
+        self.assertEqual(saved, self.data_root / "fashion_reels_updated.xlsx")
+        self.assertEqual(destination.read_bytes(), b"open workbook")
+        self.assertEqual(read_xlsx_rows(saved)[1], ["test"])
+
+        saved = _atomic_write_xlsx(destination, "reels", ["url"], [{"url": "test"}])
+        self.assertEqual(saved, destination)
+        self.assertEqual(read_xlsx_rows(destination)[1], ["test"])
+        self.assertFalse((self.data_root / "fashion_reels_updated.xlsx").exists())
 
     def test_publish_projects_fashion_and_beauty_intervals_to_hours_only(self) -> None:
         base_files = {

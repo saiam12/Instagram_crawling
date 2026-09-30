@@ -46,13 +46,12 @@ class CliTests(unittest.TestCase):
 
         self.assertTrue(collector_options(options).verbose_progress)
 
-    def test_fast_option_uses_xml_evidence_and_same_run_profile_cache(self) -> None:
+    def test_fast_option_uses_xml_evidence_without_screenshots(self) -> None:
         options = parse_args(["collect", "--fast"])
 
         collection = collector_options(options)
 
         self.assertFalse(collection.capture_screenshots)
-        self.assertTrue(collection.reuse_profiles_within_run)
 
     @patch("collect_android_reels.run_refresh", return_value=2)
     @patch("collect_android_reels.create_driver", return_value=object())

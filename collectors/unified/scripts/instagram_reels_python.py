@@ -8,6 +8,7 @@ import math
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -128,7 +129,10 @@ def parse_scheduled_command(
     )
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data_web")
     parser.add_argument("--duration-hours", type=_finite_positive, default=16)
+    parser.add_argument("--target-snapshots", type=_positive_integer, default=4)
+    parser.add_argument("--resume-started-at", help="Resume a scheduled run from its original UTC start timestamp.")
     parser.add_argument("--discovery-hours", type=_finite_positive)
+    parser.add_argument("--recollection-interval-minutes", type=_finite_positive, default=240)
     parser.add_argument("--new-items-per-window", type=_positive_integer, default=300)
     parser.add_argument("--max-new-items-per-window", type=_positive_integer, default=300)
     parser.add_argument(
@@ -203,13 +207,14 @@ def parse_scheduled_command(
         # complete duration is an active discovery period.
         options.discovery_hours = options.duration_hours
     else:
-        max_discovery_hours = options.duration_hours - 12
+        recollection_tail_hours = options.recollection_interval_minutes * (options.target_snapshots - 1) / 60
+        max_discovery_hours = options.duration_hours - recollection_tail_hours
         if max_discovery_hours <= 0:
-            parser.error("--duration-hours must exceed 12 hours unless --new-only is used")
+            parser.error("--duration-hours must exceed the recollection period unless --new-only is used")
         if options.discovery_hours is None:
             options.discovery_hours = max_discovery_hours
         elif options.discovery_hours > max_discovery_hours:
-            parser.error("--discovery-hours cannot exceed --duration-hours minus 12 hours")
+            parser.error("--discovery-hours cannot exceed --duration-hours minus the recollection period")
 
     try:
         fashion_keywords = (
@@ -244,10 +249,23 @@ def parse_scheduled_command(
             beauty_keywords = beauty_keywords[:1]
         keywords_per_window = 1
 
+    resume_started_at = None
+    if options.resume_started_at:
+        try:
+            resume_started_at = datetime.fromisoformat(options.resume_started_at.replace("Z", "+00:00"))
+        except ValueError:
+            parser.error("--resume-started-at must be an ISO 8601 timestamp with a timezone")
+        if resume_started_at.tzinfo is None:
+            parser.error("--resume-started-at must include a timezone")
+        resume_started_at = resume_started_at.astimezone(timezone.utc)
+
     return RunConfig(
         data_root=options.data_dir.resolve(),
+        resume_started_at=resume_started_at,
         duration_hours=options.duration_hours,
+        target_snapshots=options.target_snapshots,
         discovery_hours=options.discovery_hours,
+        recollection_interval_minutes=options.recollection_interval_minutes,
         discovery_interval_minutes=options.discovery_interval_minutes,
         new_items_per_window=options.new_items_per_window,
         max_new_items_per_window=options.max_new_items_per_window,
@@ -397,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
                 hashtag_options.data_dir,
                 "android",
                 "related_hashtag_count_collected",
+                show_in_terminal=True,
                 query_hashtag=summary.get("query_hashtag", ""),
                 related_hashtag_count=summary.get("related_hashtag_count", ""),
                 status=summary.get("status", ""),
@@ -409,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
                     hashtag_options.data_dir,
                     "android",
                     "related_hashtag_media_count_collected",
+                    show_in_terminal=True,
                     query_hashtag=row.get("query_hashtag", ""),
                     hashtag=row.get("hashtag", ""),
                     media_count=row.get("media_count", ""),
@@ -421,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
                 hashtag_options.data_dir,
                 "python",
                 "exact_hashtag_media_count_collected",
+                show_in_terminal=True,
                 query_hashtag=row.get("query_hashtag", ""),
                 hashtag=row.get("hashtag", ""),
                 media_count=row.get("media_count", ""),
@@ -436,16 +457,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    refresh_options = None
+    if command == "refresh":
+        refresh_parser = argparse.ArgumentParser(prog="instagram_reels_python.py refresh", add_help=False)
+        refresh_parser.add_argument("--input-xlsx", type=Path)
+        refresh_parser.add_argument("--start-row", type=int)
+        refresh_parser.add_argument("--end-row", type=int)
+        refresh_options, arguments = refresh_parser.parse_known_args(arguments)
+        if refresh_options.input_xlsx is not None:
+            refresh_options.input_xlsx = refresh_options.input_xlsx.resolve()
+
     os.chdir(PROJECT_ROOT)
     temporary_urls: Path | None = None
     try:
         if command == "refresh":
-            workbook = data_dir / "reels.xlsx"
-            if not workbook.exists():
+            workbook = refresh_options.input_xlsx if refresh_options.input_xlsx else data_dir / "reels.xlsx"
+            if not workbook.exists() and refresh_options.input_xlsx is None:
                 workbook = data_dir / "instagram_data.xlsx"
             if not workbook.exists():
-                raise FileNotFoundError(f"reels.xlsx or instagram_data.xlsx was not found in: {data_dir}")
-            urls = read_reel_urls_from_xlsx(workbook)
+                raise FileNotFoundError(f"Refresh Excel file was not found: {workbook}")
+            urls = read_reel_urls_from_xlsx(
+                workbook, start_row=refresh_options.start_row, end_row=refresh_options.end_row,
+            )
+            if not urls:
+                raise ValueError("No Instagram Reel URLs were found in the selected Excel rows.")
             descriptor, name = tempfile.mkstemp(prefix="instagram-reel-refresh-", suffix=".txt")
             os.close(descriptor)
             temporary_urls = Path(name)

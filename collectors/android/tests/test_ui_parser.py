@@ -74,6 +74,30 @@ class UiParserTests(unittest.TestCase):
         self.assertEqual(observed.metrics["repost_count"].value, 341)
         self.assertEqual(observed.metrics["share_count"].value, 7_511)
 
+    def test_empty_visible_engagement_icons_are_zero(self) -> None:
+        xml = """<hierarchy>
+          <node text="creator" resource-id="com.instagram.android:id/clips_author_username" />
+          <node content-desc="Repost" resource-id="com.instagram.android:id/repost_button" />
+          <node content-desc="Share" resource-id="com.instagram.android:id/share_button" />
+          <node content-desc="Save" resource-id="com.instagram.android:id/save_button" />
+        </hierarchy>"""
+        observed = parse_visible_reel(xml, "feed", "", "", "2026-09-28T00:00:00Z")
+        self.assertEqual(observed.metrics["repost_count"].value, 0)
+        self.assertEqual(observed.metrics["share_count"].value, 0)
+        self.assertEqual(observed.metrics["save_count"].value, 0)
+
+    def test_numbered_counts_are_not_replaced_by_empty_icons(self) -> None:
+        xml = """<hierarchy>
+          <node text="creator" resource-id="com.instagram.android:id/clips_author_username" />
+          <node text="19" resource-id="com.instagram.android:id/share_count" />
+          <node content-desc="Share" resource-id="com.instagram.android:id/share_button" />
+          <node text="4" resource-id="com.instagram.android:id/save_count" />
+          <node content-desc="Save" resource-id="com.instagram.android:id/save_button" />
+        </hierarchy>"""
+        observed = parse_visible_reel(xml, "feed", "", "", "2026-09-28T00:00:00Z")
+        self.assertEqual(observed.metrics["share_count"].value, 19)
+        self.assertEqual(observed.metrics["save_count"].value, 4)
+
     def test_parse_visible_reel_reads_audio_from_author_info_sibling(self) -> None:
         xml = """
         <hierarchy>

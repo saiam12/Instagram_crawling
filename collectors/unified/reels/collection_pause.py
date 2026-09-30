@@ -114,8 +114,13 @@ async def wait() -> None:
 
 
 def is_instagram_limit(response) -> bool:
-    host = urlparse(str(getattr(response, "url", ""))).hostname or ""
-    return (host == "instagram.com" or host.endswith(".instagram.com")) and getattr(response, "status", None) == 429
+    parsed = urlparse(str(getattr(response, "url", "")))
+    host = parsed.hostname or ""
+    return (
+        (host == "instagram.com" or host.endswith(".instagram.com"))
+        and getattr(response, "status", None) == 429
+        and parsed.path != "/ajax/bulk-route-definitions/"
+    )
 
 
 def observe(response) -> None:

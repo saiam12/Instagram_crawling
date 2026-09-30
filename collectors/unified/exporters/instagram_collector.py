@@ -571,24 +571,33 @@ def write_xlsx_workbook(destination: Path, sheets: list[tuple[str, list[list[str
             temporary.unlink()
 
 
-def read_reel_urls_from_xlsx(workbook: Path) -> list[str]:
+def read_reel_urls_from_xlsx(
+    workbook: Path, *, start_row: int | None = None, end_row: int | None = None,
+) -> list[str]:
+    if start_row is not None and start_row < 1:
+        raise ValueError("start_row must be at least 1")
+    if end_row is not None and end_row < 1:
+        raise ValueError("end_row must be at least 1")
+    if start_row is not None and end_row is not None and end_row < start_row:
+        raise ValueError("end_row must be greater than or equal to start_row")
     main_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     document_rel_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
     package_rel_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
     with zipfile.ZipFile(workbook) as archive:
         workbook_xml = ElementTree.fromstring(archive.read("xl/workbook.xml"))
         preferred_sheet_names = {"reels": 0, "new_reels": 1, "reels_rows": 2, "reels_web": 3, "reels_columns": 4}
+        sheets = workbook_xml.findall(f".//{main_ns}sheet")
         sheet = min(
             (
                 item
-                for item in workbook_xml.findall(f".//{main_ns}sheet")
+                for item in sheets
                 if item.attrib.get("name", "").casefold() in preferred_sheet_names
             ),
             key=lambda item: preferred_sheet_names[item.attrib.get("name", "").casefold()],
-            default=None,
+            default=sheets[0] if sheets else None,
         )
         if sheet is None:
-            raise ValueError("The XLSX workbook does not contain a reels sheet.")
+            raise ValueError("The XLSX workbook does not contain a worksheet.")
         relationship_id = sheet.attrib[f"{document_rel_ns}id"]
         relationships_xml = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
         target = next(item.attrib["Target"] for item in relationships_xml.findall(f"{package_rel_ns}Relationship") if item.attrib.get("Id") == relationship_id)
@@ -599,7 +608,7 @@ def read_reel_urls_from_xlsx(workbook: Path) -> list[str]:
         if "xl/sharedStrings.xml" in archive.namelist():
             shared_xml = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
             shared_strings = ["".join(node.text or "" for node in item.findall(f".//{main_ns}t")) for item in shared_xml.findall(f"{main_ns}si")]
-        rows: list[list[str]] = []
+        rows: list[tuple[int, list[str]]] = []
         for row in ElementTree.fromstring(archive.read(sheet_path)).findall(f".//{main_ns}row"):
             values: dict[int, str] = {}
             for cell in row.findall(f"{main_ns}c"):
@@ -618,16 +627,21 @@ def read_reel_urls_from_xlsx(workbook: Path) -> list[str]:
                         value = shared_strings[int(value)]
                 values[column - 1] = value
             if values:
-                rows.append([values.get(index, "") for index in range(max(values) + 1)])
+                row_number = int(row.attrib.get("r", len(rows) + 1))
+                rows.append((row_number, [values.get(index, "") for index in range(max(values) + 1)]))
     if not rows:
         return []
-    headers = [value.strip().casefold() for value in rows[0]]
-    if "url" not in headers:
-        raise ValueError("The reels_web sheet does not contain a url column.")
-    url_index = headers.index("url")
+    headers = [value.strip().casefold() for value in rows[0][1]]
+    url_index = next((index for index, value in enumerate(headers) if value in {"url", "reel_url"}), None)
+    if url_index is None:
+        raise ValueError("The selected worksheet does not contain a url or reel_url column.")
     urls: list[str] = []
     seen: set[str] = set()
-    for row in rows[1:]:
+    for row_number, row in rows[1:]:
+        if start_row is not None and row_number < start_row:
+            continue
+        if end_row is not None and row_number > end_row:
+            continue
         value = row[url_index].strip() if url_index < len(row) else ""
         match = re.match(r"^https://(?:www\.)?instagram\.com/reels?/([A-Za-z0-9_-]+)", value, re.IGNORECASE)
         if not match:

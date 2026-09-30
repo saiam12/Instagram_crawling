@@ -28,27 +28,13 @@ from .collection_diagnostics import CollectorDiagnostics
 
 
 INSTAGRAM_PACKAGE = "com.instagram.android"
-ANDROID_OWNED_FIELDS = (
-    "like_count",
-    "view_count",
-    "comment_count",
-    "share_count",
-    "repost_count",
-    "saved_count",
-    "audio_name",
-)
-METRIC_FIELDS = ANDROID_OWNED_FIELDS[:-1]
-_LIKE_DETAIL_LABELS = ("like number is", "view likes", "좋아요 수", "좋아요 보기")
-_COMMENT_RESOURCE_MARKERS = ("comment_button", "comment_count", "comments_count")
-_COMMENT_DETAIL_LABELS = ("comment number is", "view comments", "댓글 수", "댓글 보기")
-_NO_COMMENTS = re.compile(r"\bno\s+comments\s+yet\b|아직\s*댓글이\s*(없습니다|없어요)", re.I)
-_COMMENTS_DISABLED = re.compile(r"\bcomments?\s+(?:are|is)\s+(?:turned\s+off|disabled)\b|댓글\s*(?:기능이\s*)?(?:꺼져\s*있|사용할\s*수\s*없)", re.I)
+ANDROID_COLLECTION_FIELDS = ("like_count", "share_count", "repost_count", "saved_count")
+ANDROID_OWNED_FIELDS = (*ANDROID_COLLECTION_FIELDS, "audio_name")
 _RATE_LIMIT_SIGNAL = re.compile(
     r"429|too\s+many\s+requests|rate[_\s-]?limit|throttled|please\s+wait\s+a\s+few\s+minutes|"
     r"try\s+again\s+later|요청을\s*처리할\s*수\s*없습니다|잠시\s*후\s*다시",
     re.I,
 )
-_LIKE_PRIVATE = re.compile(r"only\s+.+?\s+can\s+see\s+the\s+total\s+number\s+of\s+likes|좋아요\s*수는\s*.+?만\s*볼\s*수\s*있", re.I)
 _COMPACT_COUNT = re.compile(r"(?P<number>\d+(?:[.,]\d+)?)\s*(?P<unit>[KMBkmb만천])")
 _EXACT_COUNT = re.compile(r"\d[\d,\s]*")
 _POST_COUNT_PATTERNS = (
@@ -62,9 +48,9 @@ _METRIC_RESOURCE_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("like_count", ("like_count", "likes_count")),
     ("view_count", ("video_view_count", "view_count", "play_count")),
     ("comment_count", ("comment_count", "comments_count")),
-    ("share_count", ("share_count", "shares_count", "share_number", "send_count")),
+    ("share_count", ("share_count", "shares_count", "share_number", "send_count", "share_button", "send_button")),
     ("repost_count", ("repost_count", "reposts_count", "reshare_count", "reshare_number")),
-    ("saved_count", ("save_count", "saved_count", "saves_count", "bookmark_count")),
+    ("saved_count", ("save_count", "saved_count", "saves_count", "bookmark_count", "save_button", "bookmark_button")),
 )
 _METRIC_TEXT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("like_count", ("like number is", " likes", "좋아요")),
@@ -74,6 +60,12 @@ _METRIC_TEXT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("repost_count", ("repost number is", " repost", "리포스트")),
     ("saved_count", ("save number is", " saves", "저장")),
 )
+_COUNTLESS_ICON_MARKERS = {
+    "repost_count": ("repost_button", "repost_count", "reposts_count"),
+    "share_count": ("share_button", "send_button", "share_count", "shares_count"),
+    "saved_count": ("save_button", "bookmark_button", "save_count", "saved_count"),
+}
+_COUNTLESS_ICON_LABELS = {"repost_count": {"repost"}, "share_count": {"share", "send", "reshare"}, "saved_count": {"save", "bookmark"}}
 _ANDROID_REEL_READY_TIMEOUT_SECONDS = 5.0
 _ANDROID_RETRY_READY_TIMEOUT_SECONDS = 2.0
 _ANDROID_TAG_SEARCH_SCROLL_ATTEMPTS = 120
@@ -112,6 +104,8 @@ class UiNode:
 @dataclass(frozen=True)
 class AndroidMetricResult:
     metrics: dict[str, int] = field(default_factory=dict)
+    compact_fields: tuple[str, ...] = ()
+    recollection: bool = False
     audio_name: str = ""
     like_count_private: bool | None = None
     comment_count_disabled: bool | None = None
@@ -750,58 +744,46 @@ def extract_visible_metrics(xml: str) -> dict[str, int]:
     return metrics
 
 
-def extract_audio_name(xml: str) -> str:
-    nodes = parse_ui_xml(xml)
-    for node in nodes:
-        resource_id = node.resource_id.casefold()
-        if any(marker in resource_id for marker in ("audio_name", "audio_title", "music_title", "sound_title")):
-            if node.visible_text and node.visible_text.casefold() not in {"audio", "오디오"}:
-                return node.visible_text
-    for index, node in enumerate(nodes):
-        if "author_username" not in node.resource_id.casefold():
-            continue
-        for successor in nodes[index + 1:index + 9]:
-            if "caption" in successor.resource_id.casefold():
-                break
-            candidate = successor.visible_text.strip()
-            if not candidate or candidate.casefold().startswith(("follow", "팔로우")):
-                continue
-            if _metric_key(successor) or _is_likes_trigger(successor):
-                continue
-            if candidate.casefold() not in {"audio", "오디오"}:
-                return candidate
-    return ""
-
-
-def is_likes_and_plays_panel(xml: str) -> bool:
-    nodes = parse_ui_xml(xml)
-    if any(
-        marker in node.resource_id.casefold()
-        for node in nodes
-        for marker in ("like_count_text", "video_view_count_text")
-    ):
-        return True
-    text = " ".join(node.visible_text.casefold() for node in nodes)
-    return "likes and plays" in text or "좋아요 및 재생" in text or "좋아요와 재생" in text
-
-
-def _likes_detail_ready(xml: str) -> bool:
-    metrics = extract_visible_metrics(xml)
-    return is_likes_and_plays_panel(xml) and (
-        "view_count" in metrics or bool(_LIKE_PRIVATE.search(xml))
-    )
-
-
-def _like_count_control_present(xml: str) -> bool:
-    """Return whether the detail sheet exposes a like-count icon or row."""
+def extract_recollection_metrics(xml: str) -> tuple[dict[str, int], tuple[str, ...]]:
+    """Prefer full content descriptions and identify display-only compact counts."""
+    metrics: dict[str, int] = {}
+    compact: set[str] = set()
+    fields = {*ANDROID_COLLECTION_FIELDS, "comment_count"}
     for node in parse_ui_xml(xml):
+        name = _metric_key(node)
+        if name not in fields:
+            continue
+        description = next((match.group(0).strip() for match in re.finditer(
+            r"(?<![\d,])\d+(?:[,\s]\d+)*(?:\.\d+)?\s*(?:[KMBkmb만천])?", node.content_desc
+        )), "")
+        if description and _COMPACT_COUNT.fullmatch(description) is None:
+            value = parse_display_count(description)
+            if value is not None:
+                metrics[name] = value
+                compact.discard(name)
+                continue
+        if name in metrics and name not in compact:
+            continue
+        label = description or node.text.strip()
+        if _COMPACT_COUNT.fullmatch(label):
+            value = parse_display_count(label)
+            if value is not None:
+                metrics[name] = value
+                compact.add(name)
+    return metrics, tuple(sorted(compact))
+
+
+def _countless_reel_icons(xml: str) -> set[str]:
+    missing: set[str] = set()
+    for node in parse_ui_xml(xml):
+        if _node_count(node) is not None:
+            continue
         resource_id = node.resource_id.casefold()
-        if any(marker in resource_id for marker in ("like_count", "like_button", "like_icon", "likes_icon")):
-            return True
-        visible = node.visible_text.strip().casefold()
-        if visible in {"like", "likes", "좋아요"}:
-            return True
-    return False
+        label = node.visible_text.casefold().strip()
+        for name, markers in _COUNTLESS_ICON_MARKERS.items():
+            if any(marker in resource_id for marker in markers) or label in _COUNTLESS_ICON_LABELS[name]:
+                missing.add(name)
+    return missing
 
 
 def _first_matching_node(nodes: Sequence[UiNode], predicate: object) -> UiNode | None:
@@ -848,28 +830,6 @@ def describe_android_surface(xml: str) -> str:
     if re.search(r"couldn.?t refresh|try again later|잠시 후 다시|새로고침", text, re.I):
         return "Instagram displayed a loading or temporary-error screen."
     return "Instagram did not render a recognizable Reel surface before the timeout."
-
-
-def _is_likes_trigger(node: UiNode) -> bool:
-    visible = node.visible_text.casefold()
-    return any(label in visible for label in _LIKE_DETAIL_LABELS)
-
-
-def _is_comment_trigger(node: UiNode) -> bool:
-    resource_id = node.resource_id.casefold()
-    if any(marker in resource_id for marker in _COMMENT_RESOURCE_MARKERS):
-        return True
-    visible = node.visible_text.casefold()
-    return any(label in visible for label in _COMMENT_DETAIL_LABELS)
-
-
-def _comment_sheet_state(xml: str) -> str:
-    text = " ".join(node.visible_text for node in parse_ui_xml(xml))
-    if _NO_COMMENTS.search(text):
-        return "empty"
-    if _COMMENTS_DISABLED.search(text):
-        return "disabled"
-    return ""
 
 
 def parse_hashtag_post_count(xml: str) -> tuple[int | None, str]:
@@ -1033,41 +993,7 @@ class AndroidReelMetricsEnricher:
                     self.driver.tap_bounds(target_bounds)
         return xml
 
-    def _open_likes_and_plays(self, reel_xml: str) -> tuple[dict[str, int], bool | None]:
-        node = _first_matching_node(parse_ui_xml(reel_xml), _is_likes_trigger)
-        if node is None or not self.driver.tap_bounds(node.bounds):
-            return {}, None
-        panel_xml = self._wait_for_surface(_likes_detail_ready, target="likes_and_plays_panel")
-        if not is_likes_and_plays_panel(panel_xml):
-            return {}, None
-        try:
-            metrics = extract_visible_metrics(panel_xml)
-            like_unavailable = bool(_LIKE_PRIVATE.search(panel_xml))
-            if not like_unavailable and "view_count" in metrics and "like_count" not in metrics:
-                if _like_count_control_present(panel_xml):
-                    metrics["like_count"] = 0
-                else:
-                    # A plays value without any like icon/row does not prove
-                    # zero likes. Preserve that unavailable state as X.
-                    like_unavailable = True
-            return metrics, like_unavailable
-        finally:
-            self.driver.press_back()
-
-    def _read_empty_comment_state(self, reel_xml: str) -> str:
-        node = _first_matching_node(parse_ui_xml(reel_xml), _is_comment_trigger)
-        if node is None or not self.driver.tap_bounds(node.bounds):
-            return ""
-        panel_xml = self._wait_for_surface(
-            lambda xml: bool(_comment_sheet_state(xml)) or not _is_reel_surface(xml),
-            target="comments_panel",
-        )
-        try:
-            return _comment_sheet_state(panel_xml)
-        finally:
-            self.driver.press_back()
-
-    def enrich(self, reel_url: str) -> AndroidMetricResult:
+    def enrich(self, reel_url: str, *, recollection: bool = False) -> AndroidMetricResult:
         if self.diagnostics is not None:
             self.diagnostics.update_media(current_url=reel_url)
             self.diagnostics.stage_start("PREFLIGHT")
@@ -1163,14 +1089,17 @@ class AndroidReelMetricsEnricher:
                 tap_center()
                 self._reel_paused_for_collection = True
                 time.sleep(self._delay)
-            metrics = extract_visible_metrics(reel_xml)
-            audio_name = extract_audio_name(reel_xml)
-            if not metrics and not audio_name:
+            visible_metrics = extract_visible_metrics(reel_xml)
+            metrics, compact_fields = (
+                extract_recollection_metrics(reel_xml) if recollection
+                else ({name: value for name, value in visible_metrics.items() if name in ANDROID_COLLECTION_FIELDS}, ())
+            )
+            if not metrics:
                 # The author node can appear before Instagram finishes drawing
                 # the metric rail. Retry that partial surface instead of
                 # recording a false Android success with every field blank.
                 reel_xml = self._wait_for_surface(
-                    lambda candidate: bool(extract_visible_metrics(candidate)) or bool(extract_audio_name(candidate)),
+                    lambda candidate: any(name in ANDROID_COLLECTION_FIELDS for name in extract_visible_metrics(candidate)),
                     attempts=4,
                     target="reel_metrics",
                 )
@@ -1178,61 +1107,33 @@ class AndroidReelMetricsEnricher:
                     if self.diagnostics is not None:
                         self.diagnostics.ui_event("UI_RENDER_FAILED", target="reel_metrics")
                     return AndroidMetricResult(status="unavailable", error="Instagram left the Reel surface before its metrics rendered.")
-                metrics = extract_visible_metrics(reel_xml)
-                audio_name = extract_audio_name(reel_xml)
-            if self.diagnostics is not None:
-                self.diagnostics.stage_start("READ_LIKE_COUNT")
-                self.diagnostics.stage_start("READ_PLAY_COUNT")
-            detail_metrics, like_private = self._open_likes_and_plays(reel_xml)
-            metrics.update(detail_metrics)
-            if like_private is True:
-                metrics.pop("like_count", None)
-            if self.diagnostics is not None:
-                if "like_count" in metrics or like_private is True:
-                    self.diagnostics.stage_success("READ_LIKE_COUNT", value_state="private" if like_private else "collected")
-                else:
-                    self.diagnostics.stage_failed("READ_LIKE_COUNT", reason="METADATA_MISSING", fields="like_count")
-                if "view_count" in metrics:
-                    self.diagnostics.stage_success("READ_PLAY_COUNT")
-                else:
-                    self.diagnostics.stage_failed("READ_PLAY_COUNT", reason="METADATA_MISSING", fields="view_count")
-            comment_count_disabled = False
-            if "comment_count" not in metrics:
-                if self.diagnostics is not None:
-                    self.diagnostics.stage_start("READ_COMMENT_COUNT")
-                comment_state = self._read_empty_comment_state(reel_xml)
-                if comment_state == "empty":
-                    metrics["comment_count"] = 0
-                elif comment_state == "disabled":
-                    comment_count_disabled = True
-                if self.diagnostics is not None:
-                    if "comment_count" in metrics or comment_count_disabled:
-                        self.diagnostics.stage_success("READ_COMMENT_COUNT", value_state=comment_state or "collected")
-                    else:
-                        self.diagnostics.stage_failed("READ_COMMENT_COUNT", reason="METADATA_MISSING", fields="comment_count")
-            elif self.diagnostics is not None:
-                self.diagnostics.stage_start("READ_COMMENT_COUNT")
-                self.diagnostics.stage_success("READ_COMMENT_COUNT", source="reel_surface")
+                visible_metrics = extract_visible_metrics(reel_xml)
+                metrics, compact_fields = (
+                    extract_recollection_metrics(reel_xml) if recollection
+                    else ({name: value for name, value in visible_metrics.items() if name in ANDROID_COLLECTION_FIELDS}, ())
+                )
+            for name in _countless_reel_icons(reel_xml):
+                if name not in visible_metrics:
+                    metrics.setdefault(name, 0)
             if self.diagnostics is not None:
                 missing_fields = [
                     field_name
-                    for field_name in ("like_count", "view_count", "comment_count", "share_count", "repost_count", "saved_count")
+                    for field_name in ANDROID_COLLECTION_FIELDS
                     if field_name not in metrics
                 ]
                 if missing_fields:
                     self.diagnostics.ui_event("METADATA_MISSING", fields=missing_fields)
                 else:
                     self.diagnostics.ui_event("METADATA_RENDER_OK")
-            if not metrics and not audio_name and like_private is None and not comment_count_disabled:
+            if not any(name in metrics for name in ANDROID_COLLECTION_FIELDS):
                 return AndroidMetricResult(
                     status="unavailable",
-                    error="Instagram rendered the Reel author but exposed no readable metric or audio nodes after retries.",
+                    error="Instagram rendered the Reel author but exposed no readable count after retries.",
                 )
             return AndroidMetricResult(
-                metrics={name: value for name, value in metrics.items() if name in METRIC_FIELDS},
-                audio_name=audio_name,
-                like_count_private=like_private,
-                comment_count_disabled=comment_count_disabled,
+                metrics=metrics,
+                compact_fields=compact_fields,
+                recollection=recollection,
             )
         except AndroidMetricsError as error:
             if self.diagnostics is not None:
@@ -1429,10 +1330,11 @@ class AndroidReelMetricsEnricher:
 
 
 def merge_android_metrics(record: dict[str, object], result: AndroidMetricResult) -> dict[str, object]:
-    """Fill only browser-unavailable metrics; exact Python values stay intact."""
+    """Use Android counts where observed; keep web-only fields unchanged."""
     merged = dict(record)
-    for field_name in METRIC_FIELDS:
-        if field_name in result.metrics and needs_android_metric_fallback(merged.get(field_name)):
+    fields = (*ANDROID_COLLECTION_FIELDS, "comment_count") if result.recollection else ANDROID_COLLECTION_FIELDS
+    for field_name in fields:
+        if field_name in result.metrics:
             merged[field_name] = result.metrics[field_name]
     if result.audio_name and not str(merged.get("audio_name", "") or "").strip():
         merged["audio_name"] = result.audio_name
@@ -1465,12 +1367,8 @@ def apply_metric_visibility_rules(
 
     view_count = parse_display_count(resolved.get("view_count"))
     if view_count is not None:
-        for field_name in ("repost_count", "share_count", "saved_count"):
-            if missing(resolved.get(field_name)):
-                resolved[field_name] = 0
-    like_count = parse_display_count(resolved.get("like_count"))
-    if like_count is not None and like_count <= 100 and missing(resolved.get("comment_count")):
-        resolved["comment_count"] = 0
+        if missing(resolved.get("repost_count")):
+            resolved["repost_count"] = 0
     return resolved
 
 

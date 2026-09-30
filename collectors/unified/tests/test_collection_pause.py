@@ -23,6 +23,14 @@ class ManualPauseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pause.resume("resume"))
         self.assertFalse(pause.is_paused())
 
+    async def test_auxiliary_route_429_does_not_pause_collection(self):
+        response = SimpleNamespace(
+            status=429, url="https://www.instagram.com/ajax/bulk-route-definitions/",
+        )
+        pause.observe(response)
+        self.assertFalse(pause.is_paused())
+        self.assertFalse(pause.is_instagram_limit(response))
+
     async def test_browser_stays_open_until_explicit_resume(self):
         calls = []
         async def goto():
