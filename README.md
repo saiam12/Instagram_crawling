@@ -12,12 +12,11 @@ GitHub에는 실행 코드와 설정 예제를 공유하며, 수집 데이터·�
 전체 수집·에뮬레이터 복구 동작은 지원 대상으로 검증하지 않았습니다.
 
 1. [Python 3.12 이상](https://www.python.org/downloads/windows/)(권장 3.12)과 Google Chrome 또는 Microsoft Edge를 설치합니다.
-2. 저장소 루트에서 아래 명령을 실행해 가상환경을 생성하고 패키지를 설치합니다.
+2. 저장소를 clone 또는 pull한 뒤 아래 실행 명령을 사용합니다. 첫 실행에 가상환경과 패키지를 자동으로 준비합니다.
 3. 표시된 브라우저에서 각자 Instagram에 로그인합니다. 첫 실행에는 `--background`를 붙이지 않습니다.
 
 ```powershell
 # 저장소 루트에서 실행
-.\collectors\scripts\setup\repair_venv.ps1
 .\collectors\collector.ps1 --collector-mode web --max-items 50
 ```
 
@@ -26,6 +25,11 @@ PowerShell이 스크립트 실행을 차단하면 현재 터미널에만 허용�
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
+
+`collector.ps1`, `refresh.ps1`, `monitor/start.ps1`은 실행 시 `collectors/.venv`를 확인합니다.
+환경이 없거나 손상되면 생성·복구하고, `requirements.txt`가 바뀌면 패키지를 다시 확인해 설치합니다.
+설치가 끝난 환경은 재사용하며 정상 실행마다 재설치하지 않습니다. 첫 설치에는 인터넷 연결이 필요합니다.
+Git 명령 자체가 설치를 실행하지는 않으며, 이 변경이 GitHub에 반영된 뒤 다른 PC에서 pull해야 적용됩니다.
 
 기본 `hybrid` 모드에는 Android SDK, Instagram 앱이 설치되고 로그인된 에뮬레이터 또는
 USB 디버깅이 허용된 Android 기기와 Node.js 24 이상·Android 연결 도구가 추가로 필요합니다. 브라우저/SDK의 사용자 지정 경로,
@@ -41,7 +45,7 @@ Android를 처음 준비한다면 [Android Studio 설치 및 에뮬레이터 설
 | 기능 | 설치·준비 사항 | 수동으로 해야 하는 일 |
 |---|---|---|
 | 웹 수집 | Python 3.12+, Chrome/Edge, 수집기 requirements | 각자 Instagram 로그인·인증 |
-| hybrid 수집 | 웹 수집 환경 + Android SDK + Node.js 24+ + 로그인된 Android 기기 | AVD 생성 또는 USB 디버깅 승인, 앱 로그인, `collectors/scripts/setup/setup-android-ui.ps1` 실행 |
+| hybrid 수집 | 웹 수집 환경 + Android SDK + Node.js 24+ + 로그인된 Android 기기; Android 연결 패키지는 누락 시 자동 설치 | AVD 생성 또는 USB 디버깅 승인, 앱 로그인 |
 | 로컬 모니터 | 수집기 환경 | 아래 명령으로 실행 후 이 PC의 localhost 접속 |
 | Gemini 분석·선택적 추천 | 별도 Gemini 가상환경과 requirements | API 키 발급, `.env` 설정; 공용 풀 사용 시 관리자의 시트·Apps Script 배포 |
 

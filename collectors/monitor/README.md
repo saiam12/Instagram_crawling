@@ -15,8 +15,9 @@
 
 브라우저가 열리고 <http://127.0.0.1:8765>에서 확인할 수 있습니다.
 기본 모니터는 수집기 가상환경인 `collectors/.venv`를 사용하며 추가 Python 패키지·Node.js 설치는 필요 없습니다.
-모니터에서 Android 수집을 실행하려면 [Android 연결 도구 설치](../README.md#android-연결-도구-설치)를 먼저 진행하세요.
-가상환경이 없으면 먼저 [수집기 설치](../README.md#설치)를 진행하세요.
+Python 3.12 이상이 설치되어 있으면 가상환경과 필수 Python 패키지는 첫 실행에 자동으로 준비합니다.
+모니터에서 Android 수집을 실행하려면 [Android 준비](../README.md#3-android-studio-설치-및-hybrid-준비)를 먼저 진행하세요.
+Android 연결 패키지는 로컬 서버를 준비할 때 누락 시 자동 설치하며, Node.js·SDK·기기 로그인은 별도로 필요합니다.
 
 ```powershell
 # 브라우저를 자동으로 열지 않기

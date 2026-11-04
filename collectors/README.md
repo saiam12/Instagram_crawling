@@ -31,11 +31,14 @@ Google Chrome 또는 Microsoft Edge를 설치하세요. 저장소를 받은 위�
 
 ```powershell
 cd .\collectors
-.\scripts\setup\repair_venv.ps1
+.\collector.ps1 --collector-mode web --max-items 50
 ```
 
-이 스크립트는 `py -3`, 없으면 PATH의 `python`을 사용해 `.venv`를 생성/복구하고
-`requirements.txt`를 설치합니다. Python 버전이 3.12 미만이면 설치를 중단합니다.
+수집기·재수집·모니터 실행기는 `.venv`와 필수 패키지를 확인하고, 첫 실행이나 손상 시
+자동으로 생성·복구합니다. `requirements.txt`가 변경되면 다음 실행에서 패키지를 설치하고,
+정상 환경은 재설치 없이 재사용합니다. 첫 설치에는 인터넷 연결이 필요합니다.
+설치된 Python은 `py -3.12`, `py -3`, PATH의 `python` 순으로 확인해 3.12 이상을 선택합니다.
+Python 자체와 브라우저는 먼저 설치해야 합니다. `.venv`는 Git으로 공유하지 않습니다.
 Python이 PATH에 없거나 여러 버전 중 하나를 선택하려면 실행 파일을 직접 지정하세요.
 
 ```powershell
@@ -107,7 +110,9 @@ Python의 `.venv`에 패키지를 설치하는 것만으로 Android SDK나 시�
 .\collectors\scripts\setup\setup-android-ui.ps1
 ```
 
-이 명령은 수집기에 필요한 Android 연결 도구를 이 저장소 안에 설치합니다. Python 가상환경과 별도로 한 번 준비하며, 저장소를 다른 PC로 옮겼다면 그 PC에서도 실행합니다. 이후 `hybrid` 수집과 Android 워커는 필요한 서버를 자동으로 시작하고 연결합니다. `web` 전용 수집에는 이 설치가 필요 없습니다.
+이 명령은 수집기에 필요한 Android 연결 도구를 이 저장소 안에 설치합니다. 미리 실행하지 않아도
+`hybrid` 수집이나 Android 워커가 로컬 서버를 준비할 때 패키지가 없으면 자동으로 설치합니다.
+Node.js 24 이상·Android SDK·Java와 로그인된 기기는 먼저 준비해야 하며, `web` 전용 수집에는 이 설치가 필요 없습니다.
 
 Java는 Android Studio에 포함된 `jbr`을 사용합니다. 설치 위치를 자동으로 찾지 못하면 `JAVA_HOME`에 해당 `jbr` 폴더를 지정한 뒤 실행하세요.
 연결 준비가 실패하면 표시된 오류를 해결한 뒤 다시 실행합니다. 대기 중인 Android 수집 작업은 유지됩니다.

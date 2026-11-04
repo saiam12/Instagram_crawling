@@ -8,9 +8,8 @@ $ErrorActionPreference = 'Stop'
 if ($DataDir -match '["\r\n]') { throw 'DataDir must not contain quotes or newlines.' }
 $collectors = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $collectors '.venv\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-    throw 'Collector Python environment not found. Run collectors\scripts\setup\repair_venv.ps1 first.'
-}
+& (Join-Path $collectors 'scripts\setup\repair_venv.ps1') -IfNeeded
+if ($LASTEXITCODE -ne 0) { throw 'Collector Python setup failed. Resolve the setup error above and retry.' }
 $runtime = Join-Path $collectors 'runtime\monitor'
 New-Item -ItemType Directory -Path $runtime -Force | Out-Null
 $url = "http://127.0.0.1:$Port"

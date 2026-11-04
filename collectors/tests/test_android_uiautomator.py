@@ -157,11 +157,38 @@ class PersistentAndroidTests(unittest.TestCase):
             m.ensure_server(Path('adb.exe'), 'http://127.0.0.1:4723')
             spawn.assert_not_called()
 
-    def test_missing_runtime_has_actionable_setup_message(self):
+    def test_missing_runtime_install_failure_has_actionable_setup_message(self):
         m = self.backend()
-        with tempfile.TemporaryDirectory() as directory, patch.object(m, 'RUNTIME_DIR', Path(directory)), patch.object(m, 'http_request', side_effect=android.AndroidMetricsError('offline')):
+        with tempfile.TemporaryDirectory() as directory, patch.object(m, 'RUNTIME_DIR', Path(directory)), patch.object(m, 'http_request', side_effect=android.AndroidMetricsError('offline')), patch.object(m.subprocess, 'run', side_effect=OSError('npm unavailable')):
             with self.assertRaisesRegex(android.AndroidMetricsError, 'setup-android-ui.ps1'):
                 m.ensure_server(Path('adb.exe'), 'http://127.0.0.1:4723')
+
+    def test_missing_runtime_is_installed_before_starting_local_server(self):
+        m = self.backend()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / 'node_modules/appium/build/lib/main.js'
+
+            def install(command, **options):
+                self.assertEqual(command[0], 'powershell.exe')
+                self.assertEqual(Path(command[-1]).name, 'setup-android-ui.ps1')
+                script.parent.mkdir(parents=True)
+                script.write_text('// installed runtime')
+
+            lock = Mock()
+            lock.acquire.return_value = True
+            process = Mock(pid=1234)
+            process.poll.return_value = None
+            with patch.object(m, 'RUNTIME_DIR', root), patch.object(m, 'STATE_DIR', root / 'state'), \
+                 patch.object(m, 'http_request', side_effect=[{'ready':False}, {'ready':False}, {'ready':True}]), \
+                 patch.object(m.subprocess, 'run', side_effect=install), \
+                 patch.object(m.subprocess, 'Popen', return_value=process), \
+                 patch.object(m.shutil, 'which', return_value='node.exe'), \
+                 patch.object(m, '_process_lock', return_value=lock):
+                self.assertEqual(m.ensure_server(Path('adb.exe')), 'http://127.0.0.1:4723')
+            self.assertTrue(script.is_file())
+            state = root / 'state/server-4723.json'
+            self.assertTrue(state.is_file())
 
     def test_owned_enricher_driver_is_closed_on_reset(self):
         enricher = android.AndroidReelMetricsEnricher()

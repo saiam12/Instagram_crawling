@@ -73,7 +73,17 @@ def ensure_server(adb_path: Path, url: str | None = None) -> str:
         raise AndroidMetricsError('Configured Appium server is unavailable. Start it before collection.')
     script = RUNTIME_DIR / 'node_modules' / 'appium' / 'build' / 'lib' / 'main.js'
     if not script.is_file():
-        raise AndroidMetricsError('Android UI runtime is not installed. Run .\\scripts\\setup\\setup-android-ui.ps1 from collectors first.')
+        setup = COLLECTORS / 'scripts' / 'setup' / 'setup-android-ui.ps1'
+        print('Preparing Android UI runtime for this PC...', flush=True)
+        try:
+            subprocess.run(
+                ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(setup)],
+                check=True, timeout=600, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise AndroidMetricsError(f'Android UI setup failed. Check Node.js 24+ and run {setup}.') from error
+        if not script.is_file():
+            raise AndroidMetricsError(f'Android UI runtime is still missing. Run {setup}.')
     node = shutil.which('node')
     if not node:
         raise AndroidMetricsError('Node.js 24+ is required. Install Node.js, then run scripts/setup/setup-android-ui.ps1.')

@@ -21,14 +21,13 @@ param(
     [string[]]$CollectorArguments
 )
 
+$ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $launcher = Join-Path $projectRoot "scripts\instagram_reels_python.py"
 
-if (-not (Test-Path -LiteralPath $python)) {
-    Write-Error "Python virtual environment was not found. Run .\scripts\setup\repair_venv.ps1 from $projectRoot first."
-    exit 1
-}
+& (Join-Path $projectRoot 'scripts\setup\repair_venv.ps1') -IfNeeded
+if ($LASTEXITCODE -ne 0) { throw 'Collector Python setup failed. Resolve the setup error above and retry.' }
 
 $savedPythonPath = $env:PYTHONPATH
 Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
@@ -107,8 +106,12 @@ try {
             }
         }
         & (Join-Path $projectRoot 'scripts\android\start-android.ps1') @androidOptions
-        & $python -m reels.android_uiautomator
-        if ($LASTEXITCODE -ne 0) { throw 'Android UI preparation failed. Follow the setup message above.' }
+        Push-Location $projectRoot
+        try {
+            & $python -m src.reels.android_uiautomator
+            if ($LASTEXITCODE -ne 0) { throw 'Android UI preparation failed. Follow the setup message above.' }
+        }
+        finally { Pop-Location }
     }
     & $python $launcher @argumentsToPass
     exit $LASTEXITCODE
