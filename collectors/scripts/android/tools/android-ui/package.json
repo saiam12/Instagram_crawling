@@ -1,0 +1,10 @@
+{
+  "name": "instagram-android-ui-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {"node": ">=24", "npm": ">=10"},
+  "dependencies": {
+    "appium": "3.9.0",
+    "appium-uiautomator2-driver": "8.7.2"
+  }
+}

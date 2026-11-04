@@ -1,0 +1,1758 @@
+{
+  "DeCqQTBJgSC": {
+    "source": "reviewed_source_scene_frames",
+    "scenes": {
+      "1": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "2": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.3,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "3": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.5,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "4": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.7,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "5": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.9,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "6": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "7": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.3,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "8": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.5,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "9": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.7,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "10": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.9,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "11": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "12": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.3,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "13": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.5,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "14": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.7,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "15": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.9,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "16": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 3.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "17": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 3.8,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "18": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 4.8,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "19": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 5.6,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "20": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 6.2,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "21": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 6.6,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "22": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 7.2,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "23": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 8.0,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "24": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 8.8,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "25": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 9.4,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "26": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 9.8,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "27": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 10.4,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "28": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 11.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.52,
+        "subject_kind": "person",
+        "subject_count": 1
+      }
+    },
+    "note": "Per-scene midpoint frames decoded from the original Reel; active picture bounds detected from pixels and body range/layout reviewed in the contact sheet. Not a global camera preset."
+  },
+  "DeUswbbJJ8j": {
+    "source": "reviewed_source_scene_frames",
+    "scenes": {
+      "1": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "2": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.3,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "3": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.5,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "4": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.7,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "5": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 0.9,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "6": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "7": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.3,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "8": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.5,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "9": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.7,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "10": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 1.9,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "11": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "12": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.3,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "13": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.5,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "14": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.7,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "15": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 2.9,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "16": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 3.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "17": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 3.3,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "18": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 3.5,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "19": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 4.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "20": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 4.9,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "21": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 5.6,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "22": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 6.2,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "23": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 6.6,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "24": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 7.2,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "25": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 8.0,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "26": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 8.8,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "27": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 9.4,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "28": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 9.8,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "29": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 10.4,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "30": {
+        "aspect": "landscape",
+        "letterbox": true,
+        "active_bounds": [
+          0,
+          0.3359375,
+          1,
+          0.6640625
+        ],
+        "sample_second": 11.1,
+        "shot_size": "torso",
+        "body_crop": [
+          0.18,
+          0.66
+        ],
+        "subject_width": 0.55,
+        "subject_kind": "person",
+        "subject_count": 1
+      }
+    },
+    "note": "Per-scene midpoint frames decoded from the original Reel; active picture bounds detected from pixels and body range/layout reviewed in the contact sheet. Not a global camera preset."
+  },
+  "Ddv2UERyS6h": {
+    "source": "reviewed_source_scene_frames",
+    "scenes": {
+      "1": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 0.9,
+        "subject_kind": "basket",
+        "layout_type": "product_shot",
+        "subject_count": 0
+      },
+      "2": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 2.4,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          1.0
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "3": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 3.8,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.9
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "4": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 5.3,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.9
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "5": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 6.7,
+        "shot_size": "upper_body",
+        "body_crop": [
+          0.16,
+          0.7
+        ],
+        "subject_width": 0.86,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "6": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 8.6,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.83
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "7": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 10.7,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.94
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "8": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 12.6,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.82
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "9": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 14.2,
+        "subject_kind": "sleeve",
+        "layout_type": "closeup",
+        "subject_count": 0
+      },
+      "10": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 15.8,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.9
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "11": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 17.3,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.9
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "12": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 18.8,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.92
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "13": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 21.0,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.94
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "14": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 22.6,
+        "subject_kind": "sleeve",
+        "layout_type": "closeup",
+        "subject_count": 0
+      },
+      "15": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 24.3,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.94
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "16": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 27.6,
+        "shot_size": "medium_full",
+        "body_crop": [
+          0.16,
+          0.85
+        ],
+        "subject_width": 0.72,
+        "layout_type": "mirror_selfie",
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "17": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 30.1,
+        "subject_kind": "tag",
+        "layout_type": "product_shot",
+        "subject_count": 0
+      }
+    },
+    "note": "Per-scene midpoint frames decoded from the original Reel; active picture bounds detected from pixels and body range/layout reviewed in the contact sheet. Not a global camera preset."
+  },
+  "DegU3ElzxXW": {
+    "source": "reviewed_source_scene_frames",
+    "scenes": {
+      "1": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 1.5,
+        "shot_size": "full_body",
+        "body_crop": [
+          0.16,
+          1.05
+        ],
+        "subject_width": 0.65,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "2": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 4.5,
+        "shot_size": "full_body",
+        "body_crop": [
+          0.16,
+          1.05
+        ],
+        "subject_width": 0.65,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "3": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 7.2,
+        "shot_size": "full_body",
+        "body_crop": [
+          0.16,
+          1.05
+        ],
+        "subject_width": 0.65,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "4": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 9.933333333333334,
+        "shot_size": "full_body",
+        "body_crop": [
+          0.16,
+          1.05
+        ],
+        "subject_width": 0.65,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "5": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 13.266666666666667,
+        "shot_size": "full_body",
+        "body_crop": [
+          0.16,
+          1.05
+        ],
+        "subject_width": 0.65,
+        "subject_kind": "person",
+        "subject_count": 1
+      }
+    },
+    "note": "Per-scene midpoint frames decoded from the original Reel; active picture bounds detected from pixels and body range/layout reviewed in the contact sheet. Not a global camera preset."
+  },
+  "DejAGU2An_x": {
+    "source": "reviewed_source_scene_frames",
+    "scenes": {
+      "1": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "sample_second": 0.7,
+        "shot_size": "upper_body",
+        "body_crop": [
+          0,
+          0.75
+        ],
+        "subject_width": 0.68,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "2": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "sample_second": 2.1,
+        "layout_type": "flat_lay_outfit_grid",
+        "subject_kind": "flat_lay",
+        "subject_count": 0
+      },
+      "3": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "sample_second": 2.9,
+        "layout_type": "flat_lay_outfit_grid",
+        "subject_kind": "flat_lay",
+        "subject_count": 0
+      },
+      "4": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "sample_second": 3.6,
+        "layout_type": "flat_lay_outfit_grid",
+        "subject_kind": "flat_lay",
+        "subject_count": 0
+      },
+      "5": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "sample_second": 5.0,
+        "layout_type": "flat_lay_outfit_grid",
+        "subject_kind": "flat_lay",
+        "subject_count": 0
+      },
+      "6": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "sample_second": 6.5,
+        "layout_type": "flat_lay_outfit_grid",
+        "subject_kind": "flat_lay",
+        "subject_count": 0
+      },
+      "7": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0,
+          1,
+          1
+        ],
+        "sample_second": 8.1,
+        "shot_size": "upper_body",
+        "body_crop": [
+          0,
+          0.75
+        ],
+        "subject_width": 0.68,
+        "subject_kind": "person",
+        "subject_count": 1
+      }
+    },
+    "note": "Per-scene midpoint frames decoded from the original Reel; active picture bounds detected from pixels and body range/layout reviewed in the contact sheet. Not a global camera preset."
+  },
+  "Dex-OqkTHh2": {
+    "source": "reviewed_source_scene_frames",
+    "scenes": {
+      "1": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 0.5333333333333333,
+        "shot_size": "full_body",
+        "body_crop": [
+          0,
+          1.08
+        ],
+        "subject_width": 0.4,
+        "subject_kind": "person",
+        "subject_count": 2
+      },
+      "2": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 2.033333333333333,
+        "subject_kind": "tag",
+        "layout_type": "product_shot",
+        "subject_count": 0
+      },
+      "3": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 4.0,
+        "shot_size": "full_body",
+        "body_crop": [
+          0,
+          1.08
+        ],
+        "subject_width": 0.4,
+        "subject_kind": "person",
+        "subject_count": 2
+      },
+      "4": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 5.9,
+        "shot_size": "full_body",
+        "body_crop": [
+          0,
+          1.08
+        ],
+        "subject_width": 0.4,
+        "subject_kind": "person",
+        "subject_count": 1
+      },
+      "5": {
+        "aspect": "portrait",
+        "letterbox": false,
+        "active_bounds": [
+          0,
+          0.0,
+          1,
+          1.0
+        ],
+        "sample_second": 8.0,
+        "shot_size": "full_body",
+        "body_crop": [
+          0,
+          1.08
+        ],
+        "subject_width": 0.4,
+        "subject_kind": "person",
+        "subject_count": 1
+      }
+    },
+    "note": "Per-scene midpoint frames decoded from the original Reel; active picture bounds detected from pixels and body range/layout reviewed in the contact sheet. Not a global camera preset."
+  },
+  "DeliKNPprGK": {
+    "source": "User-provided Look 2 screenshot; categorical body orientation only, not a measured angle.",
+    "scenes": {
+      "2": {
+        "subject_orientation": "three_quarter",
+        "orientation_basis": "user_look2_screenshot"
+      }
+    }
+  }
+}

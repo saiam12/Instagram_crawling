@@ -1,42 +1,75 @@
+# Local secrets (keep shareable templates)
 .env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+cookies.txt
+*.cookies.txt
+
+# Local agent instructions
 skill.md
 AGENTS.md
 
-# Python environments and caches
-.venv/
+# Dependencies and Python caches
+.venv*/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
 
-# Generated data and local browser state
-data_web/
-collectors/android/data_android/
+# Temporary files, Excel lock files, and OS metadata
+*.log
+*.tmp
+*.temp
+~$*.xlsx
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Shared generated state and browser profiles
 .android/
 outputs/
-/temp/
 graphify-out/
 browser_profile/
+.collector/
+.datasets/
+.collection-paused
 
-# Unified collector runtime files and exports
-/collectors/unified/.collector/
-/collectors/unified/diagnostics/
-/collectors/unified/logs/
-/collectors/unified/data_*/
-/collectors/unified/*.csv
-/collectors/unified/*.json
-/collectors/unified/*.jsonl
-/collectors/unified/*.log
-/collectors/unified/*.xlsx
-/collectors/unified/.collection-paused
+# Collector data (including refresh/test data) and runtime state
+/collectors/data/
+/collectors/data_*/
+/collectors/runtime/
+/collectors/logs/
+
+# Loose collector exports
+/collectors/*.csv
+/collectors/*.json
+!/collectors/refresh.example.json
+# Explicitly protect the per-computer refresh configuration.
+/collectors/refresh.local.json
+/collectors/*.jsonl
+/collectors/*.log
+/collectors/*.xlsx
+/collectors/*.html
 
 # Analyzer runtime files
-analyzers/gemini/.pool_pending/
-analyzers/gemini/.venv-py312-backup/
-analyzers/gemini/model_limits.json
-analyzers/gemini/output/
-analyzers/gemini/downloads/
-analyzers/downloads/
-analyzers/local_llm/debug_frames/
-analyzers/local_llm/results/
-analyzers/local_llm/cookies.txt
-analyzers/local_llm/**/*.cookies.txt
+/analyzers/.pool_pending/
+/analyzers/model_limits.json
+/analyzers/output/
+/analyzers/downloads/
+
+# Local archives, experiments, and agent workspaces
+/archives/
+/docs/archive/
+/docs/superpowers/
+/collectors/monitor/docs/premium-audit.json
+/temp/
+/unused/
+/.superpowers/
+
+# Legacy generated directories: keep restored old data out of Git
+/collectors/unused/
+/collectors/*/data_*/

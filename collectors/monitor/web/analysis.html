@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>분석 데이터 시각화 · Collector Monitor</title>
+  <script src="/theme.js"></script><link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/visualize.css"><link rel="stylesheet" href="/analysis.css">
+  <script src="/workspace-cache.js"></script><script src="/korean-filter.js"></script><script src="/scatter.js" defer></script><script src="/chart-board.js" defer></script><script src="/analysis.js" defer></script>
+</head>
+<body class="visualization-page analysis-page">
+  <a class="skip-link" href="#main">본문으로 이동</a>
+  <aside class="sidebar">
+    <a class="brand" href="/#overview" aria-label="Collector Monitor 처음으로"><span class="brand-mark" aria-hidden="true">▥</span><span>COLLECTOR</span></a>
+    <nav aria-label="주 메뉴">
+      <div class="nav-group" role="group" aria-labelledby="nav-collection"><p id="nav-collection" class="nav-group-label">수집 관리</p>
+        <a href="/#overview" class="nav-link" data-overview-nav><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></span>수집 현황</a>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-insights"><p id="nav-insights" class="nav-group-label">데이터 활용</p>
+        <a href="/visualize.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M4 4v16h17M8 16v-5m5 5V7m5 9V4"/></svg></span>수집 시각화</a>
+        <a href="/analysis.html" class="nav-link" aria-current="page"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18M15 9v12M9 15h12"/></svg></span>분석 시각화</a>
+        <a href="/recommend.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8Z"/></svg></span>영상 기획 추천</a>
+      </div>
+    </nav>
+    <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span>로컬 모니터</div>
+  </aside>
+  <main id="main">
+    <header class="page-header"><div><h1>분석 데이터 시각화</h1></div><div class="header-tools"><button id="theme-toggle" class="button secondary" type="button" aria-pressed="false">다크모드</button></div></header>
+    <section class="panel analysis-source" aria-label="분석 자료">
+      <div><strong>참고 분석 파일</strong><p>collectors/data/collector/reel_analysis.json</p><p id="source-status" role="status" aria-live="polite">저장된 작업을 확인하고 있습니다.</p><p id="analysis-cache" class="visual-note" role="status"></p></div>
+      <button id="reload-analysis" class="button primary" type="button" disabled>최신 분석 불러오기</button>
+    </section>
+    <p id="analysis-error" class="file-error" role="alert" hidden></p>
+    <section id="analysis-empty" class="panel visual-empty"><h2>분석 파일을 확인하고 있습니다</h2><p>콘텐츠 유형·추천 타겟·Hook·소구점·장면 길이를 집계합니다.</p></section>
+    <div id="analysis-results" hidden>
+      <section class="panel analysis-filters" aria-label="분석 필터">
+        <div class="field"><label for="analysis-search">분석 내용 검색</label><input id="analysis-search" type="search" maxlength="200" placeholder="릴스 ID · 요약 · 소구점"></div>
+        <div class="field"><label for="analysis-type">콘텐츠 유형</label><select id="analysis-type"><option value="all">전체 유형</option></select></div>
+        <div class="field"><label for="analysis-gender">추천 타겟 성별</label><select id="analysis-gender"><option value="all">전체 성별</option></select></div>
+        <div class="field"><label for="analysis-korean">릴스 구분</label><select id="analysis-korean" aria-describedby="analysis-korean-note"><option value="all">전체</option><option value="true">한국</option><option value="false">외국</option><option value="unknown">미확인 (-)</option></select></div>
+        <button id="reset-analysis" class="button secondary" type="button">필터 초기화</button>
+      </section>
+      <p id="analysis-korean-note" class="visual-note analysis-korean-note">한국·외국·미확인(-)을 구분합니다.</p>
+      <div class="analysis-selection"><p id="analysis-selection" role="status"></p><button id="clear-drill" class="button secondary compact" type="button" hidden>차트 선택 해제</button></div>
+      <section class="visual-summary" aria-label="분석 요약">
+        <article class="stat"><span>선택된 분석 릴스</span><strong id="analysis-count">—</strong><small id="analysis-total">—</small></article>
+        <article class="stat"><span>분석 장면</span><strong id="scene-count">—</strong><small>선택한 릴스의 장면 레코드 합계</small></article>
+        <article class="stat"><span>장면 기준 길이 중앙값</span><strong id="analysis-duration">—</strong><small id="duration-coverage">실제 영상 길이의 근사값</small></article>
+        <article class="stat"><span>소구점이 분석된 릴스</span><strong id="appeal-count">—</strong><small>소구점 레코드가 있는 릴스 수</small></article>
+      </section>
+      <p class="visual-note analysis-caution">AI 분석 결과이며 실제 시청자 통계가 아닙니다. 타겟·소구점은 중복 집계됩니다.</p>
+      <div class="analysis-charts">
+        <section class="panel analysis-chart"><h2>콘텐츠 유형</h2><p>분석에 기록된 분류 · 상위 10개</p><div id="chart-content"></div></section>
+        <section class="panel analysis-chart"><h2>추천 타겟 연령</h2><p>복수 선택 · 20~30대 분류는 하나로 유지</p><div id="chart-ages"></div></section>
+        <section class="panel analysis-chart"><h2>추천 타겟 성별</h2><p>분석자가 추천한 타겟 · 실제 시청자 아님</p><div id="chart-genders"></div></section>
+        <section class="panel analysis-chart"><h2>Hook 강도</h2><p>분석의 strong / medium / weak 분류</p><div id="chart-hook"></div></section>
+        <section class="panel analysis-chart"><h2>핵심 소구 유형</h2><p>복수 선택 · 릴스당 중복 제거 · 상위 10개</p><div id="chart-appeals"></div></section>
+      </div>
+      <section class="analysis-metrics" aria-labelledby="analysis-metrics-title">
+        <div class="section-heading"><h2 id="analysis-metrics-title">분석 릴스 지표 비교</h2></div>
+        <p class="visual-note">현재 분석 필터에 포함된 모든 릴스의 수집 지표입니다. 0은 포함하고 미수집 값은 제외합니다. 수집 영상 길이가 없으면 장면 종료 기준 근사 길이를 사용합니다.</p>
+        <div class="chart-layout-controls field"><label for="chart-columns">한 행의 그래프 수</label><select id="chart-columns"><option value="2">2개</option><option value="3" selected>3개</option><option value="4">4개</option></select></div>
+        <div id="comparison-grid" class="visual-charts comparison-grid" aria-label="분석 릴스 지표 비교 그래프">
+          <section class="panel visual-chart-panel axis-chart-panel" aria-labelledby="axis-chart-title">
+            <h2 id="axis-chart-title">그래프 추가</h2><p class="visual-note">X·Y축을 선택하면 그래프가 추가됩니다.</p>
+            <div class="axis-controls">
+              <div class="field"><label for="chart-x">X축</label><select id="chart-x"><option value="">지표 선택</option></select></div>
+              <div class="field"><label for="chart-y">Y축</label><select id="chart-y"><option value="">지표 선택</option></select></div>
+            </div>
+            <p id="axis-chart" role="status" aria-live="polite">X·Y축을 모두 선택하세요.</p>
+          </section>
+        </div>
+      </section>
+      <section class="panel visual-table-panel">
+        <div class="section-heading analysis-table-heading"><div><h2>분석 릴스와 근거</h2></div><div class="analysis-shortcode"><label for="analysis-shortcode" class="sr-only">shortcode 검색</label><input id="analysis-shortcode" type="search" maxlength="80" placeholder="shortcode 검색" autocomplete="off"></div></div>
+        <div class="visual-table-scroll" tabindex="0" role="region" aria-label="분석 릴스 목록"><table><caption class="sr-only">선택한 필터의 분석 릴스 목록</caption><thead><tr><th scope="col">릴스 / 분석 요약</th><th scope="col">구분 · 유형 · 추천 타겟</th><th scope="col">장면 · 근사 길이</th><th scope="col">분석 근거</th></tr></thead><tbody id="analysis-rows"></tbody></table></div>
+        <div class="analysis-pager"><div class="analysis-page-controls"><button id="analysis-prev" class="button secondary compact" type="button">이전</button><span id="analysis-page" role="status"></span><button id="analysis-next" class="button secondary compact" type="button">다음</button></div><span id="analysis-range" class="visual-note" role="status"></span></div>
+      </section>
+    </div>
+    
+  </main>
+  <dialog id="analysis-dialog" aria-labelledby="detail-title"><div class="analysis-dialog-header"><h2 id="detail-title">분석 근거</h2><button id="detail-close" class="button secondary compact" type="button" autofocus>닫기</button></div><div id="analysis-detail"></div></dialog>
+</body>
+</html>

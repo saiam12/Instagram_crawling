@@ -11,7 +11,7 @@ Instagram Reel Downloader (CLI)
 import argparse
 import os
 import yt_dlp
-from gemini.input_sources import normalize_reel_url
+from input_sources import normalize_reel_url
 
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")

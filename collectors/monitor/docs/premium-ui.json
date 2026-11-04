@@ -1,0 +1,18 @@
+{
+  "profile": "product-admin",
+  "sourceRoots": [
+    "web"
+  ],
+  "locale": "ko-KR",
+  "canonicalMap": "docs/UX-CONTRACT.md",
+  "requiredCapabilities": [
+    "Select/Listbox",
+    "Form",
+    "Scrollbar",
+    "Toast"
+  ],
+  "ownership": {
+    "Select/Listbox": "native",
+    "Date": "typed"
+  }
+}

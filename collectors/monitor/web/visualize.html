@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="monitor-token" content="__MONITOR_TOKEN__">
+  <meta name="description" content="수집 파일을 선택해 회차·시간·조회수와 반응 지표를 시각화합니다.">
+  <title>수집 데이터 시각화 · Collector Monitor</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/visualize.css">
+  <script src="/workspace-cache.js"></script>
+  <script src="/korean-filter.js"></script>
+  <script src="/scatter.js" defer></script><script src="/chart-board.js" defer></script><script src="/visualize.js" defer></script>
+</head>
+<body class="visualization-page">
+  <a class="skip-link" href="#main">본문으로 이동</a>
+  <aside class="sidebar">
+    <a class="brand" href="/#overview" aria-label="Collector Monitor 처음으로"><span class="brand-mark" aria-hidden="true">▥</span><span>COLLECTOR</span></a>
+    <nav aria-label="주 메뉴">
+      <div class="nav-group" role="group" aria-labelledby="nav-collection"><p id="nav-collection" class="nav-group-label">수집 관리</p>
+        <a href="/#overview" class="nav-link" data-overview-nav><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></span>수집 현황</a>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-insights"><p id="nav-insights" class="nav-group-label">데이터 활용</p>
+        <a href="/visualize.html" class="nav-link" aria-current="page"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M4 4v16h17M8 16v-5m5 5V7m5 9V4"/></svg></span>수집 시각화</a>
+        <a href="/analysis.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18M15 9v12M9 15h12"/></svg></span>분석 시각화</a>
+        <a href="/recommend.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8Z"/></svg></span>영상 기획 추천</a>
+      </div>
+    </nav>
+    <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span>로컬 모니터</div>
+  </aside>
+  <main id="main">
+    <header class="page-header">
+      <div><h1>수집 데이터 시각화</h1></div>
+      <div class="header-tools"><span class="badge info">로컬 파일 분석</span><button id="theme-toggle" class="button secondary" type="button" aria-pressed="false">다크모드</button></div>
+    </header>
+
+    <section class="panel file-panel" aria-labelledby="file-heading">
+      <div class="section-heading"><div><h2 id="file-heading">수집 파일 열기</h2><p>CSV · JSON · XLSX / 최대 20 MiB · 100,000건</p></div><button id="clear-file" class="button secondary compact" type="button" disabled>파일 닫기</button></div>
+      <div id="file-zone" class="file-zone">
+        <label for="data-file">파일 선택</label>
+        <input id="data-file" type="file" accept=".csv,.json,.xlsx" aria-describedby="file-help file-status">
+        <p id="file-help">파일을 여기에 끌어 놓아도 됩니다. XLSX는 시트별로 선택할 수 있습니다.</p>
+      </div>
+      <div class="file-feedback"><p id="file-status" role="status" aria-live="polite">이 PC에서 분석하고, 마지막 작업은 이 브라우저에 자동 저장합니다.</p><button id="cancel-read" class="button secondary compact" type="button" hidden>읽기 취소</button></div>
+      <div class="cache-feedback"><p id="cache-status" role="status" aria-live="polite">이전에 저장한 작업을 확인하고 있습니다.</p><button id="delete-cache" class="button secondary compact" type="button" disabled>저장된 작업 삭제</button></div>
+      <p id="file-error" class="file-error" role="alert" hidden></p>
+    </section>
+
+    <section id="visual-empty" class="visual-empty panel" aria-label="파일 선택 안내">
+      <span class="empty-glyph" aria-hidden="true">▥</span><h2>수집 데이터를 한눈에</h2>
+      <p>파일을 열면 회차별 건수, 시간대별 수집량, 전체 지표 요약과 로그 산점도가 표시됩니다.</p>
+      <p class="muted">예: reels.csv · reels.xlsx · reels_history_active.csv</p>
+    </section>
+
+    <div id="visual-results" hidden>
+      <p id="selection-note" class="visual-note" role="status"></p>
+      <p id="korean-note" class="visual-note">한국·외국·미확인(-)을 구분합니다.</p>
+      <div class="visual-tabs" role="tablist" aria-label="수집 시각화 보기">
+        <button id="metrics-tab" type="button" role="tab" aria-selected="true" aria-controls="metrics-panel">지표 비교</button>
+        <button id="trends-tab" type="button" role="tab" aria-selected="false" aria-controls="trends-panel" tabindex="-1">수집 추이</button>
+      </div>
+      <div class="visual-selection-row">
+        <article id="selection-count-card" class="stat" aria-label="선택한 데이터 요약"><span>선택된 수집 기록</span><strong id="visual-count">—</strong><small id="visual-unique">—</small></article>
+      <section class="panel visual-toolbar" aria-label="시각화 필터">
+        <div class="field"><label for="sheet-select">시트</label><select id="sheet-select"></select></div>
+        <div class="field"><label for="visual-round">수집 회차</label><select id="visual-round"><option value="all">전체 회차</option></select></div>
+        <div class="field"><div class="category-label-row"><label for="visual-korean">릴스 구분</label><label class="korean-highlight-toggle" for="highlight-korean"><input id="highlight-korean" type="checkbox">한국 강조</label></div><select id="visual-korean" aria-describedby="korean-note"><option value="all">전체</option><option value="true">한국</option><option value="false">외국</option><option value="unknown">미확인 (-)</option></select></div>
+        <div class="field"><label for="visual-scope">지표 집계 기준</label><select id="visual-scope"><option value="latest">릴스별 최신 기록</option><option value="all">모든 수집 기록</option></select></div>
+        <div class="field publisher-search-field"><label for="publisher-search">user 검색</label><div class="publisher-search-control"><input id="publisher-search" type="search" placeholder="@user 아이디" maxlength="100" autocomplete="off"><button id="clear-publisher-search" type="button" aria-label="user 검색 지우기" hidden>×</button></div></div>
+      </section>
+      </div>
+      <section id="metrics-panel" role="tabpanel" aria-labelledby="metrics-tab">
+      <div class="chart-layout-controls field"><label for="chart-columns">한 행의 그래프 수</label><select id="chart-columns"><option value="2">2개</option><option value="3" selected>3개</option><option value="4">4개</option></select></div>
+      <div id="comparison-grid" class="visual-charts comparison-grid" aria-label="지표 비교 그래프">
+        <section class="panel visual-chart-panel" aria-label="팔로워 · 조회수"><div id="fixed-chart-view_count" class="visual-chart"></div></section>
+        <section class="panel visual-chart-panel" aria-label="팔로워 · 좋아요"><div id="fixed-chart-like_count" class="visual-chart"></div></section>
+        <section class="panel visual-chart-panel" aria-label="팔로워 · 댓글"><div id="fixed-chart-comment_count" class="visual-chart"></div></section>
+        <section class="panel visual-chart-panel" aria-label="팔로워 · 공유"><div id="fixed-chart-share_count" class="visual-chart"></div></section>
+        <section class="panel visual-chart-panel" aria-label="팔로워 · 재게시"><div id="fixed-chart-repost_count" class="visual-chart"></div></section>
+        <section class="panel visual-chart-panel" aria-label="팔로워 · 저장"><div id="fixed-chart-saved_count" class="visual-chart"></div></section>
+
+        <section class="panel visual-chart-panel axis-chart-panel" aria-labelledby="axis-chart-title">
+          <h2 id="axis-chart-title">그래프 추가</h2><p class="visual-note">X·Y축을 선택하면 그래프가 추가됩니다.</p>
+          <div class="axis-controls">
+            <div class="field"><label for="chart-x">X축</label><select id="chart-x"><option value="">지표 선택</option></select></div>
+            <div class="field"><label for="chart-y">Y축</label><select id="chart-y"><option value="">지표 선택</option></select></div>
+          </div>
+          <p id="axis-chart" role="status" aria-live="polite">X·Y축을 모두 선택하세요.</p>
+        </section>
+        <section class="panel visual-chart-panel duration-comparison-panel" aria-label="영상 길이와 조회수"><div id="collection-duration-chart" class="visual-chart"></div></section>
+      </div>
+      <section class="panel visual-table-panel"><div class="section-heading"><div><h2>수집 기록</h2></div></div><div class="visual-table-scroll" tabindex="0" role="region" aria-label="시각화에 사용한 수집 기록"><table class="collection-records"><colgroup><col class="record-identity"><col class="record-date"><col class="record-round"><col span="7" class="record-number"></colgroup><caption class="sr-only">모든 지표와 수집 회차가 포함된 최근 기록</caption><thead><tr><th scope="col">릴스 / 작성자</th><th scope="col">수집 시각 · 한국 시간</th><th scope="col">회차</th><th scope="col" class="numeric">조회수</th><th scope="col" class="numeric">좋아요</th><th scope="col" class="numeric">댓글</th><th scope="col" class="numeric">공유</th><th scope="col" class="numeric">재게시</th><th scope="col" class="numeric">저장</th><th scope="col" class="numeric">팔로워</th></tr></thead><tbody id="visual-rows"></tbody></table></div></section>
+      </section>
+      <section id="trends-panel" role="tabpanel" aria-labelledby="trends-tab" hidden>
+        <div class="visual-charts">
+        <section class="panel visual-chart-panel"><div class="visual-chart-heading"><h2>회차별 수집 기록</h2><p>선택한 회차의 모든 기록 · 단위: 건</p></div><div id="round-chart" class="visual-chart"></div></section>
+        <section class="panel visual-chart-panel"><div class="visual-chart-heading"><h2>시간대별 수집량</h2><label for="time-bucket" class="sr-only">시간 집계 간격</label><select id="time-bucket"><option value="hour">1시간</option><option value="day">1일</option></select></div><p id="timeline-note" class="visual-note">한국 시간 · 모든 기록 기준</p><div id="time-chart" class="visual-chart"></div></section>
+        </div>
+      </section>
+    </div>
+    
+  </main>
+</body>
+</html>

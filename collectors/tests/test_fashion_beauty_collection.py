@@ -1,0 +1,2296 @@
+from __future__ import annotations
+
+import asyncio
+import csv
+import json
+import os
+import tempfile
+import unittest
+import zipfile
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+from xml.etree import ElementTree
+
+from src.exporters.instagram_collector import write_xlsx_workbook
+from scripts.instagram_reels_python import main as launcher_main, parse_fashion_command, parse_scheduled_command
+
+from src.reels.fashion_beauty_collection import (
+    SupervisorLock,
+    RecollectionBrowserSession,
+    _atomic_write_xlsx,
+    _write_json_atomic,
+    _due_retry_delay,
+    _invoke_before_deadline,
+    _invoke_recollection_batches_before_deadline,
+    active_hashtag_position,
+    datasets,
+    decide_next_work,
+    invoke_generic_collector,
+    invoke_generic_recollection_batches,
+    publish_dataset_outputs,
+    read_history,
+    run_fashion_beauty_collection,
+)
+
+from src.reels.fashion_beauty_scheduler import (
+    BEAUTY_KEYWORDS,
+    FASHION_KEYWORDS,
+    RECOLLECTION_INTERVAL,
+    SNAPSHOT_OFFSETS,
+    DatasetConfig,
+    DueJob,
+    RunConfig,
+    due_jobs,
+    initial_count_in_window,
+    is_initial_candidate_allowed,
+    hashtag_at,
+    window_dataset,
+)
+
+
+def isoformat_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def read_xlsx_rows(path: Path) -> list[list[str]]:
+    namespace = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    with zipfile.ZipFile(path) as workbook:
+        worksheet = ElementTree.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+    return [
+        ["".join(node.text or "" for node in cell.findall(f".//{namespace}t")) for cell in row.findall(f"{namespace}c")]
+        for row in worksheet.findall(f".//{namespace}row")
+    ]
+
+
+class AtomicJsonTests(unittest.TestCase):
+    def test_retries_transient_windows_permission_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            destination = Path(temporary_directory) / "collector_status.json"
+            destination.write_text('{"state":"old"}', encoding="utf-8")
+            original_replace = os.replace
+            attempts = 0
+
+            def replace(source: Path, target: Path) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("temporary file lock")
+                original_replace(source, target)
+
+            with patch("src.reels.fashion_beauty_collection.os.replace", side_effect=replace), patch(
+                "src.reels.fashion_beauty_collection.time.sleep"
+            ) as sleep:
+                _write_json_atomic(destination, {"state": "completed"})
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {"state": "completed"})
+
+
+class CommandTests(unittest.TestCase):
+    def test_unlimited_duration_defaults_to_continuous_discovery(self) -> None:
+        config = parse_scheduled_command("fashion", ["--duration-hours", "0"])
+        self.assertIsNone(config.duration_hours)
+        self.assertIsNone(config.discovery_hours)
+        self.assertIsNone(parse_scheduled_command("fashion", ["--duration-hours", "0", "--new-only"]).discovery_hours)
+        self.assertEqual(parse_scheduled_command("fashion", ["--duration-hours", "0", "--discovery-hours", "4"]).discovery_hours, 4)
+        with self.assertRaises(SystemExit):
+            parse_scheduled_command("fashion", ["--duration-hours", "-1"])
+        with self.assertRaises(SystemExit):
+            parse_scheduled_command("fashion-beauty", ["--duration-hours", "0", "--six-hour-new-only"])
+    def test_fashion_hashtags_are_reduced_and_candidates_increased(self) -> None:
+        removed = {"가방추천", "dailylook", "outfitinspo", "koreanstyle", "kfashion", "streetstyle", "fashionreels", "lookbook", "styleinspo", "menswear", "womenswear", "streetwear"}
+        self.assertEqual(len(FASHION_KEYWORDS), 36)
+        self.assertFalse(removed.intersection(FASHION_KEYWORDS))
+        config = parse_scheduled_command("fashion", [])
+        self.assertEqual(config.hashtag_candidates_per_keyword, 200)
+        self.assertFalse(hasattr(config, "keywords_per_window"))
+
+    def test_scheduled_commands_select_their_requested_domains(self) -> None:
+        config = parse_fashion_command([])
+
+        self.assertEqual(config.domains, ("fashion",))
+        self.assertEqual(config.duration_hours, 16)
+        self.assertEqual(config.target_snapshots, 4)
+        self.assertEqual(config.discovery_hours, 4)
+        self.assertFalse(hasattr(config, "new_items_per_window"))
+        self.assertFalse(hasattr(config, "max_new_items_per_window"))
+        self.assertFalse(hasattr(config, "keywords_per_window"))
+        self.assertEqual(config.max_upload_age_days, 30)
+        self.assertEqual(parse_scheduled_command("beauty", []).domains, ("beauty",))
+        self.assertEqual(
+            parse_scheduled_command("fashion-beauty", []).domains,
+            ("fashion", "beauty"),
+        )
+        self.assertTrue(parse_scheduled_command("fashion", ["--background"]).background)
+        self.assertFalse(parse_scheduled_command("fashion", []).collect_hashtag_media_count)
+        self.assertTrue(
+            parse_scheduled_command("fashion", ["--collect-hashtag-media-count"]).collect_hashtag_media_count
+        )
+        self.assertEqual(parse_scheduled_command("beauty", ["--maxdays", "14"]).max_upload_age_days, 14)
+        self.assertEqual(parse_scheduled_command("beauty", ["--max-upload-days", "14"]).max_upload_age_days, 14)
+        self.assertEqual(
+            parse_scheduled_command("fashion", ["--hashtag-candidates-per-keyword", "100"]).hashtag_candidates_per_keyword,
+            100,
+        )
+
+    def test_scheduled_run_can_resume_its_original_start_time(self) -> None:
+        resumed = parse_scheduled_command("fashion", ["--resume-started-at", "2026-09-25T05:00:52Z"])
+        self.assertEqual(resumed.resume_started_at, datetime(2026, 9, 25, 5, 0, 52, tzinfo=timezone.utc))
+        with self.assertRaises(SystemExit):
+            parse_scheduled_command("fashion", ["--resume-started-at", "2026-09-25T05:00:52"])
+
+    def test_test_single_hashtag_keeps_only_one_keyword_without_changing_normal_defaults(self) -> None:
+        config = parse_scheduled_command("fashion", ["--test-single-hashtag"])
+
+        self.assertEqual(config.fashion_keywords, (FASHION_KEYWORDS[0],))
+        self.assertEqual(parse_scheduled_command("fashion", []).fashion_keywords, FASHION_KEYWORDS)
+
+    def test_discovery_defaults_to_duration_minus_twelve_hours(self) -> None:
+        self.assertEqual(
+            parse_fashion_command(["--duration-hours", "24"]).discovery_hours,
+            12,
+        )
+
+    def test_three_snapshots_allow_a_thirteen_hour_run(self) -> None:
+        config = parse_fashion_command([
+            "--duration-hours", "13", "--target-snapshots", "3", "--discovery-hours", "4",
+        ])
+        self.assertEqual((config.duration_hours, config.target_snapshots, config.discovery_hours), (13, 3, 4))
+        with self.assertRaises(SystemExit):
+            parse_fashion_command(["--duration-hours", "13", "--discovery-hours", "4"])
+
+    def test_discovery_cannot_exceed_duration_minus_twelve_hours(self) -> None:
+        self.assertEqual(
+            parse_fashion_command(["--duration-hours", "24", "--discovery-hours", "12"]).discovery_hours,
+            12,
+        )
+        with self.assertRaises(SystemExit):
+            parse_fashion_command(["--duration-hours", "24", "--discovery-hours", "13"])
+        with self.assertRaises(SystemExit):
+            parse_fashion_command(["--duration-hours", "12"])
+
+    def test_three_minute_recollection_option_allows_a_short_test_run(self) -> None:
+        config = parse_fashion_command([
+            "--recollection-interval-minutes", "3",
+            "--duration-hours", "0.25",
+            "--discovery-hours", "0.1",
+        ])
+        self.assertEqual(config.recollection_interval_minutes, 3)
+        self.assertEqual(config.discovery_hours, 0.1)
+        self.assertEqual(parse_fashion_command([]).recollection_interval_minutes, 240)
+
+    def test_six_hour_new_only_preset_uses_shared_standard_outputs(self) -> None:
+        config = parse_scheduled_command("fashion-beauty", ["--six-hour-new-only"])
+
+        self.assertEqual(config.duration_hours, 6)
+        self.assertEqual(config.discovery_hours, 6)
+        self.assertTrue(config.new_only)
+        self.assertTrue(config.base_output)
+        self.assertEqual(config.max_upload_age_days, 365)
+        self.assertEqual(config.hashtag_candidates_per_keyword, 200)
+        self.assertEqual(config.fashion_keywords, FASHION_KEYWORDS)
+        self.assertEqual(config.beauty_keywords, BEAUTY_KEYWORDS)
+        self.assertTrue(all(dataset.data_root == config.data_root for dataset in datasets(config)))
+
+    def test_six_hour_new_only_preset_requires_both_domains(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_scheduled_command("fashion", ["--six-hour-new-only"])
+
+    def test_custom_discovery_interval_changes_the_active_domain(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = parse_fashion_command(["--discovery-interval-minutes", "15"])
+
+        self.assertEqual(
+            window_dataset(
+                started_at,
+                started_at + timedelta(minutes=15),
+                config.discovery_interval_minutes,
+            ),
+            "beauty",
+        )
+
+    def test_custom_hashtag_query_replaces_the_domain_keywords(self) -> None:
+        config = parse_fashion_command([
+            "--fashion-hashtag-query",
+            "runway OR streetwear",
+        ])
+
+        self.assertEqual(tuple(hashtag_at(config.fashion_keywords, index) for index in (1, 2)), ("runway", "streetwear"))
+        self.assertEqual(config.beauty_keywords, BEAUTY_KEYWORDS)
+
+    def test_fashion_rejects_unsafe_numeric_options(self) -> None:
+        invalid_arguments = (
+            ["--duration-hours", "nan"],
+            ["--discovery-hours", "0"],
+            ["--discovery-interval-minutes", "inf"],
+            ["--new-items-per-window", "0"],
+            ["--max-new-items-per-window", "301"],
+            ["--new-items-per-window", "51", "--max-new-items-per-window", "50"],
+            ["--max-upload-days", "-1"],
+        )
+
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                parse_fashion_command(arguments)
+
+    def test_fashion_launcher_dispatches_without_running_the_real_collector(self) -> None:
+        with patch(
+            "scripts.instagram_reels_python.run_fashion_beauty_collection",
+            new=AsyncMock(return_value=0),
+        ):
+            result = launcher_main(["fashion"])
+
+        self.assertEqual(result, 0)
+
+    def test_hashtag_post_presets_use_the_complete_saved_keyword_lists(self) -> None:
+        presets = {
+            "fashion": tuple(FASHION_KEYWORDS),
+            "beauty": tuple(BEAUTY_KEYWORDS),
+            "fashion-beauty": tuple(dict.fromkeys((*FASHION_KEYWORDS, *BEAUTY_KEYWORDS))),
+        }
+
+        for preset, expected in presets.items():
+            with self.subTest(preset=preset), patch(
+                "scripts.instagram_reels_python.collect_hashtag_count_report",
+                new=AsyncMock(return_value=([], {"xlsx": Path("hashtags.xlsx")}, [])),
+            ) as collect, patch("scripts.instagram_reels_python.append_collection_log"):
+                result = launcher_main(["hashtag-posts", "--preset", preset])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(tuple(collect.await_args.args[1]), expected)
+
+    def test_hashtag_post_command_rejects_query_and_preset_together(self) -> None:
+        with self.assertRaises(SystemExit):
+            launcher_main([
+                "hashtag-posts",
+                "--preset",
+                "fashion",
+                "--hashtag-query",
+                "ootd",
+            ])
+
+
+class SchedulerTests(unittest.TestCase):
+    def test_due_time_uses_four_hour_interval_anchored_to_first_snapshot(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        rows = [
+            {"url": "https://www.instagram.com/reels/a/", "collection_number": "1", "collected_at": isoformat_utc(base)},
+            {"url": "https://www.instagram.com/reels/a/", "collection_number": "2", "collected_at": isoformat_utc(base + RECOLLECTION_INTERVAL)},
+        ]
+        jobs = due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + RECOLLECTION_INTERVAL * 2)
+        self.assertEqual([(job.url, job.due_at) for job in jobs], [("https://www.instagram.com/reels/a/", base + RECOLLECTION_INTERVAL * 2)])
+
+    def test_four_hour_schedule_stops_after_four_total_snapshots(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        rows = [{"url": "https://www.instagram.com/reels/a/", "collection_number": str(index + 1), "collected_at": isoformat_utc(base + SNAPSHOT_OFFSETS[index])} for index in range(len(SNAPSHOT_OFFSETS))]
+        jobs = due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + RECOLLECTION_INTERVAL * len(SNAPSHOT_OFFSETS))
+        self.assertEqual(jobs, [])
+
+    def test_configured_schedule_stops_after_three_total_snapshots(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        dataset = DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS)
+        rows = [
+            {"url": "https://www.instagram.com/reels/a/", "collection_number": index + 1,
+             "collected_at": isoformat_utc(base + RECOLLECTION_INTERVAL * index)}
+            for index in range(3)
+        ]
+        self.assertEqual(due_jobs(dataset, rows, base + RECOLLECTION_INTERVAL * 3, target_snapshots=3), [])
+        self.assertEqual(len(due_jobs(dataset, rows[:2], base + RECOLLECTION_INTERVAL * 2,
+                                      target_snapshots=3)), 1)
+
+    def test_three_minute_interval_recollects_three_times_from_first_snapshot(self) -> None:
+        base = datetime(2026, 9, 25, tzinfo=timezone.utc)
+        dataset = DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS)
+        rows = []
+        for index in range(4):
+            if index:
+                jobs = due_jobs(dataset, rows, base + timedelta(minutes=3 * index), timedelta(minutes=3))
+                self.assertEqual([job.due_at for job in jobs], [base + timedelta(minutes=3 * index)])
+            rows.append({"url": "https://www.instagram.com/reels/a/", "collection_number": index + 1,
+                         "collected_at": isoformat_utc(base + timedelta(minutes=3 * index))})
+        self.assertEqual(due_jobs(dataset, rows, base + timedelta(minutes=12), timedelta(minutes=3)), [])
+
+    def test_fashion_run_only_recollects_reels_first_collected_in_that_run(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        dataset = DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS)
+        rows = [
+            {"url": "https://www.instagram.com/reels/older/", "collection_number": 1,
+             "collected_at": isoformat_utc(started - timedelta(hours=1))},
+            {"url": "https://www.instagram.com/reels/current/", "collection_number": 1,
+             "collected_at": isoformat_utc(started)},
+            {"url": "https://www.instagram.com/reels/no-initial/", "collection_number": 2,
+             "collected_at": isoformat_utc(started)},
+        ]
+
+        jobs = due_jobs(dataset, rows, started + RECOLLECTION_INTERVAL, first_collected_at=started)
+
+        self.assertEqual([job.url for job in jobs], ["https://www.instagram.com/reels/current/"])
+
+    def test_domains_alternate_and_hashtag_lists_have_expected_sizes(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        self.assertEqual(window_dataset(base, base), "fashion")
+        self.assertEqual(window_dataset(base, base + timedelta(minutes=30)), "beauty")
+        self.assertEqual(len(FASHION_KEYWORDS), 36)
+        self.assertEqual(len(BEAUTY_KEYWORDS), 48)
+        self.assertEqual(hashtag_at(FASHION_KEYWORDS, 3), FASHION_KEYWORDS[2])
+
+    def test_upload_age_filters_only_initial_candidates(self) -> None:
+        captured = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        self.assertTrue(is_initial_candidate_allowed("2026-07-27T00:00:00Z", captured, 30))
+        self.assertFalse(is_initial_candidate_allowed("2026-07-26T23:59:59Z", captured, 30))
+
+    def test_initial_count_uses_only_initial_rows_in_half_open_window(self) -> None:
+        start = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        end = start + timedelta(hours=1)
+        rows = [
+            {"url": "https://www.instagram.com/reels/a/", "collection_number": "1", "collected_at": isoformat_utc(start)},
+            {"url": "https://www.instagram.com/reels/b/", "collection_number": "2", "collected_at": isoformat_utc(start + timedelta(minutes=10))},
+            {"url": "https://www.instagram.com/reels/c/", "collection_number": "1", "collected_at": isoformat_utc(end)},
+            {"url": "https://www.instagram.com/reels/d/", "collection_number": "1", "collected_at": "not-a-timestamp"},
+        ]
+        self.assertEqual(initial_count_in_window(rows, start, end), 1)
+
+    def test_hashtags_are_selected_individually_and_cycle(self) -> None:
+        self.assertEqual([hashtag_at(FASHION_KEYWORDS, index) for index in range(1, 37)], list(FASHION_KEYWORDS))
+        self.assertEqual(hashtag_at(FASHION_KEYWORDS, 37), FASHION_KEYWORDS[0])
+        self.assertEqual(hashtag_at(FASHION_KEYWORDS, 38), FASHION_KEYWORDS[1])
+
+    def test_hashtag_selection_rejects_empty_list_and_zero_position(self) -> None:
+        for keywords, position in (((), 1), (FASHION_KEYWORDS, 0)):
+            with self.subTest(position=position), self.assertRaises(ValueError):
+                hashtag_at(keywords, position)
+
+    def test_malformed_url_or_timestamp_is_excluded_from_due_jobs(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        rows = [
+            {"url": "not a URL", "collection_number": "1", "collected_at": isoformat_utc(base)},
+            {"url": "https://www.instagram.com/reels/b/", "collection_number": "1", "collected_at": "not-a-timestamp"},
+        ]
+        self.assertEqual(due_jobs(DatasetConfig("fashion", Path("C:/tmp"), FASHION_KEYWORDS), rows, base + timedelta(days=2)), [])
+
+    def test_initial_count_ignores_malformed_url(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        rows = [{"url": "not a URL", "collection_number": "1", "collected_at": isoformat_utc(base)}]
+        self.assertEqual(initial_count_in_window(rows, base, base + timedelta(hours=1)), 0)
+
+    def test_initial_count_rejects_invalid_port_but_keeps_valid_url(self) -> None:
+        base = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        rows = [
+            {"url": "https://instagram.com:bad/reels/a/", "collection_number": "1", "collected_at": isoformat_utc(base)},
+            {"url": "https://instagram.com/reels/b/", "collection_number": "1", "collected_at": isoformat_utc(base + timedelta(minutes=1))},
+        ]
+        self.assertEqual(initial_count_in_window(rows, base, base + timedelta(hours=1)), 1)
+
+
+class ManualClock:
+    def __init__(self, current: datetime) -> None:
+        self.current = current
+
+    def __call__(self) -> datetime:
+        return self.current
+
+    def advance(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds)
+
+
+class SupervisorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limit_cooldown_survives_restart_and_blocks_other_due_urls(self):
+        from src.reels import fashion_beauty_collection as module
+        started = datetime(2026, 10, 23, tzinfo=timezone.utc)
+        clock = ManualClock(started)
+        config = replace(self.config, domains=("fashion", "beauty"), duration_hours=21 / 60, discovery_hours=0, target_snapshots=2)
+        first, second = "https://www.instagram.com/reels/ONE/", "https://www.instagram.com/reels/TWO/"
+        history = self.write_history("fashion", [
+            {"url": first, "collection_number": 1, "collected_at": isoformat_utc(started - RECOLLECTION_INTERVAL)},
+            {"url": second, "collection_number": 1, "collected_at": isoformat_utc(started - RECOLLECTION_INTERVAL + timedelta(minutes=1))},
+        ])
+        calls = []
+        fail_read = False
+        original_read = module.read_history
+        def read(dataset):
+            nonlocal fail_read
+            if fail_read and clock() > started:
+                fail_read = False
+                raise PermissionError("transient history read during cooldown")
+            return original_read(dataset)
+        async def invoke(**kwargs):
+            nonlocal fail_read
+            calls.append((clock(), list(kwargs["urls"])))
+            status = history.parent.parent / "collector_status.json"
+            if len(calls) == 1:
+                status.write_text(json.dumps({"failure_code": "rate_limited", "retry_after_seconds": 1200}))
+                fail_read = True
+                return 2
+            status.write_text(json.dumps({"state": "completed"}))
+            with history.open("a", newline="", encoding="utf-8") as file:
+                for url in kwargs["urls"]:
+                    csv.writer(file).writerow([url, 2, isoformat_utc(clock())])
+            return 0
+        async def wait(_event, seconds):
+            clock.advance(seconds)
+        with patch.object(module, "read_history", side_effect=read), patch.object(module, "wait_for_stop_or_timeout", new=wait), patch.object(module, "analyze_qualifying_fashion_reels", new=AsyncMock(return_value={})):
+            await run_fashion_beauty_collection(config, invoke=invoke, clock=clock)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0], started + timedelta(minutes=20))
+        self.assertEqual(set(calls[1][1]), {first, second})
+        self.assertEqual(clock(), started + timedelta(minutes=20))
+
+    async def test_cached_terminal_rate_limit_context_is_closed_after_batch_only(self):
+        from unittest.mock import Mock
+        from src.reels import fashion_beauty_collection as module
+        from src.reels.instagram_reels_browser import InstagramRateLimitState
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal):
+                context = Mock()
+                state = InstagramRateLimitState(limited=True, manual_pause=True, terminate_after_resume=terminal)
+                context._instagram_collector_rate_limit_state = state
+                session = RecollectionBrowserSession()
+                session.context = context
+                with patch.object(module, "run_collectors_in_shared_context", new=AsyncMock(return_value=[2])), patch.object(session, "close", new=AsyncMock()) as close:
+                    self.assertEqual(await session.run([object()], None), [2])
+                self.assertEqual(close.await_count, 1 if terminal else 0)
+                self.assertTrue(state.limited)
+                self.assertEqual(state.resume_count, 0)
+
+    async def test_supervisor_retries_infrastructure_error_without_extending_duration(self):
+        from src.reels import fashion_beauty_collection as module
+        started = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        clock = ManualClock(started)
+        config = replace(self.config, domains=("fashion",), duration_hours=60 / 3600, discovery_hours=0)
+        seen = []
+        async def run(run_config, **kwargs):
+            seen.append(run_config.resume_started_at)
+            if len(seen) == 1:
+                raise OSError("temporary history read failure")
+            clock.current = started + timedelta(seconds=60)
+            return 0
+        async def wait(_event, seconds):
+            clock.advance(seconds)
+        with patch.object(module, "_run_fashion_beauty_collection", new=AsyncMock(side_effect=run)), patch.object(module, "wait_for_stop_or_timeout", new=wait):
+            self.assertEqual(await run_fashion_beauty_collection(config, clock=clock), 0)
+        self.assertEqual(seen, [started, started])
+        self.assertEqual(clock(), started + timedelta(seconds=60))
+
+    async def test_explicit_stop_survives_cleanup_failure_without_restarting(self):
+        from src.reels import fashion_beauty_collection as module
+        started = datetime(2026, 10, 22, tzinfo=timezone.utc)
+        clock = ManualClock(started)
+        async def run(config, **kwargs):
+            kwargs["lifecycle_stop_event"].set()
+            raise OSError("cleanup after user stop failed")
+        with patch.object(module, "_run_fashion_beauty_collection", new=AsyncMock(side_effect=run)) as invoke:
+            self.assertEqual(await run_fashion_beauty_collection(self.config, clock=clock), 0)
+        invoke.assert_awaited_once()
+
+    async def test_maintenance_is_retried_after_web_discovery_finishes(self):
+        config = replace(self.config, domains=("fashion",), discovery_hours=0,
+                         android_adb_path=Path("D:/Team SDK/adb.exe"), android_device_id="team-phone")
+        clock = ManualClock(datetime(2026, 10, 22, tzinfo=timezone.utc))
+        queue = self.data_root / ".datasets/fashion/.collector/android_metric_queue/pending"
+        queue.mkdir(parents=True)
+        job = queue / "job.json"
+        job.write_text('{}')
+        def launch(*args, **runtime):
+            self.assertEqual(runtime, {"adb_path": config.android_adb_path, "device_id": "team-phone"})
+            if self.start_android_worker.call_count >= 2:
+                job.unlink()
+            return False
+        self.start_android_worker.side_effect = launch
+        async def wait(_event, seconds):
+            clock.advance(seconds)
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=wait):
+            result = await run_fashion_beauty_collection(config, invoke=AsyncMock(), clock=clock)
+        self.assertEqual(result, 0)
+        self.assertEqual(self.start_android_worker.call_count, 2)
+        self.assertFalse(job.exists())
+
+    async def test_idle_final_publication_failure_gets_another_attempt(self):
+        config = replace(self.config, domains=("fashion",), discovery_hours=0)
+        clock = ManualClock(datetime(2026, 10, 22, tzinfo=timezone.utc))
+        async def wait(_event, seconds):
+            clock.advance(seconds)
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=wait), patch("src.reels.fashion_beauty_collection.publish_dataset_outputs", side_effect=[PermissionError("locked"), {}]) as publish:
+            self.assertEqual(await run_fashion_beauty_collection(config, invoke=AsyncMock(), clock=clock), 0)
+        self.assertEqual(publish.call_count, 2)
+
+    async def test_android_recovery_failure_does_not_stop_web_or_lose_queue(self):
+        config = replace(self.config, domains=("fashion",), duration_hours=1, discovery_hours=1)
+        clock = ManualClock(datetime(2026, 10, 22, tzinfo=timezone.utc))
+        calls = []
+        queue = self.data_root / ".datasets/fashion/.collector/android_metric_queue"
+        async def invoke(**kwargs):
+            calls.append(kwargs)
+            (queue / "pending").mkdir(parents=True, exist_ok=True)
+            (queue / "pending/job.json").write_text(json.dumps({"job_id": "job", "target": {"url": "https://www.instagram.com/reels/ONE/"}}), encoding="utf-8")
+            (queue / "status.json").write_text(json.dumps({"state": "recovery_failed", "stop_reason": "ADB command timed out after 15s: shell am start"}), encoding="utf-8")
+            clock.current += timedelta(minutes=30)
+            return 0
+        result = await run_fashion_beauty_collection(config, invoke=invoke, clock=clock)
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["android_state"], "recovery_wait")
+        self.assertIn("shell am start", status["android_error"])
+        self.assertIn("pending=1", status["android_error"])
+        self.start_android_worker.assert_called()
+        self.assertTrue((queue / "pending/job.json").exists())
+
+    async def test_locked_publication_and_status_are_retried_without_stopping_collection(self):
+        from src.reels import fashion_beauty_collection as module
+        config = replace(self.config, domains=("fashion",), duration_hours=1, discovery_hours=1)
+        clock = ManualClock(datetime(2026, 10, 22, tzinfo=timezone.utc))
+        calls = []
+        async def invoke(**kwargs):
+            calls.append(kwargs)
+            clock.current += timedelta(minutes=30)
+            return 0
+        original_write = module.write_dataset_status
+        writes = []
+        def write(dataset, state):
+            writes.append(state)
+            if len(writes) == 1:
+                raise PermissionError("status locked")
+            original_write(dataset, state)
+        with patch.object(module, "publish_dataset_outputs", side_effect=[PermissionError("Excel locked"), {}]) as publish, patch.object(module, "write_dataset_status", side_effect=write):
+            result = await run_fashion_beauty_collection(config, invoke=invoke, clock=clock)
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(publish.call_count, 2)
+        self.assertEqual(len(writes), 3)
+        self.assertEqual(writes[0]["publication_error"], "Excel locked")
+        self.assertNotIn("publication_error", writes[1])
+        self.assertEqual(json.loads((self.data_root / "collector_status.json").read_text())["state"], "completed")
+
+    async def test_cached_browser_reopens_only_after_context_close_event(self):
+        from unittest.mock import Mock
+        from src.reels import fashion_beauty_collection as module
+        for closed in (True, False):
+            with self.subTest(closed=closed):
+                contexts = [Mock(), Mock()]
+                runtime = Mock()
+                runtime.stop = AsyncMock()
+                factory = Mock()
+                factory.return_value.start = AsyncMock(return_value=runtime)
+                async def collect(*args, **kwargs):
+                    if run.await_count == 1 and closed:
+                        contexts[0].on.call_args.args[1]()
+                    return [2] if run.await_count == 1 else [0]
+                with patch.object(module, "load_playwright", return_value=factory), patch.object(module, "locate_browser_executable", return_value="browser"), patch.object(module, "launch_collection_context", new=AsyncMock(side_effect=[(None, ctx) for ctx in contexts])) as launch, patch.object(module, "run_collectors_in_shared_context", new=AsyncMock(side_effect=collect)) as run, patch.object(module, "safe_close", new=AsyncMock()):
+                    session = RecollectionBrowserSession()
+                    self.assertEqual(await session.run([object()], None), [2])
+                    self.assertEqual(await session.run([object()], None), [0])
+                    self.assertEqual(launch.await_count, 2 if closed else 1)
+                    await session.close()
+
+    async def test_new_supervisor_run_retries_previous_recovery_failure(self):
+        config = replace(self.config, domains=("fashion",), duration_hours=0.5, discovery_hours=0.5)
+        queue = self.data_root / ".datasets/fashion/.collector/android_metric_queue"
+        queue.mkdir(parents=True)
+        (queue / "status.json").write_text(json.dumps({"state": "recovery_failed", "device_error": "UI unavailable"}), encoding="utf-8")
+        clock = ManualClock(datetime(2026, 10, 3, tzinfo=timezone.utc))
+        async def collect(**kwargs):
+            clock.current += timedelta(minutes=30)
+            return 0
+        invoke = AsyncMock(side_effect=collect)
+        self.assertEqual(await run_fashion_beauty_collection(config, invoke=invoke, clock=clock), 0)
+        invoke.assert_awaited_once()
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["state"], "completed")
+        worker_status = json.loads((queue / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(worker_status["state"], "restart_requested")
+        self.assertEqual(worker_status["previous_recovery_error"], "UI unavailable")
+
+    def setUp(self) -> None:
+        worker_patch = patch("src.reels.fashion_beauty_collection.start_android_metric_worker", create=True)
+        self.start_android_worker = worker_patch.start()
+        self.addCleanup(worker_patch.stop)
+        restart_patch = patch("src.reels.fashion_beauty_collection.enqueue_android_app_restart")
+        self.enqueue_app_restart = restart_patch.start()
+        self.addCleanup(restart_patch.stop)
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.data_root = Path(self.temporary_directory.name)
+        self.config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=1,
+            discovery_hours=1,
+            discovery_interval_minutes=30,
+        )
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def write_history(self, dataset: str, rows: list[dict[str, object]]) -> Path:
+        destination = self.data_root / ".datasets" / dataset / ".collector" / "reels_history_active.csv"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+            writer.writeheader()
+            writer.writerows(rows)
+        return destination
+
+    async def test_foreground_browser_stays_open_only_for_nearby_recollections(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        first_url = "https://www.instagram.com/reels/first/"
+        second_url = "https://www.instagram.com/reels/second/"
+        config = replace(
+            self.config, domains=("fashion",), resume_started_at=started,
+            discovery_hours=0, recollection_interval_minutes=10,
+        )
+
+        for gap_minutes in (4, 6):
+            with self.subTest(gap_minutes=gap_minutes):
+                history = self.write_history("fashion", [
+                    {"url": first_url, "collection_number": 1, "collected_at": isoformat_utc(started)},
+                    {"url": second_url, "collection_number": 1,
+                     "collected_at": isoformat_utc(started + timedelta(minutes=gap_minutes))},
+                ])
+                clock = ManualClock(started + timedelta(minutes=10))
+                events: list[str] = []
+                collected_at: dict[str, datetime] = {}
+
+                class FakeSession:
+                    def __init__(self) -> None:
+                        self.context: object | None = None
+
+                    async def run(self, options: object, stop_event: asyncio.Event) -> list[int]:
+                        if self.context is None:
+                            self.context = object()
+                            events.append("open")
+                        urls = options[0].urls_file.read_text(encoding="utf-8").splitlines()
+                        for url in urls:
+                            label = "first" if url == first_url else "second"
+                            events.append(label)
+                            collected_at[label] = clock()
+                            with history.open("a", newline="", encoding="utf-8") as file:
+                                csv.writer(file).writerow([url, 2, isoformat_utc(clock())])
+                            if url == second_url:
+                                stop_event.set()
+                        return [0]
+
+                    async def close(self) -> None:
+                        if self.context is not None:
+                            events.append("close")
+                            self.context = None
+
+                async def fake_wait(_event: object, seconds: float) -> bool:
+                    clock.advance(seconds)
+                    return False
+
+                with (
+                    patch("src.reels.fashion_beauty_collection.RecollectionBrowserSession", new=FakeSession),
+                    patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait),
+                ):
+                    await run_fashion_beauty_collection(config, clock=clock)
+
+                self.assertEqual(collected_at["second"], started + timedelta(minutes=10 + gap_minutes))
+                self.assertEqual(
+                    events,
+                    ["open", "first", "second", "close"] if gap_minutes == 4
+                    else ["open", "first", "close", "open", "second", "close"],
+                )
+
+    def test_archived_and_pending_rows_keep_their_four_hour_recollection_times(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        archived = {"url": "https://www.instagram.com/reels/early/", "collection_number": 1,
+                    "collected_at": isoformat_utc(started + timedelta(minutes=5))}
+        active = {"url": "https://www.instagram.com/reels/later/", "collection_number": 1,
+                  "collected_at": isoformat_utc(started + timedelta(minutes=57))}
+        journal_row = {"url": "https://www.instagram.com/reels/latest/",
+                       "collected_at": isoformat_utc(started + timedelta(hours=3))}
+        history = self.write_history("fashion", [active])
+        archive = history.with_name("reels_history_active_legacy_20260925T060053Z.csv")
+        with archive.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+            writer.writeheader()
+            writer.writerows([archived, active])
+        Path(f"{history}.pending.jsonl").write_text(json.dumps(journal_row) + "\n", encoding="utf-8")
+
+        rows = read_history(datasets(replace(self.config, domains=("fashion",)))[0])
+        self.assertEqual(len(rows), 3)
+        due = due_jobs(DatasetConfig("fashion", history.parent.parent, ()), rows,
+                       started + timedelta(hours=4, minutes=6))
+        self.assertEqual([job.url for job in due], [archived["url"]])
+
+    async def test_resumed_run_collects_an_overdue_archived_reel(self) -> None:
+        original_start = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        config = replace(self.config, resume_started_at=original_start, duration_hours=16,
+                         discovery_hours=4, domains=("fashion",))
+        history = self.write_history("fashion", [])
+        archive = history.with_name("reels_history_active_legacy_20260925T060053Z.csv")
+        with archive.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+            writer.writeheader()
+            writer.writerow({"url": "https://www.instagram.com/reels/early/", "collection_number": 1,
+                             "collected_at": isoformat_utc(original_start + timedelta(minutes=5))})
+        clock = ManualClock(original_start + timedelta(hours=4, minutes=6))
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            clock.current = original_start + timedelta(hours=16)
+            return 0
+
+        await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([(call["mode"], call["urls"]) for call in calls],
+                         [("recollect", ["https://www.instagram.com/reels/early/"])])
+
+    async def test_fashion_run_skips_previous_runs_due_recollections(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        config = replace(self.config, domains=("fashion",), duration_hours=16, discovery_hours=4)
+        history = self.write_history("fashion", [
+            {"url": "https://www.instagram.com/reels/older/", "collection_number": 1,
+             "collected_at": isoformat_utc(started - timedelta(hours=1))},
+        ])
+        clock = ManualClock(started)
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if kwargs["mode"] == "discover":
+                with history.open("a", newline="", encoding="utf-8") as file:
+                    csv.writer(file).writerow([
+                        "https://www.instagram.com/reels/current/", 1, isoformat_utc(started)
+                    ])
+                clock.current = started + RECOLLECTION_INTERVAL
+            else:
+                clock.current = started + timedelta(hours=16)
+            return 0
+
+        async def fake_wait(_event: object, _seconds: float) -> bool:
+            clock.current = started + RECOLLECTION_INTERVAL
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([(call["mode"], call.get("urls")) for call in calls],
+                         [("discover", None), ("recollect", ["https://www.instagram.com/reels/current/"])])
+
+    async def test_three_minute_run_invokes_each_recollection(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        url = "https://www.instagram.com/reels/quick/"
+        config = replace(self.config, duration_hours=0.25, discovery_hours=0.1,
+                         recollection_interval_minutes=3, domains=("fashion",), resume_started_at=started)
+        history = self.write_history("fashion", [
+            {"url": url, "collection_number": 1, "collected_at": isoformat_utc(started)},
+        ])
+        clock = ManualClock(started + timedelta(minutes=3))
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            with history.open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow([url, len(calls) + 1, isoformat_utc(clock())])
+            clock.advance(3 * 60)
+            return 0
+
+        async def fake_wait(_event, seconds):
+            clock.advance(seconds)
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([call["mode"] for call in calls], ["recollect"] * 3)
+        self.assertEqual(clock(), started + timedelta(minutes=12))
+
+    async def test_missing_snapshot_retries_only_its_reel_after_successful_batch(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        first = "https://www.instagram.com/reels/first/"
+        missing = "https://www.instagram.com/reels/missing/"
+        config = replace(
+            self.config, duration_hours=0.25, discovery_hours=0.05,
+            recollection_interval_minutes=3, target_snapshots=2,
+            domains=("fashion",), resume_started_at=started,
+        )
+        history = self.write_history("fashion", [
+            {"url": url, "collection_number": 1, "collected_at": isoformat_utc(started)}
+            for url in (first, missing)
+        ])
+        clock = ManualClock(started + timedelta(minutes=3))
+        calls: list[list[str]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            urls = list(kwargs["urls"])
+            calls.append(urls)
+            saved = first if len(calls) == 1 else missing
+            with history.open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow([saved, 2, isoformat_utc(clock())])
+            if len(calls) == 2:
+                clock.current = started + timedelta(hours=config.duration_hours)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(calls, [[first, missing], [missing]])
+
+    async def test_fashion_waits_for_recollection_of_pending_initial_snapshot(self) -> None:
+        started = datetime(2026, 9, 25, 5, tzinfo=timezone.utc)
+        url = "https://www.instagram.com/reels/pending_initial/"
+        config = replace(self.config, duration_hours=0.25, discovery_hours=0.1,
+                         recollection_interval_minutes=3, domains=("fashion",), resume_started_at=started)
+        history = self.write_history("fashion", [])
+        Path(f"{history}.pending.jsonl").write_text("\n".join(json.dumps(row) for row in [
+            {"url": "https://www.instagram.com/reels/older/",
+             "collected_at": isoformat_utc(started - timedelta(minutes=3))},
+            {"url": url, "collected_at": isoformat_utc(started + timedelta(minutes=5))},
+        ]) + "\n", encoding="utf-8")
+        clock = ManualClock(started + timedelta(minutes=7))
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            clock.current = started + timedelta(minutes=15)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+        self.assertEqual([(call["mode"], call["urls"]) for call in calls], [("recollect", [url])])
+
+    async def test_due_jobs_from_both_domains_run_before_active_window_discovery(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
+        initial_at = started_at - RECOLLECTION_INTERVAL
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=0.5,
+            discovery_hours=0.5,
+            discovery_interval_minutes=30,
+        )
+        histories = {
+            dataset: self.write_history(
+                dataset,
+                [{"url": f"https://www.instagram.com/reels/{dataset}/", "collection_number": 1, "collected_at": isoformat_utc(initial_at)}],
+            )
+            for dataset in ("fashion", "beauty")
+        }
+        clock = ManualClock(started_at)
+        calls: list[dict[str, object]] = []
+        lock_observations: list[tuple[bool, bool]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            lock_observations.append(
+                (
+                    (self.data_root / ".datasets" / "fashion_beauty_scheduler.lock.json").exists(),
+                    (self.data_root / ".datasets" / str(kwargs["dataset"]) / "collector.lock.json").exists(),
+                )
+            )
+            if kwargs["mode"] == "recollect":
+                history = histories[str(kwargs["dataset"])]
+                with history.open("a", newline="", encoding="utf-8") as file:
+                    csv.writer(file).writerow(
+                        [kwargs["urls"][0], 2, isoformat_utc(started_at)]  # type: ignore[index]
+                    )
+            else:
+                clock.current = started_at + timedelta(hours=config.duration_hours)
+            return 0
+
+        with patch(
+            "src.reels.fashion_beauty_collection.wait_for_stop_or_timeout",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call["mode"] for call in calls[:3]], ["recollect", "recollect", "discover"])
+        self.assertEqual({call["dataset"] for call in calls[:2]}, {"fashion", "beauty"})
+        self.assertEqual(calls[2]["dataset"], "fashion")
+        self.assertEqual(calls[2]["max_items"], 0)
+        self.assertTrue(all(supervisor and not generic for supervisor, generic in lock_observations))
+        self.assertTrue((self.data_root / "collector_status.json").exists())
+        self.assertTrue((self.data_root / "beauty_collector_status.json").exists())
+
+    async def test_due_recollections_for_one_domain_share_a_browser_invocation(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
+        config = replace(self.config, discovery_interval_minutes=60)
+        urls = [
+            "https://www.instagram.com/reels/batch-a/",
+            "https://www.instagram.com/reels/batch-b/",
+            "https://www.instagram.com/reels/batch-c/",
+        ]
+        history = self.write_history(
+            "fashion",
+            [
+                {
+                    "url": url,
+                    "collection_number": 1,
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+                }
+                for url in urls
+            ],
+        )
+        clock = ManualClock(started_at)
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if kwargs["mode"] == "recollect":
+                with history.open("a", newline="", encoding="utf-8") as file:
+                    writer = csv.writer(file)
+                    writer.writerows(
+                        [url, 2, isoformat_utc(clock())]
+                        for url in kwargs["urls"]  # type: ignore[index]
+                    )
+            else:
+                clock.current = started_at + timedelta(hours=config.duration_hours)
+            return 0
+
+        result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call["mode"] for call in calls], ["recollect", "discover"])
+        self.assertEqual(calls[0]["dataset"], "fashion")
+        self.assertEqual(calls[0]["urls"], urls)
+
+    async def test_due_recollections_for_both_domains_run_concurrently(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=0.5,
+            discovery_hours=0.5,
+            discovery_interval_minutes=30,
+        )
+        histories = {
+            dataset: self.write_history(
+                dataset,
+                [{
+                    "url": f"https://www.instagram.com/reels/{dataset}_parallel/",
+                    "collection_number": 1,
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+                }],
+            )
+            for dataset in ("fashion", "beauty")
+        }
+        clock = ManualClock(started_at)
+        active = max_active = 0
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            nonlocal active, max_active
+            calls.append(dict(kwargs))
+            if kwargs["mode"] == "discover":
+                clock.current = started_at + timedelta(hours=config.duration_hours)
+                return 0
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0)
+                dataset = str(kwargs["dataset"])
+                with histories[dataset].open("a", newline="", encoding="utf-8") as file:
+                    csv.writer(file).writerow(
+                        [kwargs["urls"][0], 2, isoformat_utc(clock())]  # type: ignore[index]
+                    )
+                return 0
+            finally:
+                active -= 1
+
+        result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(max_active, 2)
+        self.assertEqual({call["dataset"] for call in calls[:2]}, {"fashion", "beauty"})
+
+    async def test_default_cross_domain_batches_share_one_authenticated_context(self) -> None:
+        fashion_url = "https://www.instagram.com/reels/fashion_shared/"
+        beauty_url = "https://www.instagram.com/reels/beauty_shared/"
+        captured_url_files: list[str] = []
+
+        async def fake_shared_runner(options: list[object], **_kwargs: object) -> list[int]:
+            captured_url_files.extend(option.urls_file.read_text(encoding="utf-8") for option in options)  # type: ignore[union-attr]
+            return [0, 0]
+
+        shared_runner = AsyncMock(side_effect=fake_shared_runner)
+        with patch(
+            "src.reels.fashion_beauty_collection.run_collectors_in_shared_context",
+            new=shared_runner,
+        ):
+            results = await invoke_generic_recollection_batches(
+                config=self.config,
+                batches=(("fashion", (fashion_url,)), ("beauty", (beauty_url,))),
+            )
+
+        self.assertEqual(results, [0, 0])
+        options = shared_runner.await_args.args[0]
+        self.assertEqual(
+            [option.data_dir for option in options],
+            [self.data_root / ".datasets" / "fashion", self.data_root / ".datasets" / "beauty"],
+        )
+        self.assertEqual(captured_url_files, [f"{fashion_url}\n", f"{beauty_url}\n"])
+        self.assertTrue(all(not option.urls_file.exists() for option in options))
+
+    async def test_app_restart_occurs_one_minute_before_hourly_or_longer_recollection(self) -> None:
+        for interval_minutes in (30, 60, 240):
+            with self.subTest(interval_minutes=interval_minutes):
+                self.enqueue_app_restart.reset_mock()
+                started = datetime(2026, 10, 4, tzinfo=timezone.utc)
+                clock = ManualClock(started)
+                url = "https://www.instagram.com/reels/pre_restart/"
+                history = self.write_history("fashion", [{"url": url, "collection_number": 1, "collected_at": isoformat_utc(started)}])
+                config = replace(self.config, domains=("fashion",), discovery_hours=0,
+                                 recollection_interval_minutes=interval_minutes, target_snapshots=2,
+                                 resume_started_at=started, duration_hours=5)
+                restart_times = []
+                self.enqueue_app_restart.side_effect = lambda *args: restart_times.append(clock())
+                collected_times = []
+
+                async def invoke(**kwargs):
+                    collected_times.append(clock())
+                    with history.open("a", newline="", encoding="utf-8") as file:
+                        csv.writer(file).writerow([url, 2, isoformat_utc(clock())])
+                    return 0
+
+                async def wait(_event, seconds):
+                    clock.advance(seconds)
+                    return False
+
+                with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=wait):
+                    self.assertEqual(await run_fashion_beauty_collection(config, invoke=invoke, clock=clock), 0)
+                due_at = started + timedelta(minutes=interval_minutes)
+                self.assertEqual(collected_times, [due_at])
+                self.assertEqual(restart_times, [due_at - timedelta(minutes=1)] if interval_minutes >= 60 else [])
+                self.enqueue_app_restart.side_effect = None
+
+    async def test_recollection_period_finishes_when_target_snapshots_are_complete(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=16,
+            discovery_hours=0,
+            discovery_interval_minutes=30,
+            domains=("fashion",),
+        )
+        url = "https://www.instagram.com/reels/final_snapshot/"
+        history = self.write_history(
+            "fashion",
+            [
+                {
+                    "url": url,
+                    "collection_number": index,
+                    "collected_at": isoformat_utc(started_at),
+                }
+                for index in range(1, 3)
+            ],
+        )
+        clock = ManualClock(started_at)
+        waits: list[float] = []
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            with history.open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow([url, len(calls) + 2, isoformat_utc(clock())])
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(clock(), started_at + timedelta(hours=12))
+        self.assertEqual(waits[:4], [8 * 60 * 60 - 60, 60, 4 * 60 * 60 - 60, 60])
+        self.assertEqual(sum(waits), 12 * 60 * 60)
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["completion_reason"], "all_collection_work_finished")
+
+    async def test_new_only_mode_skips_existing_due_jobs_and_discovers(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        base_history = self.data_root / ".collector" / "reels_history_active.csv"
+        base_history.parent.mkdir(parents=True, exist_ok=True)
+        with base_history.open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+            writer.writeheader()
+            writer.writerow({
+                "url": "https://www.instagram.com/reels/due/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+            })
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=0.5,
+            discovery_hours=0.5,
+            discovery_interval_minutes=30,
+            new_only=True,
+            base_output=True,
+        )
+        clock = ManualClock(started_at)
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            clock.current = started_at + timedelta(minutes=30)
+            return 0
+
+        result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call["mode"] for call in calls], ["discover"])
+        self.assertEqual(calls[0]["dataset"], "fashion")
+        self.assertTrue((self.data_root / "collector_status.json").exists())
+        self.assertTrue((self.data_root / "beauty_collector_status.json").exists())
+
+    async def test_single_domain_new_only_advances_after_each_completed_hashtag(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=0.5,
+            discovery_hours=0.5,
+            discovery_interval_minutes=30,
+            new_only=True,
+            domains=("fashion",),
+        )
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if len(calls) == 2:
+                clock.current = started_at + timedelta(minutes=30)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call["max_items"] for call in calls], [0, 0])
+        self.assertEqual(calls[0]["hashtags"], (FASHION_KEYWORDS[0],))
+        self.assertEqual(
+            calls[1]["hashtags"],
+            (FASHION_KEYWORDS[1],),
+        )
+
+    async def test_fashion_beauty_new_only_keeps_its_alternating_keyword_rotation(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=1,
+            discovery_hours=1,
+            discovery_interval_minutes=30,
+            new_only=True,
+            domains=("fashion", "beauty"),
+        )
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                clock.current = started_at + timedelta(minutes=30)
+            elif len(calls) == 2:
+                clock.current = started_at + timedelta(hours=1)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call["dataset"] for call in calls], ["fashion", "beauty"])
+        self.assertEqual(calls[0]["hashtags"], (FASHION_KEYWORDS[0],))
+        self.assertEqual(calls[1]["hashtags"], (BEAUTY_KEYWORDS[0],))
+
+    def test_keyword_window_index_only_freezes_single_domain_new_only_runs(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        later = started_at + timedelta(minutes=30)
+        fashion_returns = started_at + timedelta(minutes=60)
+        fashion_new_only = RunConfig(data_root=self.data_root, new_only=True, domains=("fashion",))
+        fashion_normal = RunConfig(data_root=self.data_root, domains=("fashion",))
+        combined_new_only = RunConfig(data_root=self.data_root, new_only=True, domains=("fashion", "beauty"))
+
+        self.assertEqual(active_hashtag_position(fashion_new_only, started_at, later), 1)
+        self.assertEqual(active_hashtag_position(fashion_normal, started_at, later), 2)
+        self.assertEqual(active_hashtag_position(combined_new_only, started_at, later), 1)
+        self.assertEqual(active_hashtag_position(combined_new_only, started_at, fashion_returns), 2)
+
+    async def test_discovery_rechecks_window_and_deadlines_after_each_bounded_batch(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                clock.current = started_at + timedelta(minutes=31)
+            else:
+                clock.current = started_at + timedelta(hours=1)
+            return 0
+
+        with patch(
+            "src.reels.fashion_beauty_collection.wait_for_stop_or_timeout",
+            new=AsyncMock(return_value=False),
+        ):
+            result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            [(call["dataset"], call["max_items"]) for call in calls],
+            [("fashion", 0), ("beauty", 0)],
+        )
+        fashion_status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("deadline", fashion_status["last_error"].lower())
+
+    async def test_discovery_deadline_allows_saved_reel_enrichment_to_finish(self) -> None:
+        discovery_stop_event = asyncio.Event()
+        steps: list[str] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            steps.append("reel_saved")
+            await kwargs["discovery_stop_event"].wait()  # type: ignore[union-attr]
+            steps.append("follower_and_play_count_saved")
+            return 0
+
+        result, error = await _invoke_before_deadline(
+            fake_invoke,
+            lambda: datetime.now(timezone.utc),
+            datetime.now(timezone.utc) + timedelta(milliseconds=50),
+            graceful_stop_event=discovery_stop_event,
+            mode="discover",
+            discovery_stop_event=discovery_stop_event,
+        )
+
+        self.assertEqual((result, error), (0, ""))
+        self.assertEqual(steps, ["reel_saved", "follower_and_play_count_saved"])
+
+    async def test_recollection_enrichment_finishes_after_deadline(self) -> None:
+        for production in (False, True):
+            with self.subTest(production=production):
+                deadline = datetime.now(timezone.utc) + timedelta(milliseconds=20)
+                jobs = (DueJob("fashion", "https://www.instagram.com/reels/one/", deadline),)
+                steps = []
+                async def custom(**kwargs):
+                    steps.append("saved")
+                    await asyncio.sleep(0.04)
+                    steps.append("follower_and_views_saved")
+                    return 0
+                async def generic(**kwargs):
+                    return [await custom(**kwargs)]
+                with patch("src.reels.fashion_beauty_collection.invoke_generic_recollection_batches", side_effect=generic):
+                    outcomes = await _invoke_recollection_batches_before_deadline(
+                        invoke_generic_collector if production else custom,
+                        lambda: datetime.now(timezone.utc), deadline,
+                        config=self.config, batches=[("fashion", jobs)], stop_event=asyncio.Event(),
+                    )
+                self.assertEqual(outcomes, [(jobs, 0, "")])
+                self.assertEqual(steps, ["saved", "follower_and_views_saved"])
+
+    async def test_recollection_does_not_start_after_deadline(self) -> None:
+        deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+        jobs = (DueJob("fashion", "https://www.instagram.com/reels/one/", deadline),)
+        with patch("src.reels.fashion_beauty_collection.invoke_generic_recollection_batches", new_callable=AsyncMock) as invoke:
+            outcomes = await _invoke_recollection_batches_before_deadline(
+                invoke_generic_collector, lambda: datetime.now(timezone.utc), deadline,
+                config=self.config, batches=[("fashion", jobs)], stop_event=asyncio.Event(),
+            )
+        invoke.assert_not_awaited()
+        self.assertEqual(outcomes[0][1], 2)
+
+    async def test_recollection_drain_still_propagates_cancellation(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        async def generic(**kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=1)
+        jobs = (DueJob("fashion", "https://www.instagram.com/reels/one/", deadline),)
+        with patch("src.reels.fashion_beauty_collection.invoke_generic_recollection_batches", side_effect=generic):
+            task = asyncio.create_task(_invoke_recollection_batches_before_deadline(
+                invoke_generic_collector, lambda: datetime.now(timezone.utc), deadline,
+                config=self.config, batches=[("fashion", jobs)], stop_event=asyncio.Event(),
+            ))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(cancelled.is_set())
+
+    async def test_fashion_only_advances_hashtag_without_waiting_for_window(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=0.5,
+            discovery_hours=0.5,
+            discovery_interval_minutes=30,
+            domains=("fashion",),
+        )
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if len(calls) == 2:
+                clock.current = started_at + timedelta(minutes=30)
+            return 0
+
+        result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call["dataset"] for call in calls], ["fashion", "fashion"])
+        self.assertEqual(calls[0]["hashtags"], (FASHION_KEYWORDS[0],))
+        self.assertEqual(
+            calls[1]["hashtags"],
+            (FASHION_KEYWORDS[1],),
+        )
+
+    async def test_discovery_progress_is_carried_across_retries_in_one_window(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=1,
+            discovery_hours=1,
+            discovery_interval_minutes=30,
+            domains=("fashion",),
+        )
+        history = self.data_root / ".datasets" / "fashion" / ".collector" / "reels_history_active.csv"
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                history.parent.mkdir(parents=True)
+                with history.open("w", newline="", encoding="utf-8-sig") as file:
+                    writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+                    writer.writeheader()
+                    writer.writerow({
+                        "url": "https://www.instagram.com/reels/progress/",
+                        "collection_number": 1,
+                        "collected_at": isoformat_utc(started_at),
+                    })
+            else:
+                clock.current = started_at + timedelta(hours=1)
+            return 0
+
+        await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual([call["progress_offset"] for call in calls], [0, 1])
+
+    async def test_worker_stop_request_stops_the_supervisor_without_a_restart(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        calls: list[str] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(str(kwargs["dataset"]))
+            kwargs["stop_event"].set()  # type: ignore[index]
+            return 0
+
+        result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["fashion"])
+
+    async def test_overdue_snapshots_from_a_prior_run_are_not_recollected_immediately(self) -> None:
+        started_at = datetime(2026, 8, 27, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=1,
+            discovery_hours=1,
+            discovery_interval_minutes=30,
+            domains=("fashion",),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/prior-run/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - timedelta(hours=12)),
+            }],
+        )
+        calls: list[dict[str, object]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            calls.append(dict(kwargs))
+            kwargs["stop_event"].set()  # type: ignore[index]
+            return 0
+
+        await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual([(call["dataset"], call["mode"]) for call in calls], [("fashion", "discover")])
+
+    async def test_fashion_beauty_publishes_each_domain_to_its_own_outputs(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=1,
+            discovery_hours=1,
+            discovery_interval_minutes=30,
+            domains=("fashion", "beauty"),
+        )
+        calls: list[str] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            dataset = str(kwargs["dataset"])
+            calls.append(dataset)
+            workspace = self.data_root / ".datasets" / dataset
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "reels.csv").write_text(f"{dataset}-only", encoding="utf-8")
+            clock.current += timedelta(minutes=31)
+            return 0
+
+        await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(calls, ["fashion", "beauty"])
+        self.assertEqual((self.data_root / "reels.csv").read_text(encoding="utf-8"), "fashion-only")
+        self.assertEqual((self.data_root / "beauty_reels.csv").read_text(encoding="utf-8"), "beauty-only")
+
+    async def test_fresh_malformed_supervisor_lock_is_not_stolen(self) -> None:
+        lock_path = self.data_root / ".datasets" / "fashion_beauty_scheduler.lock.json"
+        lock_path.parent.mkdir(parents=True)
+        lock_path.write_bytes(b"")
+
+        with patch("src.reels.fashion_beauty_collection.asyncio.sleep", new=AsyncMock()) as retry_sleep:
+            with self.assertRaisesRegex(RuntimeError, "initializ"):
+                await SupervisorLock(lock_path).acquire()
+
+        self.assertTrue(lock_path.exists())
+        self.assertEqual(lock_path.read_bytes(), b"")
+        self.assertGreaterEqual(retry_sleep.await_count, 1)
+
+    def test_due_retry_backoff_is_bounded_for_long_outages(self) -> None:
+        self.assertEqual(
+            [_due_retry_delay(attempt) for attempt in (1, 2, 3, 4, 5, 6, 20_000)],
+            [300.0, 600.0, 1200.0, 1800.0, 1800.0, 1800.0, 1800.0],
+        )
+
+    async def test_nonzero_due_recollection_is_published_reported_and_retried_serially(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
+        history = self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/retry/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+            }],
+        )
+        workspace_export = self.data_root / ".datasets" / "fashion" / "reels.csv"
+        workspace_export.write_text("fixture", encoding="utf-8")
+        clock = ManualClock(started_at)
+        attempts = 0
+        active = 0
+        max_active = 0
+        waits: list[float] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            nonlocal attempts, active, max_active
+            attempts += 1
+            active += 1
+            max_active = max(max_active, active)
+            active -= 1
+            if attempts == 1:
+                return 7
+            with history.open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow(
+                    [kwargs["urls"][0], 2, isoformat_utc(clock())]  # type: ignore[index]
+                )
+            clock.current = started_at + timedelta(hours=self.config.duration_hours)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+            self.assertIn("code 7", status["last_error"])
+            self.assertEqual(status["collector_failures"], 1)
+            with (self.data_root / "reels.csv").open("r", newline="", encoding="utf-8-sig") as file:
+                published_rows = list(csv.DictReader(file))
+            self.assertEqual([row["collection_number"] for row in published_rows], ["1"])
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 7)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(max_active, 1)
+        self.assertEqual(sum(waits), 300.0)
+
+    async def test_repeated_due_failure_is_deferred_after_five_attempts(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=4,
+            discovery_hours=0,
+            domains=("fashion", "beauty"),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/rate-limited/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+            }],
+        )
+        clock = ManualClock(started_at)
+        attempts = 0
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            return 2
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 5)
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("retry deferred", status["last_error"])
+
+    async def test_rate_limit_pauses_failed_due_batch_for_twenty_minutes(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=21 / 60,
+            discovery_hours=0,
+            domains=("fashion", "beauty"),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/rate-limited/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+            }],
+        )
+        clock = ManualClock(started_at)
+        attempts = 0
+        waits: list[float] = []
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+            status_path.write_text(
+                json.dumps({"follower_last_status": "rate_limited"}),
+                encoding="utf-8",
+            )
+            return 2
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(sum(waits[:40]), 1200.0)
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("rate limit detected", status["last_error"])
+
+    async def test_rate_limit_respects_longer_server_retry_after(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=21 / 60,
+            discovery_hours=0,
+            domains=("fashion", "beauty"),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/rate-limited/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+            }],
+        )
+        clock = ManualClock(started_at)
+        attempts = 0
+        waits: list[float] = []
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+            status_path.write_text(
+                json.dumps({"failure_code": "rate_limited", "retry_after_seconds": 1800}),
+                encoding="utf-8",
+            )
+            return 2
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(sum(waits), 1260.0)
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertIn("rate limit detected", status["last_error"])
+
+    async def test_due_recollection_runs_during_discovery_pause_then_backs_off_on_its_own_429(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=31 / 60,
+            discovery_hours=31 / 60,
+            discovery_interval_minutes=30,
+            domains=("fashion", "beauty"),
+        )
+        self.write_history(
+            "fashion",
+            [{
+                "url": "https://www.instagram.com/reels/due-during-pause/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(
+                    started_at - RECOLLECTION_INTERVAL + timedelta(minutes=10)
+                ),
+            }],
+        )
+        clock = ManualClock(started_at)
+        invocations: list[tuple[str, datetime]] = []
+        recollection_attempts = 0
+
+        async def fake_invoke(**kwargs: object) -> int:
+            nonlocal recollection_attempts
+            mode = str(kwargs["mode"])
+            invocations.append((mode, clock()))
+            if mode == "discover":
+                status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+                status_path.write_text(json.dumps({"failure_code": "rate_limited"}), encoding="utf-8")
+                return 2
+            recollection_attempts += 1
+            if recollection_attempts == 1:
+                status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+                status_path.write_text(json.dumps({"failure_code": "collector_error"}), encoding="utf-8")
+                return 2
+            clock.current = started_at + timedelta(minutes=31)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            [mode for mode, _when in invocations],
+            ["discover", "recollect", "recollect"],
+        )
+        self.assertLess(invocations[1][1], started_at + timedelta(minutes=20))
+        self.assertEqual(invocations[1][1], started_at + timedelta(minutes=10))
+        self.assertEqual(invocations[2][1], started_at + timedelta(minutes=30))
+
+    async def test_discovery_rate_limit_pause_crosses_window_boundary(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=50 / 60,
+            discovery_hours=50 / 60,
+            discovery_interval_minutes=30,
+            domains=("fashion",),
+        )
+        clock = ManualClock(started_at)
+        discovery_times: list[datetime] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            self.assertEqual(kwargs["mode"], "discover")
+            discovery_times.append(clock())
+            if len(discovery_times) == 1:
+                clock.current = started_at + timedelta(minutes=29)
+                status_path = self.data_root / ".datasets" / "fashion" / "collector_status.json"
+                status_path.parent.mkdir(parents=True, exist_ok=True)
+                status_path.write_text(json.dumps({"failure_code": "rate_limited"}), encoding="utf-8")
+                return 2
+            clock.current = started_at + timedelta(minutes=50)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(discovery_times[1], started_at + timedelta(minutes=49))
+
+    async def test_failed_discovery_waits_before_retrying_the_same_window(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=1,
+            discovery_hours=1,
+            discovery_interval_minutes=60,
+            domains=("fashion",),
+        )
+        attempts = 0
+        waits: list[float] = []
+        hashtags: list[tuple[str, ...]] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            nonlocal attempts
+            attempts += 1
+            hashtags.append(tuple(kwargs["hashtags"]))
+            if attempts == 1:
+                return 2
+            clock.current = started_at + timedelta(hours=1)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(sum(waits), 300.0)
+        self.assertEqual(hashtags, [(FASHION_KEYWORDS[0],)] * 2)
+
+    async def test_failed_due_job_backoff_does_not_delay_other_due_domain(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 31, tzinfo=timezone.utc)
+        histories = {
+            "fashion": self.write_history(
+                "fashion",
+                [{
+                    "url": "https://www.instagram.com/reels/fashion_retry/",
+                    "collection_number": 1,
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+                }],
+            ),
+            "beauty": self.write_history(
+                "beauty",
+                [{
+                    "url": "https://www.instagram.com/reels/beauty_due/",
+                    "collection_number": 1,
+                    "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+                }],
+            ),
+        }
+        clock = ManualClock(started_at)
+        calls: list[str] = []
+
+        async def fake_invoke(**kwargs: object) -> int:
+            dataset = str(kwargs["dataset"])
+            calls.append(dataset)
+            if calls == ["fashion"]:
+                return 7
+            with histories[dataset].open("a", newline="", encoding="utf-8") as file:
+                csv.writer(file).writerow(
+                    [kwargs["urls"][0], 2, isoformat_utc(clock())]  # type: ignore[index]
+                )
+            if len(calls) == 3:
+                clock.current = started_at + timedelta(hours=self.config.duration_hours)
+            return 0
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 7)
+        self.assertEqual(calls, ["fashion", "beauty", "fashion"])
+
+    async def test_invocation_exception_is_reported_and_status_is_published(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            clock.current = started_at + timedelta(hours=self.config.duration_hours)
+            raise RuntimeError("deterministic collector failure")
+
+        result = await run_fashion_beauty_collection(self.config, invoke=fake_invoke, clock=clock)
+
+        self.assertEqual(result, 2)
+        for dataset in ("fashion", "beauty"):
+            status = json.loads((self.data_root / f"{'' if dataset == 'fashion' else dataset + '_'}collector_status.json").read_text(encoding="utf-8"))
+            if dataset == "fashion":
+                self.assertIn("deterministic collector failure", status["last_error"])
+                self.assertEqual(status["collector_failures"], 1)
+            self.assertEqual(status["state"], "completed")
+
+    async def test_negative_collector_result_stays_nonzero_for_discovery_and_recollection(self) -> None:
+        started_at = datetime(2026, 8, 26, 0, 30, tzinfo=timezone.utc)
+        for mode in ("discover", "recollect"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary_directory:
+                data_root = Path(temporary_directory)
+                config = RunConfig(
+                    data_root=data_root,
+                    duration_hours=0.5,
+                    discovery_hours=0.5,
+                    discovery_interval_minutes=30,
+                )
+                if mode == "recollect":
+                    history = data_root / ".datasets" / "fashion" / ".collector" / "reels_history_active.csv"
+                    history.parent.mkdir(parents=True)
+                    with history.open("w", newline="", encoding="utf-8-sig") as file:
+                        writer = csv.DictWriter(file, fieldnames=["url", "collection_number", "collected_at"])
+                        writer.writeheader()
+                        writer.writerow({
+                            "url": "https://www.instagram.com/reels/negative/",
+                            "collection_number": 1,
+                            "collected_at": isoformat_utc(started_at - RECOLLECTION_INTERVAL),
+                        })
+                clock = ManualClock(started_at)
+
+                async def fake_invoke(**_kwargs: object) -> int:
+                    clock.current = started_at + timedelta(minutes=30)
+                    return -9
+
+                result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+                self.assertEqual(result, -9)
+                status = json.loads((data_root / "collector_status.json").read_text(encoding="utf-8"))
+                self.assertIn("code -9", status["last_error"])
+                self.assertEqual(status["collector_failures"], 1)
+
+    async def test_empty_recollection_period_finishes_early(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            duration_hours=5 / 3600,
+            discovery_hours=0,
+        )
+        waits: list[float] = []
+
+        async def fake_wait(_event: object, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.advance(seconds)
+            return False
+
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait):
+            result = await run_fashion_beauty_collection(config, invoke=AsyncMock(), clock=clock)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(waits, [])
+        self.assertEqual(clock(), started_at)
+
+    async def test_completed_snapshot_target_finishes_after_discovery(self) -> None:
+        started = datetime(2026, 9, 29, 11, tzinfo=timezone.utc)
+        config = RunConfig(
+            data_root=self.data_root, resume_started_at=started, duration_hours=13,
+            discovery_hours=4, target_snapshots=3, domains=("fashion",),
+        )
+        self.write_history("fashion", [
+            {"url": "https://www.instagram.com/reels/finished/", "collection_number": index + 1,
+             "collected_at": isoformat_utc(started + RECOLLECTION_INTERVAL * index)}
+            for index in range(3)
+        ])
+        invoke = AsyncMock()
+
+        clock = ManualClock(started + timedelta(hours=9))
+        async def wait(_event, seconds):
+            clock.advance(seconds)
+        with patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=wait):
+            result = await run_fashion_beauty_collection(config, invoke=invoke, clock=clock)
+
+        self.assertEqual(result, 0)
+        invoke.assert_not_awaited()
+        self.assertEqual(clock(), started + timedelta(hours=9))
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(status["completion_reason"], "all_collection_work_finished")
+
+    async def test_scheduler_owns_android_log_relay_for_its_full_run(self) -> None:
+        started_at = datetime(2026, 8, 26, tzinfo=timezone.utc)
+        clock = ManualClock(started_at)
+        config = RunConfig(
+            data_root=self.data_root,
+            domains=("fashion",),
+            duration_hours=1,
+            discovery_hours=1,
+            new_only=True,
+        )
+        relay_started: list[tuple[Path, str]] = []
+        relay_stopped: list[tuple[Path, str]] = []
+        invocations = 0
+
+        async def fake_relay(data_dir: Path, source: str) -> None:
+            identity = (data_dir, source)
+            relay_started.append(identity)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                relay_stopped.append(identity)
+
+        async def fake_invoke(**_kwargs: object) -> int:
+            nonlocal invocations
+            invocations += 1
+            await asyncio.sleep(0)
+            clock.current = started_at + (
+                timedelta(minutes=1)
+                if invocations == 1
+                else timedelta(minutes=30) if invocations == 2 else timedelta(hours=1)
+            )
+            return 0
+
+        async def fake_wait(_event: object, _seconds: float) -> bool:
+            clock.current = started_at + timedelta(hours=1)
+            return False
+
+        with (
+            patch(
+                "src.reels.fashion_beauty_collection.relay_new_collection_log_lines",
+                new=fake_relay,
+            ),
+            patch("src.reels.fashion_beauty_collection.wait_for_stop_or_timeout", new=fake_wait),
+        ):
+            result = await run_fashion_beauty_collection(config, invoke=fake_invoke, clock=clock)
+
+        expected = (self.data_root / ".datasets" / "fashion", "android")
+        self.assertEqual(result, 0)
+        self.assertEqual(relay_started, [expected])
+        self.assertEqual(relay_stopped, [expected])
+
+    async def test_discovery_uses_unlimited_generic_collector(self) -> None:
+        captured = []
+        async def fake_run(options: object) -> int:
+            captured.append(options)
+            return 0
+        with patch("src.reels.fashion_beauty_collection.run_collector", new=fake_run):
+            await invoke_generic_collector(config=self.config, dataset="fashion", mode="discover", hashtags=("패션",))
+        self.assertEqual(captured[0].max_items, 0)
+
+    async def test_unlimited_run_continues_past_sixteen_hours_until_stopped(self) -> None:
+        started = datetime(2026, 10, 29, tzinfo=timezone.utc)
+        clock = ManualClock(started)
+        config = replace(self.config, duration_hours=None, discovery_hours=None, domains=("fashion",))
+        calls = []
+        async def invoke(**kwargs):
+            calls.append(kwargs)
+            clock.advance(29 * 60)
+            if len(calls) == 37:
+                kwargs["stop_event"].set()
+            return 0
+        await run_fashion_beauty_collection(config, invoke=invoke, clock=clock)
+        self.assertEqual(len(calls), 37)
+        self.assertGreater(clock.current, started + timedelta(hours=16))
+        status = json.loads((self.data_root / "collector_status.json").read_text(encoding="utf-8"))
+        self.assertTrue(status["duration_unlimited"])
+        self.assertIsNone(status["ends_at"])
+
+    async def test_discovery_has_no_300_item_cap_and_keeps_due_jobs(self) -> None:
+        now = datetime(2026, 8, 26, 0, 10, tzinfo=timezone.utc)
+        rows = [
+            {
+                "url": f"https://www.instagram.com/reels/current{index}/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(now.replace(minute=0) + timedelta(seconds=index)),
+            }
+            for index in range(350)
+        ]
+        rows.append(
+            {
+                "url": "https://www.instagram.com/reels/due/",
+                "collection_number": 1,
+                "collected_at": isoformat_utc(now - RECOLLECTION_INTERVAL),
+            }
+        )
+
+        decision = decide_next_work(self.config, rows, now)
+
+        self.assertEqual(decision.collected_count, 350)
+        self.assertEqual([job.url for job in decision.due_jobs], ["https://www.instagram.com/reels/due/"])
+
+    async def test_generic_invocation_applies_discovery_only_options(self) -> None:
+        captured: list[object] = []
+
+        async def fake_run_collector(options: object) -> int:
+            captured.append(options)
+            if getattr(options, "urls_file", None):
+                captured.append(Path(getattr(options, "urls_file")).read_text(encoding="utf-8"))
+            return 0
+
+        with patch("src.reels.fashion_beauty_collection.run_collector", new=fake_run_collector):
+            await invoke_generic_collector(
+                config=replace(self.config, background=True),
+                dataset="fashion",
+                mode="discover",
+                hashtags=("패션", "ootd"),
+                max_items=37,
+                progress_offset=4,
+            )
+            await invoke_generic_collector(
+                config=self.config,
+                dataset="beauty",
+                mode="recollect",
+                urls=["https://www.instagram.com/reels/due/"],
+            )
+            await invoke_generic_collector(
+                config=replace(self.config, domains=("fashion",)),
+                dataset="fashion",
+                mode="recollect",
+                urls=["https://www.instagram.com/reels/due/"],
+            )
+
+        discover = captured[0]
+        recollect = captured[1]
+        self.assertEqual(getattr(discover, "data_dir"), (self.data_root / ".datasets" / "fashion").resolve())
+        self.assertEqual(getattr(discover, "hashtags"), ["패션", "ootd"])
+        self.assertEqual(getattr(discover, "max_items"), 37)
+        self.assertEqual(getattr(discover, "progress_offset"), 4)
+        self.assertTrue(getattr(discover, "background"))
+        self.assertEqual(getattr(discover, "direct_reel_info_wait_seconds"), 3)
+        self.assertEqual(getattr(discover, "exact_metric_attempts"), 3)
+        self.assertEqual(getattr(discover, "exact_metric_retry_delay_seconds"), 2)
+        self.assertEqual(getattr(discover, "hashtag_candidates_per_keyword"), 200)
+        self.assertFalse(getattr(discover, "relay_detached_android_logs"))
+        self.assertTrue(getattr(discover, "rate_limit_return_immediately"))
+        self.assertFalse(getattr(discover, "collect_hashtag_media_count"))
+        self.assertTrue(getattr(discover, "new_urls_only"))
+        self.assertTrue(getattr(discover, "followers_after_reels"))
+        self.assertEqual(getattr(discover, "max_upload_age_days"), 30)
+        self.assertEqual(getattr(recollect, "data_dir"), (self.data_root / ".datasets" / "beauty").resolve())
+        self.assertTrue(getattr(recollect, "disable_recollect_cooldown"))
+        self.assertEqual(getattr(recollect, "max_upload_age_days"), 0)
+        self.assertEqual(captured[2], "https://www.instagram.com/reels/due/\n")
+        self.assertFalse(Path(getattr(recollect, "urls_file")).exists())
+        self.assertFalse(getattr(discover, "profile_android_recollection", False))
+        self.assertTrue(getattr(recollect, "profile_android_recollection", False))
+        self.assertTrue(getattr(captured[3], "profile_android_recollection", False))
+
+    async def test_generic_discovery_enables_only_the_requested_media_count_job(self) -> None:
+        captured: list[object] = []
+
+        async def fake_run_collector(options: object) -> int:
+            captured.append(options)
+            return 0
+
+        with patch("src.reels.fashion_beauty_collection.run_collector", new=fake_run_collector):
+            await invoke_generic_collector(
+                config=replace(self.config, collect_hashtag_media_count=True),
+                dataset="fashion",
+                mode="discover",
+                hashtags=("runway", "ootd"),
+            )
+
+        self.assertEqual(getattr(captured[0], "hashtags"), ["runway", "ootd"])
+        self.assertTrue(getattr(captured[0], "collect_hashtag_media_count"))
+        self.assertEqual(getattr(captured[0], "android_idle_hashtags"), [])
+
+    def test_publish_restores_user_json_and_xlsx_from_workspace(self) -> None:
+        from src.reels.instagram_reels_browser import write_users_xlsx
+        workspace = self.data_root / '.datasets' / 'fashion'
+        workspace.mkdir(parents=True)
+        (workspace / 'users.csv').write_text(
+            'user_id,username,follower_count,collected_at\n'
+            '123,restored_user,100,2026-10-31T00:00:00Z\n', encoding='utf-8',
+        )
+        write_users_xlsx(workspace)
+        written = publish_dataset_outputs(DatasetConfig('fashion', workspace, FASHION_KEYWORDS))
+        self.assertIn('users_json', written)
+        self.assertIn('users_xlsx', written)
+        users = json.loads((self.data_root / 'users.json').read_text(encoding='utf-8'))
+        self.assertEqual(users[0]['username'], 'restored_user')
+        self.assertEqual(users[0]['follower_count'], 100)
+        self.assertTrue((self.data_root / 'users.xlsx').is_file())
+
+    def test_publish_creates_only_domain_named_exports_and_preserves_base_outputs(self) -> None:
+        base_files = {
+            name: f"base-{name}".encode()
+            for name in ("reels.csv", "reels.json", "reels.xlsx", "users.csv")
+        }
+        for name, content in base_files.items():
+            (self.data_root / name).write_bytes(content)
+        workspace = self.data_root / ".datasets" / "fashion"
+        workspace.mkdir(parents=True)
+        source_files = {
+            name: f"fashion-{name}".encode()
+            for name in ("reels.csv", "reels.json", "reels.xlsx", "users.csv")
+        }
+        for name, content in source_files.items():
+            (workspace / name).write_bytes(content)
+
+        written = publish_dataset_outputs(DatasetConfig("fashion", workspace, FASHION_KEYWORDS))
+
+        self.assertEqual(set(written), {"reels_csv", "reels_json", "reels_xlsx", "users_csv"})
+        self.assertFalse((self.data_root / "fashion_reels.csv").exists())
+        for name, content in source_files.items():
+            self.assertEqual((self.data_root / name).read_bytes(), content)
+        self.assertFalse(list(self.data_root.glob(".*.tmp")))
+
+    def test_publish_keeps_each_recollection_as_a_separate_reel_row(self) -> None:
+        workspace = self.data_root / ".datasets" / "fashion"
+        history = workspace / ".collector" / "reels_history_active.csv"
+        history.parent.mkdir(parents=True)
+        fields = ["collection_number", "days_since_previous", "collected_at", "url", "view_count"]
+        rows = [
+            ["1", "", "2026-08-26T00:00:00Z", "https://www.instagram.com/reels/row-test/", "100"],
+            ["2", "+0.1day", "2026-08-26T00:30:00Z", "https://www.instagram.com/reels/row-test/", "110"],
+        ]
+        with history.open("w", newline="", encoding="utf-8-sig") as file:
+            csv.writer(file).writerows([fields, *rows])
+
+        publish_dataset_outputs(DatasetConfig("fashion", workspace, FASHION_KEYWORDS))
+
+        with (self.data_root / "reels.csv").open("r", newline="", encoding="utf-8-sig") as file:
+            published_rows = list(csv.DictReader(file))
+        published_json = json.loads((self.data_root / "reels.json").read_text(encoding="utf-8"))
+        workbook_rows = read_xlsx_rows(self.data_root / "reels.xlsx")
+
+        self.assertEqual([row["collection_number"] for row in published_rows], ["1", "2"])
+        self.assertEqual([row["view_count"] for row in published_rows], ["100", "110"])
+        self.assertEqual(published_rows[1]["hours_since_previous"], "+0.5hour")
+        self.assertEqual([row["collection_number"] for row in published_json], ["1", "2"])
+        self.assertEqual(len(workbook_rows), 3)
+
+    def test_publish_combines_archived_web_rows_and_completed_android_metrics(self) -> None:
+        workspace = self.data_root / ".datasets" / "fashion"
+        history_dir = workspace / ".collector"
+        history_dir.mkdir(parents=True)
+        fields = ["collection_number", "collected_at", "url", "like_count", "view_count", "repost_count", "comment_count"]
+        url = "https://www.instagram.com/reels/archived-test/"
+        first_time = "2026-09-25T08:00:00Z"
+        for name, row in (
+            ("reels_history_active_legacy_20260925T080000Z.csv", ["1", first_time, url, "10", "90", "5", "7"]),
+            ("reels_history_active.csv", ["1", "2026-09-25T09:00:00Z", "https://www.instagram.com/reels/new-test/", "20", "", "", ""]),
+        ):
+            with (history_dir / name).open("w", newline="", encoding="utf-8-sig") as file:
+                csv.writer(file).writerows([fields, row])
+        completed = history_dir / "android_metric_queue" / "completed"
+        completed.mkdir(parents=True)
+        (completed / "job.json").write_text(json.dumps({
+            "target": {"url": url, "collected_at": first_time},
+            "status": "collected",
+            "observed_reel_url": url,
+            "observed_username": "archived_author",
+            "metrics": {"like_count": 11, "view_count": 100, "comment_count": 99,
+                        "repost_count": 0, "share_count": 19, "saved_count": 4},
+        }), encoding="utf-8")
+
+        publish_dataset_outputs(DatasetConfig("fashion", workspace, FASHION_KEYWORDS))
+
+        with (self.data_root / "reels.csv").open("r", newline="", encoding="utf-8-sig") as file:
+            rows = list(csv.DictReader(file))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["url"], url)
+        self.assertEqual(rows[0]["like_count"], "11")
+        self.assertEqual(rows[0]["view_count"], "90")
+        self.assertEqual(rows[0]["comment_count"], "7")
+        self.assertEqual(rows[0]["repost_count"], "0")
+        self.assertEqual(rows[0]["share_count"], "19")
+        self.assertEqual(rows[0]["saved_count"], "4")
+        self.assertEqual(len(read_xlsx_rows(self.data_root / "reels.xlsx")), 3)
+
+    def test_locked_public_workbook_is_written_to_updated_path(self) -> None:
+        destination = self.data_root / "reels.xlsx"
+        destination.write_bytes(b"open workbook")
+        original_replace = os.replace
+
+        def replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+            if Path(target) == destination:
+                raise PermissionError("workbook is open")
+            original_replace(source, target)
+
+        with patch("src.reels.fashion_beauty_collection.os.replace", side_effect=replace):
+            saved = _atomic_write_xlsx(destination, "reels", ["url"], [{"url": "test"}])
+
+        self.assertEqual(saved, self.data_root / "reels_updated.xlsx")
+        self.assertEqual(destination.read_bytes(), b"open workbook")
+        self.assertEqual(read_xlsx_rows(saved)[1], ["test"])
+
+        saved = _atomic_write_xlsx(destination, "reels", ["url"], [{"url": "test"}])
+        self.assertEqual(saved, destination)
+        self.assertEqual(read_xlsx_rows(destination)[1], ["test"])
+        self.assertFalse((self.data_root / "reels_updated.xlsx").exists())
+
+    def test_publish_projects_fashion_and_beauty_intervals_to_hours_only(self) -> None:
+        base_files = {
+            "reels.csv": b"baseline reels csv",
+            "reels.json": b"baseline reels json",
+            "reels.xlsx": b"baseline reels xlsx",
+            "users.csv": b"baseline users csv",
+        }
+        for name, content in base_files.items():
+            (self.data_root / name).write_bytes(content)
+
+        reels_fields = [
+            "collection_number", "collected_at", "url",
+            "2nd collect_collected_at", "2nd collect_days_since_previous",
+        ]
+        reels_row = [
+            "2", "2026-08-26T00:00:00Z", "https://www.instagram.com/reels/hour-test/",
+            "2026-08-26T00:30:00Z", "+0.1day",
+        ]
+        users_fields = [
+            "collection_number", "days_since_previous", "user_id", "username",
+            "biography", "profile_category", "post_count", "follower_count", "follower_count_change", "collected_at",
+        ]
+        users_rows = [
+            ["1", "", "42", "hour_user", "profile", "의류(브랜드)", "2078", "100", "", "2026-08-26T00:00:00Z"],
+            ["2", "+0.2day", "42", "hour_user", "profile", "의류(브랜드)", "2080", "110", "10", "2026-08-26T04:00:00Z"],
+        ]
+
+        for dataset_name, keywords in (("fashion", FASHION_KEYWORDS), ("beauty", BEAUTY_KEYWORDS)):
+            with self.subTest(dataset=dataset_name):
+                workspace = self.data_root / ".datasets" / dataset_name
+                workspace.mkdir(parents=True)
+                with (workspace / "reels.csv").open("w", newline="", encoding="utf-8-sig") as file:
+                    csv.writer(file).writerows([reels_fields, reels_row])
+                (workspace / "reels.json").write_text(
+                    json.dumps([dict(zip(reels_fields, reels_row))]), encoding="utf-8"
+                )
+                write_xlsx_workbook(workspace / "reels.xlsx", [("reels", [reels_fields, reels_row])])
+                with (workspace / "users.csv").open("w", newline="", encoding="utf-8-sig") as file:
+                    csv.writer(file).writerows([users_fields, *users_rows])
+                write_xlsx_workbook(workspace / "collection_results_users.xlsx", [("users", [users_fields, *users_rows])])
+
+                publish_dataset_outputs(DatasetConfig(dataset_name, workspace, keywords))
+
+                with (self.data_root / f"{'' if dataset_name == 'fashion' else dataset_name + '_'}reels.csv").open("r", newline="", encoding="utf-8-sig") as file:
+                    published_reels = list(csv.DictReader(file))
+                with (self.data_root / f"{'' if dataset_name == 'fashion' else dataset_name + '_'}users.csv").open("r", newline="", encoding="utf-8-sig") as file:
+                    published_users = list(csv.DictReader(file))
+                published_json = json.loads((self.data_root / f"{'' if dataset_name == 'fashion' else dataset_name + '_'}reels.json").read_text(encoding="utf-8"))
+                reel_xlsx = read_xlsx_rows(self.data_root / f"{'' if dataset_name == 'fashion' else dataset_name + '_'}reels.xlsx")
+
+                self.assertEqual(published_reels[0]["2nd collect_hours_since_previous"], "+0.5hour")
+                self.assertNotIn("2nd collect_days_since_previous", published_reels[0])
+                self.assertEqual(published_json[0]["2nd collect_hours_since_previous"], "+0.5hour")
+                self.assertEqual(published_users[0]["hours_since_previous"], "")
+                self.assertEqual(published_users[1]["hours_since_previous"], "+4hour")
+                self.assertNotIn("days_since_previous", published_users[1])
+                self.assertIn("2nd collect_hours_since_previous", reel_xlsx[0])
+                self.assertIn("+0.5hour", reel_xlsx[1])
+                self.assertFalse((self.data_root / f"{'' if dataset_name == 'fashion' else dataset_name + '_'}collection_results_users.xlsx").exists())
+
+        self.assertFalse((self.data_root / "fashion_reels.csv").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
