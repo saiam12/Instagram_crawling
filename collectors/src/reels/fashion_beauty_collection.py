@@ -32,11 +32,12 @@ from .fashion_beauty_scheduler import (
 )
 from . import collection_pause
 from .korean_classification import record_is_korean, apply_korean_overrides
-from .android_reel_metrics import ANDROID_COLLECTION_FIELDS, android_result_matches_reel
+from .android_reel_metrics import AndroidMetricResult, android_result_matches_reel, merge_android_metrics
 from .browser_runtime import load_playwright, locate_browser_executable, safe_close
-from .instagram_reels_browser import REEL_HISTORY_DIRECTORY, REEL_HISTORY_FILENAME, apply_metric_visibility_rules, android_recovery_failure, android_metric_queue_counts, clear_collection_stop_request, enqueue_android_app_restart, reset_android_recovery_for_new_run, launch_collection_context, normalize_reel_url, parse_args, rate_limit_state_for_context, relay_new_collection_log_lines, run_collector, run_collectors_in_shared_context, wait_for_stop_or_timeout
+from .instagram_reels_browser import REEL_HISTORY_DIRECTORY, REEL_HISTORY_FILENAME, android_recovery_failure, android_metric_queue_counts, clear_collection_stop_request, enqueue_android_app_restart, reset_android_recovery_for_new_run, launch_collection_context, normalize_reel_url, parse_args, rate_limit_state_for_context, relay_new_collection_log_lines, run_collector, run_collectors_in_shared_context, wait_for_stop_or_timeout
 from .android_metric_worker import start_android_metric_worker
 from .process_lock import process_is_alive
+from .reel_store import open_csv_snapshot
 from .fashion_analyzer import analyze_qualifying_fashion_reels
 from .collection_diagnostics import cumulative_collector_summaries
 from src.exporters.instagram_collector import write_xlsx_workbook, sync_combined_xlsx, REEL_INTERNAL_EXPORT_FIELDS
@@ -187,7 +188,7 @@ def read_history(dataset: DatasetConfig) -> list[dict[str, Any]]:
     for source in [*archives, history]:
         if not source.exists():
             continue
-        with source.open("r", newline="", encoding="utf-8-sig") as file:
+        with open_csv_snapshot(source) as file:
             for row in csv.DictReader(file):
                 key = (str(row.get("url", "")), str(row.get("collected_at", "")), str(row.get("collection_number", "")))
                 if all(key[:2]):
@@ -426,19 +427,18 @@ def publish_dataset_outputs(dataset: DatasetConfig) -> dict[str, Path]:
             metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
             if metrics and not android_result_matches_reel(result, row):
                 continue
-            fields_to_apply = (*ANDROID_COLLECTION_FIELDS, "comment_count") if result.get("recollection") else ANDROID_COLLECTION_FIELDS
-            for field in fields_to_apply:
-                if field in metrics and field not in result.get("compact_fields", ()):
-                    row[field] = metrics[field]
+            row.update(merge_android_metrics(row, AndroidMetricResult(
+                metrics=metrics,
+                compact_fields=tuple(result.get("compact_fields") or ()),
+                recollection=bool(result.get("recollection")),
+                like_count_private=result.get("like_count_private"),
+                comment_count_disabled=result.get("status") == "collected" and result.get("comment_count_disabled") is True,
+            )))
             if result.get("audio_name") and not row.get("audio_name"):
                 row["audio_name"] = result["audio_name"]
-            if result.get("like_count_private") is True:
-                row["like_count"] = "X"
-            if result.get("status") == "collected":
-                row.update(apply_metric_visibility_rules(row, comment_count_disabled=result.get("comment_count_disabled") is True))
             if result.get("android_mismatch"):
                 row["android_mismatch"] = result["android_mismatch"]
-        with reel_history.open("r", newline="", encoding="utf-8-sig") as file:
+        with open_csv_snapshot(reel_history) as file:
             active_fields = list(csv.DictReader(file).fieldnames or [])
         fields = list(dict.fromkeys([*active_fields, *(field for row in rows for field in row)]))
         rows.sort(key=lambda row: (str(row.get("collected_at", "")), str(row.get("url", ""))))

@@ -87,12 +87,13 @@ class AndroidQueueProgressTests(unittest.TestCase):
             paths = browser._android_metric_queue_paths(directory)
             self.enqueue(directory, 1)
             browser.enqueue_android_hashtag_post_count_job(directory, ["fashion"])
+            working, reel = browser._claim_android_metric_job(paths)
+            self.assertEqual(browser.android_reel_progress(paths, reel, fallback_current=1), (1, 1))
+            working.unlink()
             working, hashtag = browser._claim_android_metric_job(paths)
             self.assertEqual(hashtag["kind"], "related_hashtag_post_counts")
             self.assertNotIn("android_queue_index", hashtag)
             working.unlink()
-            working, reel = browser._claim_android_metric_job(paths)
-            self.assertEqual(browser.android_reel_progress(paths, reel, fallback_current=1), (1, 1))
 
     def test_worker_exposes_deferred_reel_in_terminal_log(self):
         with tempfile.TemporaryDirectory() as directory:

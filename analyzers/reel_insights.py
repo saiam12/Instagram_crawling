@@ -17,12 +17,12 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from pool import create_pool
+from prompts import HOOK_TYPES, HookType
 from reel_analyzer import ALLOWED_MODELS, _call_with_pool
 
 
 MODEL = "gemini-3.6-flash"
 DEFAULT_BATCH_SIZE = 10
-HOOK_TYPES = ("텍스트 훅", "동작 훅", "비포·애프터", "상품 선노출", "상황·공감", "호기심·반전", "기타")
 SCENE_TYPES = ("거울 셀카", "전신 착장", "제품 클로즈업", "플랫레이", "토킹헤드", "POV", "텍스트 중심", "기타")
 MOVEMENT_TYPES = ("정적 포즈", "걷기", "손동작", "착장 전환", "카메라 이동", "제품 조작", "기타")
 
@@ -31,7 +31,7 @@ class VideoInsight(BaseModel):
     reel_id: str
     title: str = Field(description="영상의 핵심 특징을 한 문장으로 요약")
     features: List[str] = Field(description="관찰 근거가 있는 2~4개의 짧은 특징")
-    hook_type: Literal["텍스트 훅", "동작 훅", "비포·애프터", "상품 선노출", "상황·공감", "호기심·반전", "기타"]
+    hook_type: HookType
     scene_patterns: List[Literal["거울 셀카", "전신 착장", "제품 클로즈업", "플랫레이", "토킹헤드", "POV", "텍스트 중심", "기타"]]
     movement_patterns: List[Literal["정적 포즈", "걷기", "손동작", "착장 전환", "카메라 이동", "제품 조작", "기타"]]
 

@@ -18,6 +18,27 @@ const configRows = [['a','',model,5,20,'사용','','',''], ['b','',model,5,20,'�
 const config = () => api.settingsFrom(configRows);
 const offered = [{key_label:'a',model}, {key_label:'b',model}];
 const body = id => ({request_id:id.repeat(8)+'-1111-1111-1111-111111111111',user:'tester',candidates:offered});
+
+test('request time display uses KST while retaining complete timestamps and blanks',()=>{
+  const started='2026-11-17T14:59:59.123Z', ended='2026-11-17T15:00:01.456Z';
+  let values=[[started,ended],[new Date(started),'']], format, headers, zone;
+  const book={setSpreadsheetTimeZone:value=>{zone=value;}};
+  const times={getValues:()=>values,setValues:next=>{values=next;}};
+  const source={getLastRow:()=>7,getRange:(row)=> row==='F6:G'
+    ? {setNumberFormat:value=>{format=value;}}
+    : row==='F5:G5' ? {setValues:value=>{headers=value;}} : times};
+  api.formatRequestTimes(book,source);
+  assert.equal(zone,'Asia/Seoul'); assert.equal(format,'HH:mm:ss');
+  assert.equal(values[0][0].getTime(),Date.parse(started));
+  assert.equal(values[0][1].getTime(),Date.parse(ended));
+  assert.equal(api.timeAt(values[0][0]),'23:59:59');
+  assert.equal(api.timeAt(values[0][1]),'00:00:01');
+  assert.equal(values[1][1],'');
+  assert.deepEqual(headers,[['요청 시각(KST)','완료/갱신 시각(KST)']]);
+  const running=log('a','사용중'); running[5]=new Date(now-1000); running[6]=new Date(now);
+  assert.equal(api.statsFor(config()[0],[running],now).busy,true);
+  assert.equal(api.statsFor(config()[0],[running],now).rpm,1);
+});
 test('explicit retired-record cleanup preserves all other rows',t=>{
   const previous={SpreadsheetApp:global.SpreadsheetApp,LockService:global.LockService};
   t.after(()=>Object.assign(global,previous));
@@ -25,23 +46,23 @@ test('explicit retired-record cleanup preserves all other rows',t=>{
     const rows=['gemini-3.5-flash','gemini-3.8-flash','gemini-3.7-flash','gemini-3.7-flash','antigravity-preview-09-2026'].map(model=>{
       const row=Array(17).fill(''); row[column]=model; return row;
     });
-    return {rows,getLastRow:()=>rows.length+5,getRange:()=>({getValues:()=>rows,getDisplayValues:()=>rows}),
+    return {rows,getLastRow:()=>rows.length+5,getRange:()=>({getValues:()=>rows,getDisplayValues:()=>rows,getNotes:()=>rows.map(row=>row.map(()=>''))}),
       deleteRows(start,count){rows.splice(start-6,count);}};
   };
-  const sheets={'프로젝트 설정':makeSheet(2),'사용 현황':makeSheet(2),'요청 기록':makeSheet(4)};
+  const sheets={'프로젝트 설정':makeSheet(2),'사용 현황':makeSheet(2),'요청 기록':makeSheet(3)};
   global.SpreadsheetApp={flush(){},openById:()=>({getSheetByName:name=>sheets[name]})};
   let released=false;
   global.LockService={getScriptLock:()=>({waitLock(){},releaseLock(){released=true;}})};
   assert.deepEqual(api.removeRetiredModelRecords(),{'프로젝트 설정':3,'사용 현황':3,'요청 기록':3});
-  assert.deepEqual(sheets['요청 기록'].rows.map(row=>row[4]),['gemini-3.8-flash','antigravity-preview-09-2026']);
+  assert.deepEqual(sheets['요청 기록'].rows.map(row=>row[3]),['gemini-3.8-flash','antigravity-preview-09-2026']);
   assert.equal(released,true);
 });
 function log(project, status, day='2026-09-12', limit='') {
-  return ['old','other',project,'a',model,'2026-09-12T08:00:00Z','',status,'','','','',limit,'',day,0];
+  return ['old','other',project,model,day,'2026-09-12T08:00:00Z','',status,'','','','',limit,20];
 }
 function sheet(initial=[]) {
   return {rows:structuredClone(initial), writes:[], getRange(row,col,height,width) {
-    return {setValues: values => {
+    return {getNote:()=>'',setNote:()=>{},setValues: values => {
       this.writes.push(structuredClone(values));
       values.forEach((v,i) => {this.rows[row-6+i] = [...v];});
     }};
@@ -56,8 +77,8 @@ test('reserves both, chooses lower daily count, immediately releases loser', () 
   assert.equal(s.writes[1].filter(r=>r[7]==='선택 해제').length,1);
 });
 test('equal remaining quota chooses the higher Flash model',()=>{
-  const low=log('p1','후보 예약'); low[0]='request:0'; low[4]='gemini-3.6-flash'; low[15]=3; low[16]=17;
-  const high=log('p2','후보 예약'); high[0]='request:1'; high[4]='gemini-3.8-flash'; high[15]=3; high[16]=17;
+  const low=log('p1','후보 예약'); low[0]='request:0'; low[3]='gemini-3.6-flash'; low[13]=17;
+  const high=log('p2','후보 예약'); high[0]='request:1'; high[3]='gemini-3.8-flash'; high[13]=17;
   api.selectRows([low,high]);
   assert.equal(low[7],'선택 해제'); assert.equal(high[7],'사용중');
 });
@@ -121,20 +142,20 @@ test('Date-valued sheet days count both successful and failed requests',()=>{
 });
 test('readRows keeps the sheet-displayed day when Sheets coerces it to Date',()=>{
   const values=[log('p1','성공',new Date('2026-09-11T15:00:00Z'))];
-  const displayed=[values[0].map((v,i)=>i===14?'2026-09-12':String(v ?? ''))];
-  const source={getLastRow:()=>6,getRange:()=>({getValues:()=>values,getDisplayValues:()=>displayed})};
-  assert.equal(api.readRows(source,17)[0][14],'2026-09-12');
+  const displayed=[values[0].map((v,i)=>i===4?'2026-09-12':String(v ?? ''))];
+  const source={getLastRow:()=>6,getRange:()=>({getValues:()=>values,getDisplayValues:()=>displayed,getNotes:()=>values.map(row=>row.map(()=>''))})};
+  assert.equal(api.readRows(source,14)[0][4],'2026-09-12');
 });
 test('baseline, RPM and temporary cooldown affect eligibility',()=>{
   const c=api.settingsFrom([['a','',model,5,20,'사용','','2026-09-12',20]]);
   assert.equal(api.sampleCandidates(c,[],offered,now,()=>0).length,0);
   const logs=Array.from({length:5},()=>{const r=log('a','성공');r[5]=new Date(now-1000).toISOString();return r;});
   assert.equal(api.sampleCandidates(config(),logs,offered,now,()=>0)[0].project,'b');
-  const r=log('a','실패');r[13]=new Date(now+60000).toISOString();
+  const r=log('a','실패');r.retryAt=new Date(now+60000).toISOString();
   assert.equal(api.sampleCandidates(config(),[r],offered,now,()=>0)[0].project,'b');
 });
-test('Lite and duplicate mappings are rejected',()=>{
-  assert.throws(()=>api.settingsFrom([['k','','gemini-3.5-flash-lite',5,20,'사용']]));
+test('3.5 Flash Lite is allowed and duplicate mappings are rejected',()=>{
+  assert.equal(api.settingsFrom([['k','','gemini-3.5-flash-lite',5,500,'사용']])[0].rpd,500);
   assert.throws(()=>api.settingsFrom([...configRows,configRows[0]]));
 });
 test('retired settings are ignored while 3.8 stays available',()=>{
@@ -142,7 +163,7 @@ test('retired settings are ignored while 3.8 stays available',()=>{
   assert.deepEqual(api.settingsFrom(rows).map(c=>c.model),[model,model,'gemini-3.8-flash']);
 });
 test('unfinished two-candidate reservation is recovered on same ID',()=>{
-  const b=body('a'); const rows=config().map((c,i)=>[b.request_id+':'+i,b.user,c.project,c.key_label,c.model,new Date(now).toISOString(),'','후보 예약','','','','','','','2026-09-12',i]);
+  const b=body('a'); const rows=config().map((c,i)=>[b.request_id+':'+i,b.user,c.key_label,c.model,'2026-09-12',new Date(now).toISOString(),'','후보 예약','','','','','',20-i]);
   const s=sheet(rows); const result=api.acquire(s,config(),s.rows,b,now);
   assert.equal(result.selected.key_label,'a');
   assert.equal(s.rows[1][7],'선택 해제');
@@ -161,7 +182,7 @@ test('sync adds shared aliases, normalizes owners, and leaves unrelated rows alo
   ]);
   const shared=[{key_label:'kept',owner:'tester'},{key_label:'new',owner:'tester'}];
   const result=api.syncSettings(settings,settings.rows,shared);
-  assert.deepEqual(result,{ok:true,added:6,updated:3,enabled:1,stopped:1});
+  assert.deepEqual(result,{ok:true,added:8,updated:3,enabled:1,stopped:1});
   assert.equal(settings.rows.find(r=>r[0]==='kept' && r[2]===model)[5],'중지');
   assert.ok(settings.rows.filter(r=>r[0]==='kept').every(r=>r[1]==='tester'));
   assert.equal(settings.rows.find(r=>r[2]==='gemini-3.8-flash')[5],'사용');
@@ -169,16 +190,16 @@ test('sync adds shared aliases, normalizes owners, and leaves unrelated rows alo
   assert.equal(settings.rows.find(r=>r[0]==='removed')[5],'사용');
   assert.equal(settings.rows.find(r=>r[0]==='other')[5],'사용');
   assert.deepEqual(settings.rows.filter(r=>r[0]==='new').map(r=>r[2]),[
-    'gemini-3.6-flash','gemini-3.8-flash','antigravity-preview-09-2026','gemini-embedding-2',
+    'gemini-3.6-flash','gemini-3.8-flash','gemini-3.5-flash-lite','antigravity-preview-09-2026','gemini-embedding-2',
   ]);
 });
 test('sync applies workload daily limits without changing RPM, status or counted history',()=>{
-  const models=['gemini-3.6-flash','gemini-3.8-flash','gemini-embedding-2','antigravity-preview-09-2026'];
+  const models=['gemini-3.6-flash','gemini-3.8-flash','gemini-embedding-2','antigravity-preview-09-2026','gemini-3.5-flash-lite'];
   const settings=sheet(models.map(model=>['kept','tester',model,7,1,'중지','manual','2026-11-01',9]));
   api.syncSettings(settings,settings.rows,[{key_label:'kept',owner:'tester'}]);
-  assert.deepEqual(models.map(model=>settings.rows.find(row=>row[2]===model)[4]),[20,20,1000,100]);
+  assert.deepEqual(models.map(model=>settings.rows.find(row=>row[2]===model)[4]),[20,20,1000,100,500]);
   assert.ok(settings.rows.filter(row=>row[0]).every(row=>row[3]===7 && row[5]==='중지' && row[7]==='2026-11-01' && row[8]===9));
-  assert.deepEqual(settings.rows.map(row=>row[2]),['gemini-3.6-flash','gemini-3.8-flash','','antigravity-preview-09-2026','','gemini-embedding-2']);
+  assert.deepEqual(settings.rows.map(row=>row[2]),['gemini-3.6-flash','gemini-3.8-flash','','gemini-3.5-flash-lite','','antigravity-preview-09-2026','','gemini-embedding-2']);
 });
 test('deployment always opens the shared spreadsheet from the source constant',t=>{
   const previous={PropertiesService:global.PropertiesService,LockService:global.LockService,
@@ -247,16 +268,7 @@ test('heartbeat refreshes only the matching active reservation',()=>{
   const row=log('a','사용중'); row[0]='request:0'; row[1]='tester';
   const logs=sheet([row]);
   assert.deepEqual(api.heartbeat(logs,logs.rows,{request_id:'request:0',user:'tester'},now),{ok:true});
-  assert.equal(logs.rows[0][6],new Date(now).toISOString());
-});
-test('sync migrates request log project names without losing history',()=>{
-  const rows=[log('project-acct1','성공'),log('other','성공')];
-  rows[0][3]='acct1'; rows[1][3]='other';
-  const logs=sheet(rows);
-  const updated=api.syncLogProjects(logs,logs.rows,[{key_label:'acct1',owner:'tester'}]);
-  assert.equal(updated,1);
-  assert.equal(logs.rows[0][2],'acct1');
-  assert.equal(logs.rows[1][2],'other');
+  assert.equal(logs.rows[0][6].getTime(),now);
 });
 test('old project and key alias columns migrate into one key alias column',()=>{
   const grid=[
@@ -277,4 +289,42 @@ test('old project and key alias columns migrate into one key alias column',()=>{
   assert.equal(api.migrateSettingsSchema(source),true);
   assert.deepEqual(grid[0],['키 별칭','담당자','모델','RPM 한도','RPD 한도','사용 여부','비고','초기 집계일','초기 사용량']);
   assert.deepEqual(grid[1],['acct1','tester',model,5,20,'사용','memo','','']);
+});
+
+test('request columns migrate safely, resume after interruption and retain cooldown notes',()=>{
+  const headers=['요청 ID','사용자','프로젝트 별칭','키 별칭','모델','요청 시각(KST)','완료/갱신 시각(KST)','처리 상태','입력 토큰','출력 토큰','총 토큰','오류 코드','제한 종류','재시도 가능 시각(UTC)','집계일(KST)','후보 선택 전 요청 수','후보 선택 전 잔여량'];
+  const started=new Date(now-1000),ended=new Date(now);
+  const old=['legacy','tester','old-project','a',model,started,ended,'실패',12,5,17,503,'일시',new Date(now+60000).toISOString(),'2026-09-12',3,17];
+  const grid=[headers,old],notes=[headers.map(()=>''),old.map(()=>'')]; notes[1][12]='사용자 메모';
+  let interrupted=false;
+  const source={
+    getLastRow:()=>6,getMaxRows:()=>1000,getMaxColumns:()=>grid[0].length,
+    getRange(row,col,height,width) {
+      if (typeof row==='string') return {setNumberFormat(){}};
+      const range={column:col,
+        getValues:()=>grid.slice(row-5,row-5+height).map(r=>r.slice(col-1,col-1+width)),
+        getDisplayValues:()=>grid.slice(row-5,row-5+height).map(r=>r.slice(col-1,col-1+width).map(String)),
+        getNotes:()=>notes.slice(row-5,row-5+height).map(r=>r.slice(col-1,col-1+width)),
+        setValues:values=>{values.forEach((r,i)=>r.forEach((v,j)=>{grid[row-5+i][col-1+j]=v;}));return range;},
+        setNotes:values=>{values.forEach((r,i)=>r.forEach((v,j)=>{notes[row-5+i][col-1+j]=v;}));return range;},
+      }; return range;
+    },
+    deleteColumn(col) {
+      grid.forEach(r=>r.splice(col-1,1));notes.forEach(r=>r.splice(col-1,1));
+      if (!interrupted) {interrupted=true;throw new Error('simulated interrupted migration');}
+    },
+    moveColumns(range,destination) {
+      for (const rows of [grid,notes]) rows.forEach(r=>r.splice(destination-1,0,...r.splice(range.column-1,1)));
+    },
+  };
+  assert.throws(()=>api.migrateRequestSchema(source),/interrupted/);
+  assert.equal(api.migrateRequestSchema(source),true);
+  assert.equal(api.migrateRequestSchema(source),false);
+  assert.deepEqual(grid[0],['요청 ID','사용자','키 별칭','모델','집계일(KST)','요청 시각(KST)','완료/갱신 시각(KST)','처리 상태','입력 토큰','출력 토큰','총 토큰','오류 코드','제한 종류','후보 선택 전 잔여량']);
+  assert.deepEqual(grid[1],['legacy','tester','a',model,'2026-09-12',started,ended,'실패',12,5,17,503,'일시',17]);
+  const migrated=api.readRows(source,14);
+  assert.match(notes[1][12],/사용자 메모/);
+  assert.equal(api.statsFor(config()[0],migrated,now).retry,now+60000);
+  assert.equal(api.statsFor(config()[0],migrated,now).count,1);
+  assert.equal(api.statsFor(config()[0],migrated,now).rpm,1);
 });

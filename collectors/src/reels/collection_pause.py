@@ -92,20 +92,7 @@ def _raise_if_terminal_rate_limit(target) -> None:
 
 def wait_sync(*, terminal: bool = False) -> None:
     while is_paused():
-        if terminal and _input_lock.acquire(blocking=False):
-            try:
-                if not is_paused():
-                    return
-                command = sys.stdin.readline()
-                if not command:
-                    # Detached workers cannot authorize resumption.
-                    terminal = False
-                elif not resume(command):
-                    print("일시정지 상태입니다. 재개하려면 resume을 입력하세요.", flush=True)
-            finally:
-                _input_lock.release()
-        else:
-            time.sleep(0.1)
+        time.sleep(0.5)
 
 
 async def wait() -> None:

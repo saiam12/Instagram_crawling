@@ -2173,11 +2173,11 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
         workspace = self.data_root / ".datasets" / "fashion"
         history_dir = workspace / ".collector"
         history_dir.mkdir(parents=True)
-        fields = ["collection_number", "collected_at", "url", "like_count", "view_count", "repost_count", "comment_count"]
+        fields = ["collection_number", "collected_at", "url", "like_count", "view_count", "repost_count", "comment_count", "username"]
         url = "https://www.instagram.com/reels/archived-test/"
         first_time = "2026-09-25T08:00:00Z"
         for name, row in (
-            ("reels_history_active_legacy_20260925T080000Z.csv", ["1", first_time, url, "10", "90", "5", "7"]),
+            ("reels_history_active_legacy_20260925T080000Z.csv", ["1", first_time, url, "10", "90", "5", "7", "archived_author"]),
             ("reels_history_active.csv", ["1", "2026-09-25T09:00:00Z", "https://www.instagram.com/reels/new-test/", "20", "", "", ""]),
         ):
             with (history_dir / name).open("w", newline="", encoding="utf-8-sig") as file:
@@ -2199,7 +2199,7 @@ class SupervisorTests(unittest.IsolatedAsyncioTestCase):
             rows = list(csv.DictReader(file))
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["url"], url)
-        self.assertEqual(rows[0]["like_count"], "11")
+        self.assertEqual(rows[0]["like_count"], "10")
         self.assertEqual(rows[0]["view_count"], "90")
         self.assertEqual(rows[0]["comment_count"], "7")
         self.assertEqual(rows[0]["repost_count"], "0")

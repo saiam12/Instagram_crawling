@@ -103,8 +103,16 @@ class AndroidHealth:
                     if not following.startswith("    "):
                         break
                     focused.append(following)
-        if re.search(r"Application (?:Not Responding|Error)|isn.t responding|응답하지 않|응답 없음", "\n".join(focused), re.I):
-            return {"state": "app_error", "serial": serial, "label": "Android 앱 응답 없음 · 화면 확인 필요",
-                    "detail": "현재 입력 대상에 앱 응답 없음 또는 오류 창이 표시되어 있습니다."}
+        app_error_pattern = r"Application (?:Not Responding|Error)|isn.t responding|응답하지 않|응답 없음"
+        if re.search(app_error_pattern, "\n".join(focused), re.I):
+            # Input dumps can list multiple dispatcher focus snapshots.
+            window = run("-s", serial, "shell", "dumpsys", "window")
+            current = re.search(r"^\s*mCurrentFocus\s*=([^\r\n]+)", window.stdout, re.M)
+            if window.returncode or not current:
+                return {"state": "unknown", "serial": serial, "label": "포커스 창 확인 필요",
+                        "detail": "현재 포커스 창을 확인하지 못했습니다."}
+            if re.search(app_error_pattern, current[1], re.I):
+                return {"state": "app_error", "serial": serial, "label": "Android 앱 응답 없음 · 화면 확인 필요",
+                        "detail": "현재 입력 대상에 앱 응답 없음 또는 오류 창이 표시되어 있습니다."}
         return {"state": "responsive", "serial": serial, "label": "Android 연결·명령 응답 확인",
                 "detail": "ADB 연결과 입력 서비스 조회가 응답했습니다. 모든 앱 터치의 성공을 보장하는 판정은 아닙니다."}

@@ -455,17 +455,16 @@ PYTHON_TO_ANDROID_REQUIRED_FIELDS = (
 )
 PYTHON_TO_ANDROID_RETRY_DELAY_SECONDS = 3.0
 ANDROID_HASHTAG_WAIT_SECONDS = 120.0
-ANDROID_RECOLLECTION_WAIT_SECONDS = 60.0
 HASHTAG_REDISCOVERY_INTERVAL_SECONDS = 60
 HASHTAG_GRID_INITIAL_LOAD_MILLISECONDS = 2_500
 HASHTAG_GRID_SCROLL_SETTLE_MILLISECONDS = 1_000
 HASHTAG_GRID_MAX_SCROLL_ATTEMPTS = 60
 HASHTAG_GRID_MAX_UNCHANGED_ATTEMPTS = 8
 FOLLOWER_PAGE_RECYCLE_LOOKUP_COUNT = 500
-PROFILE_REEL_VIEW_SETTLE_MILLISECONDS = 2_000
+PROFILE_REEL_VIEW_SETTLE_MILLISECONDS = 400
 PROFILE_REEL_VIEW_EMPTY_GRID_WAIT_MILLISECONDS = 6_000
 PROFILE_REEL_VIEW_SCROLL_ATTEMPTS = 350
-PROFILE_REEL_VIEW_SCROLL_MILLISECONDS = 1_000
+PROFILE_REEL_VIEW_SCROLL_MILLISECONDS = 400
 PROFILE_REEL_VIEW_INITIAL_TIMEOUT_SECONDS = 30.0
 PROFILE_REEL_VIEW_RETRY_TIMEOUT_SECONDS = 60.0
 PROFILE_REEL_VIEW_POLL_MILLISECONDS = 250
@@ -487,6 +486,7 @@ DIRECT_REEL_SETTLE_MILLISECONDS = 250
 # initiated. This is deliberately a passive wait: it must not make a second
 # Instagram request simply because a metric arrives late.
 PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS = 20_000
+HYBRID_SHARE_REPOST_WAIT_MILLISECONDS = 3_000
 PASSIVE_RESPONSE_EXTENDED_WAIT_MILLISECONDS = 60_000
 DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS
 # The legacy media-info fetch is retained for compatibility and diagnostics,
@@ -498,8 +498,8 @@ DIRECT_REEL_INFO_FETCH_TIMEOUT_MILLISECONDS = 4_000
 DIRECT_REEL_INFO_FRESH_PAGE_SETTLE_MILLISECONDS = 1_000
 EXACT_METRIC_MAX_ATTEMPTS = 3
 EXACT_METRIC_RETRY_DELAY_SECONDS = 2.0
-EXACT_REEL_DETAIL_SETTLE_MILLISECONDS = 1_000
-EXACT_REEL_DETAIL_TIMEOUT_MILLISECONDS = 3_000
+EXACT_REEL_DETAIL_SETTLE_MILLISECONDS = 400
+EXACT_REEL_DETAIL_TIMEOUT_MILLISECONDS = 2_000
 EXACT_REEL_DETAIL_POLL_MILLISECONDS = 150
 EXACT_REEL_DETAIL_PAGE_ATTEMPTS = 3
 EXACT_REEL_DETAIL_RETRY_DELAY_MILLISECONDS = 1_500
@@ -563,6 +563,9 @@ DIRECT_REEL_INFO_REQUEST_SCRIPT = r"""async mediaId => {
           comment_count: media.comment_count,
           media_repost_count: media.media_repost_count,
           repost_count: media.repost_count,
+          share_count: media.share_count,
+          media_share_count: media.media_share_count,
+          reshare_count: media.reshare_count,
           taken_at: media.taken_at,
           video_duration: media.video_duration,
           user: {
@@ -651,6 +654,8 @@ def metadata_from_media(
         or media.get("hide_like_and_view_counts") is True,
         "commentCount": exact_nonnegative_integer(media.get("comment_count")),
         "repostCount": repost_count,
+        "shareCount": next((count for key in ("media_share_count", "share_count", "reshare_count")
+                            if (count := exact_nonnegative_integer(media.get(key))) is not None), None),
         "isReel": media_is_reel(media),
     }
 
@@ -670,9 +675,9 @@ def merge_reel_metadata(current: dict[str, Any] | None, found: dict[str, Any] | 
     observed = found or {}
     if observed.get("userId") and not existing.get("userId"):
         existing, observed = observed, existing
-    metric_fields = {"viewCount", "followerCount", "likeCount", "commentCount", "repostCount"}
+    metric_fields = {"viewCount", "followerCount", "likeCount", "commentCount", "repostCount", "shareCount"}
     merged: dict[str, Any] = {}
-    for field in ["userId", "username", "caption", "accountCountry", "audioName", "locationName", "ad", "uploadedAt", "videoDurationSeconds", "viewCount", "viewSourceField", "followerCount", "followerSourceField", "likeCount", "commentCount", "repostCount", "isReel"]:
+    for field in ["userId", "username", "caption", "accountCountry", "audioName", "locationName", "ad", "uploadedAt", "videoDurationSeconds", "viewCount", "viewSourceField", "followerCount", "followerSourceField", "likeCount", "commentCount", "repostCount", "shareCount", "isReel"]:
         if field in {"userId", "username"}:
             owner = existing if existing.get("userId") or existing.get("username") else observed
             merged[field] = owner.get(field) or ""
@@ -704,7 +709,7 @@ def merge_reel_metadata(current: dict[str, Any] | None, found: dict[str, Any] | 
 def merge_direct_reel_metadata(current: dict[str, Any] | None, direct: dict[str, Any] | None) -> dict[str, Any]:
     merged = merge_reel_metadata(current, direct)
     observed = direct or {}
-    for field in ["viewCount", "followerCount", "likeCount", "commentCount", "repostCount"]:
+    for field in ["viewCount", "followerCount", "likeCount", "commentCount", "repostCount", "shareCount"]:
         value = exact_nonnegative_integer(observed.get(field))
         if value is not None:
             merged[field] = value
@@ -891,10 +896,19 @@ async def _cancel_pending_response_tasks(response_tasks: set[asyncio.Task[None]]
             await asyncio.gather(*done, return_exceptions=True)
 
 
+LIKE_ATTRIBUTION_TEXT_PATTERN = re.compile(
+    r"^(?:\S+님(?:이|(?:\s+외)?\s+(?:여러\s*명|[\d,]+\s*명)이)\s*좋아합니다"
+    r"|liked\s+by\s+.+|좋아요\s*[\d,]+\s*개|[\d,]+\s+likes?)$",
+    re.I,
+)
+
+
 def build_collected_record(record: dict[str, Any], response_metadata: dict[str, Any] | None = None, collected_at: str | None = None) -> dict[str, Any]:
     response = response_metadata or {}
     timestamp = collected_at or isoformat_utc()
     title_candidate = str(record.get("title", "")).strip()
+    if LIKE_ATTRIBUTION_TEXT_PATTERN.fullmatch(title_candidate):
+        title_candidate = ""
     inferred_username = (
         title_candidate
         if not any([response.get("userId"), response.get("username"), record.get("userId"), record.get("username"), record.get("audioName"), record.get("uploadedAt")])
@@ -934,7 +948,7 @@ def build_collected_record(record: dict[str, Any], response_metadata: dict[str, 
         "like_count": UNAVAILABLE_LIKE_COUNT_MARKER if response.get("likeCountPrivate") is True
         else exact_nonnegative_integer(response.get("likeCount")),
         "comment_count": exact_nonnegative_integer(response.get("commentCount")),
-        "share_count": "",
+        "share_count": exact_nonnegative_integer(response.get("shareCount")),
         "repost_count": exact_nonnegative_integer(response.get("repostCount")),
         "saved_count": "",
         "follower_count": "",
@@ -1458,7 +1472,7 @@ def enqueue_android_view_count_job(data_dir: Path | str, record: dict[str, Any])
     write_json_atomic(paths["pending"] / f"{job_id}.json", {
         "job_id": job_id, "kind": "profile_view_count", "queued_at": isoformat_utc(),
         "reason": "web_view_unavailable",
-        "target": {field: str(record[field]) for field in ("url", "collected_at", "username")},
+        "target": {field: str(record.get(field) or "") for field in ("url", "collected_at", "username", "title", "hashtags")},
     })
     return job_id
 
@@ -1662,8 +1676,16 @@ def merge_follower_data_into_rows(reels: list[dict[str, Any]], users_path: Path)
     if not users_path.exists():
         return 0
     user_fields, users = read_csv_objects(users_path)
-    by_id = {row["user_id"]: row for row in users if row.get("user_id")}
-    by_username = {row["username"].lower(): row for row in users if row.get("username")}
+    users_by_id: dict[str, list[dict[str, Any]]] = {}
+    users_by_username: dict[str, list[dict[str, Any]]] = {}
+    for row in users:
+        uid = str(row.get("user_id") or "").strip()
+        uname = str(row.get("username") or "").strip().lower()
+        if uid:
+            users_by_id.setdefault(uid, []).append(row)
+        if uname:
+            users_by_username.setdefault(uname, []).append(row)
+
     latest_by_url: dict[str, dict[str, Any]] = {}
     for reel in reels:
         url = str(reel.get("url", ""))
@@ -1676,8 +1698,11 @@ def merge_follower_data_into_rows(reels: list[dict[str, Any]], users_path: Path)
     for reel in reels:
         identity = str(reel.get("user_id", "") or "")
         username = str(reel.get("username", "") or "").lower()
-        user = by_id.get(identity) or by_username.get(username)
-        if user and (
+        candidates = users_by_id.get(identity) or users_by_username.get(username)
+        if not candidates:
+            continue
+        user = candidates[0]
+        if (
             (identity and user.get("user_id") and identity != str(user["user_id"]))
             or (username and user.get("username") and username != str(user["username"]).lower())
         ):
@@ -1686,9 +1711,17 @@ def merge_follower_data_into_rows(reels: list[dict[str, Any]], users_path: Path)
             reel["follower_count"] = ""
             changed += int(bool(previous))
             continue
-        if not user:
-            continue
-        latest_count = latest_field_value(user, user_fields, "follower_count")
+
+        reel_dt = parse_datetime(reel.get("collected_at"))
+        if len(candidates) > 1 and reel_dt is not None:
+            def time_diff(u: dict[str, Any]) -> float:
+                udt = parse_datetime(u.get("collected_at"))
+                return abs((udt - reel_dt).total_seconds()) if udt else float("inf")
+            best_user = min(candidates, key=time_diff)
+        else:
+            best_user = candidates[-1]
+
+        latest_count = latest_field_value(best_user, user_fields, "follower_count")
         previous = str(reel.get("follower_count", "") or "")
         is_latest_for_reel = latest_by_url.get(str(reel.get("url", ""))) is reel
         if latest_count and (not previous or is_latest_for_reel):
@@ -2760,11 +2793,13 @@ EXTRACT_VISIBLE_REEL_SCRIPT = r"""() => {
   const uploadedAt = timeElement?.getAttribute('datetime') || timeElement?.getAttribute('title') || textOf(timeElement);
   const uploadedText = textOf(timeElement);
   const excluded = /^(?:팔로우|follow|좋아요|likes?|댓글|comments?|리포스트|reposts?|공유|share|send|저장|save|옵션|options?)$/i;
+  const likeAttribution = new RegExp(__LIKE_ATTRIBUTION_PATTERN__, 'i');
   const clean = value => value.split(/\n+/).map(line => line.trim().replace(/(?:…|\.\.\.)?\s*(?:더\s*보기|more)$/i, '').trim())
     .filter(Boolean).filter(line => line !== username && line !== audioName && line !== uploadedText && line !== locationName)
     .filter(line => !(username && line.startsWith(username) && /(?:팔로우|follow)/i.test(line)))
     .filter(line => !(audioName && line.includes(audioName))).filter(line => !/(?:♬|🎵|원본\s*오디오|original\s*audio)/i.test(line))
     .filter(line => !excluded.test(line) && !adPattern.test(line) && !/^\d+(?:[.,]\d+)*(?:천|만|억|[KMB])?$/i.test(line))
+    .filter(line => !likeAttribution.test(line))
     .join(' ').replace(/\s+/g, ' ').trim();
   const captions = [...scope.querySelectorAll('span')].filter(visible).map(element => ({ element, text: clean(textOf(element)) }))
     .filter(item => item.text && item.text.length <= 10000)
@@ -2777,7 +2812,7 @@ EXTRACT_VISIBLE_REEL_SCRIPT = r"""() => {
     likeText: metricFrom(likeControls), likeControlPresent: likeControls.length > 0,
     commentText: metricFrom(commentControls), repostText: metricFrom(repostControls)
   };
-}"""
+}""".replace("__LIKE_ATTRIBUTION_PATTERN__", json.dumps(LIKE_ATTRIBUTION_TEXT_PATTERN.pattern, ensure_ascii=False))
 
 
 async def extract_visible_reel(page: Any, *, allow_post_route: bool = False) -> dict[str, Any] | None:
@@ -2861,11 +2896,16 @@ def next_transition_stall_state(previous_count: Any, changed: bool) -> dict[str,
     return {"consecutive": consecutive, "shouldRecycle": consecutive >= REEL_UNPRODUCTIVE_RECYCLE_THRESHOLD}
 
 
-async def wait_for_reel_metadata(shortcode: str, reel_metadata: dict[str, dict[str, Any]], timeout_milliseconds: int = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS) -> dict[str, Any]:
+async def wait_for_reel_metadata(
+    shortcode: str, reel_metadata: dict[str, dict[str, Any]],
+    timeout_milliseconds: int = PASSIVE_RESPONSE_METADATA_TIMEOUT_MILLISECONDS,
+    *, required_counts: tuple[str, ...] = (),
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_milliseconds / 1000
     while time.monotonic() < deadline:
-        if shortcode in reel_metadata:
-            return reel_metadata[shortcode]
+        observed = reel_metadata.get(shortcode)
+        if observed is not None and all(exact_nonnegative_integer(observed.get(field)) is not None for field in required_counts):
+            return observed
         await asyncio.sleep(0.1)
     return reel_metadata.get(shortcode, {})
 
@@ -3025,8 +3065,9 @@ async def resolve_page_first_reel_metadata(
     After 20 seconds without a complete response, open the Reel through its
     creator's profile grid and retry passive observation. This uses normal
     browser navigation and clicks only; it never calls the direct media-info
-    API. Hybrid collection and deferred profile collection return after a
-    brief passive wait. Their later follower stage reads play_count on the
+    API. Hybrid collection waits briefly for exact share and repost counts.
+    Deferred profile collection uses a shorter passive wait. Their later
+    follower stage reads play_count on the
     author's Reels tab; missing app metrics can still be filled by Android.
     """
     shortcode = str(record.get("shortcode") or "")
@@ -3045,13 +3086,18 @@ async def resolve_page_first_reel_metadata(
         visible_metadata,
     )
     if not require_complete_metrics or defer_profile_metrics:
-        # Passive metadata may contain the creator id, upload time, or full
-        # caption a moment after the visible Reel appears.  Do not wait for
-        # engagement metrics: profile visits and Android can fill them later.
+        # Hybrid saves any exact engagement counts already present, including
+        # share/repost responses that arrive after the initial owner payload.
+        required_counts = () if require_complete_metrics else tuple(
+            field for field in ("shareCount", "repostCount")
+            if exact_nonnegative_integer(page_metadata.get(field)) is None
+        )
+        wait_limit = HYBRID_SHARE_REPOST_WAIT_MILLISECONDS if required_counts else 750
         passive_metadata = await wait_for_reel_metadata(
             shortcode,
             passive_response_metadata,
-            min(max(0, timeout_milliseconds), 750),
+            min(max(0, timeout_milliseconds), wait_limit),
+            required_counts=required_counts,
         )
         return merge_reel_metadata(page_metadata, passive_metadata), bool(passive_metadata)
     if has_complete_page_reel_metrics(shortcode, page_metadata):
@@ -3260,11 +3306,13 @@ async def read_reel_detail_metadata(
     require_exact_view: bool = False,
     username: str = "",
     required_fields: tuple[str, ...] = ("likeCount", "commentCount"),
+    page_attempts: int | None = None,
 ) -> dict[str, Any]:
     """Wait for a Reel detail response to fill missing exact metric integers."""
     target = str(shortcode or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", target):
         return dict(existing_metadata or {})
+    attempts = EXACT_REEL_DETAIL_PAGE_ATTEMPTS if page_attempts is None else page_attempts
     metadata: dict[str, dict[str, Any]] = {target: dict(existing_metadata or {})}
     author = str((existing_metadata or {}).get("username") or username).strip().lstrip("@")
     author_path = f"{quote(author, safe='')}/" if INSTAGRAM_USERNAME_PATTERN.fullmatch(author) else ""
@@ -3290,7 +3338,7 @@ async def read_reel_detail_metadata(
     try:
         page.on("response", on_response)
         listener_attached = True
-        for page_attempt in range(EXACT_REEL_DETAIL_PAGE_ATTEMPTS):
+        for page_attempt in range(attempts):
             try:
                 response = await page.goto(
                     detail_url,
@@ -3300,7 +3348,7 @@ async def read_reel_detail_metadata(
             except asyncio.CancelledError:
                 raise
             except Exception:
-                if page_attempt + 1 >= EXACT_REEL_DETAIL_PAGE_ATTEMPTS:
+                if page_attempt + 1 >= attempts:
                     return current_metadata()
                 await _cancel_pending_response_tasks(response_tasks)
                 await page.wait_for_timeout(EXACT_REEL_DETAIL_RETRY_DELAY_MILLISECONDS * (page_attempt + 1))
@@ -3318,7 +3366,7 @@ async def read_reel_detail_metadata(
                 if has_required_metadata():
                     return current_metadata()
                 await page.wait_for_timeout(EXACT_REEL_DETAIL_POLL_MILLISECONDS)
-            if page_attempt + 1 < EXACT_REEL_DETAIL_PAGE_ATTEMPTS:
+            if page_attempt + 1 < attempts:
                 await _cancel_pending_response_tasks(response_tasks)
                 await page.wait_for_timeout(EXACT_REEL_DETAIL_RETRY_DELAY_MILLISECONDS * (page_attempt + 1))
         return current_metadata()
@@ -3443,6 +3491,7 @@ async def read_profile_account_country_result(page: Any, username: str, user_id:
     status = "about_unavailable"
     opened = False
     entry_method = "username_link"
+    error_type = ""
     try:
         async with asyncio.timeout(6):
             username_link = page.get_by_role("link", name=username, exact=True).filter(
@@ -3466,9 +3515,11 @@ async def read_profile_account_country_result(page: Any, username: str, user_id:
                     # country as undisclosed rather than a temporary UI failure.
                     await panel.get_by_text(re.compile(r"^(가입한 날짜|Date joined)$", re.I)).wait_for(state="visible", timeout=1000)
                     status = "country_not_shown"
-    except Exception:
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
         # An unavailable About panel must not fail a Reel or follower lookup.
-        pass
+        error_type = type(error).__name__
     finally:
         if opened:
             try:
@@ -3480,7 +3531,10 @@ async def read_profile_account_country_result(page: Any, username: str, user_id:
             except Exception:
                 pass
     _PROFILE_ACCOUNT_COUNTRIES[key] = (country, status, time.monotonic())
-    return {"country": country, "status": status, "entry_method": entry_method}
+    result = {"country": country, "status": status, "entry_method": entry_method}
+    if error_type:
+        result["error_type"] = error_type
+    return result
 
 
 async def lookup_account_country_only(
@@ -3506,9 +3560,12 @@ async def lookup_account_country_only(
                 "triggers_stop": collection_pause.is_instagram_limit(response),
             })
             if diagnostics_path is not None:
-                with diagnostics_path.open("a", encoding="utf-8") as file:
-                    file.write(json.dumps({"user_id": str(user_id), "username": normalized,
-                                           **rate_limit_responses[-1]}, ensure_ascii=False) + "\n")
+                try:
+                    with diagnostics_path.open("a", encoding="utf-8") as file:
+                        file.write(json.dumps({"user_id": str(user_id), "username": normalized,
+                                               **rate_limit_responses[-1]}, ensure_ascii=False) + "\n")
+                except OSError:
+                    pass
         limited = limited or collection_pause.is_instagram_limit(response)
         # Observe identity opportunistically; follower availability never gates UI.
         task = asyncio.create_task(_collect_profile_snapshot_from_response(response, normalized, profile))
@@ -3688,20 +3745,71 @@ async def recheck_unknown_account_countries(
 class ProfileReelViewEnricher:
     """Fill only this run's pending snapshots during the author's profile visit."""
 
-    def __init__(self, store: Any, *, android_fallback: bool = False) -> None:
+    def __init__(self, store: Any, *, android_fallback: bool = False, recollection_details: bool = False) -> None:
         self.store = store
         self.android_fallback = android_fallback
+        self.recollection_details = recollection_details
         self.pending: dict[tuple[str, str], dict[str, Any]] = {}
         self.tracked: set[tuple[str, str]] = set()
         self.observed: dict[tuple[str, str], int] = {}
+
+    async def _flush_profile_history(self) -> None:
+        if getattr(self, "_defer_flush", False):
+            self._pending_flush = True
+            return
+        try:
+            await self.store.flush()
+        except OSError as error:
+            # The store remains dirty so a later checkpoint can retry the write.
+            if csv_path := getattr(self.store, "csv_path", None):
+                try:
+                    await asyncio.to_thread(
+                        append_collection_log, Path(csv_path).parent.parent,
+                        "python", "profile_history_write_deferred", error=str(error),
+                    )
+                except OSError:
+                    pass
+
+    async def _flush_pending_history(self) -> None:
+        if not getattr(self, "_pending_flush", False):
+            return
+        self._pending_flush = False
+        defer_prev = getattr(self, "_defer_flush", False)
+        self._defer_flush = False
+        try:
+            await self._flush_profile_history()
+        finally:
+            self._defer_flush = defer_prev
 
     def cached_count(self, record: dict[str, Any]) -> int | None:
         # A prior profile visit is not a fresh observation for a new snapshot.
         return None
 
+    def _ensure_tracked_index(self) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        rows = self.store.rows
+        signature = (id(rows), len(rows), len(self.tracked))
+        if getattr(self, "_index_signature", None) != signature:
+            by_key: dict[tuple[str, str], dict[str, Any]] = {}
+            by_user: dict[str, list[dict[str, Any]]] = {}
+            if self.tracked:
+                for row in rows:
+                    key = (str(row.get("url", "")), str(row.get("collected_at", "")))
+                    if key in self.tracked:
+                        by_key[key] = row
+                        by_user.setdefault(str(row.get("username") or "").casefold(), []).append(row)
+            self._tracked_by_key = by_key
+            self._tracked_by_user = by_user
+            self._index_signature = signature
+        return self._tracked_by_key, self._tracked_by_user
+
+    def _tracked_rows_for_user(self, username: str) -> list[dict[str, Any]]:
+        _, by_user = self._ensure_tracked_index()
+        return by_user.get(str(username or "").strip().lstrip("@").casefold(), [])
+
     def track(self, record: dict[str, Any]) -> None:
         key = (str(record.get("url", "")), str(record.get("collected_at", "")))
         self.tracked.add(key)
+        self._index_signature = None
         if exact_visible_reel_count(str(record.get("view_count", ""))) is None:
             self.pending[key] = dict(record)
 
@@ -3710,26 +3818,27 @@ class ProfileReelViewEnricher:
         user_id = str(payload.get("userId") or "")
         return [
             exact_visible_reel_count(str(row.get("view_count", "")))
-            for row in self.store.rows
-            if (str(row.get("url", "")), str(row.get("collected_at", ""))) in self.tracked
-            and str(row.get("username") or "").casefold() == username
-            and (not user_id or not row.get("user_id") or str(row["user_id"]) == user_id)
+            for row in self._tracked_rows_for_user(username)
+            if not user_id or not row.get("user_id") or str(row["user_id"]) == user_id
         ]
 
     def missing_duration_targets(self, username: str, user_id: str) -> dict[tuple[str, str], str]:
         return {
             (str(row.get("url", "")), str(row.get("collected_at", ""))): normalized["shortcode"]
-            for row in self.store.rows
-            if (str(row.get("url", "")), str(row.get("collected_at", ""))) in self.tracked
-            and str(row.get("username") or "").casefold() == username.casefold()
-            and (not user_id or str(row.get("user_id") or "") == user_id)
+            for row in self._tracked_rows_for_user(username)
+            if (not user_id or str(row.get("user_id") or "") == user_id)
             and parse_positive_video_duration(row.get("video_duration_seconds")) is None
             and (normalized := normalize_reel_url(row.get("url")))
         }
 
-    async def enrich_profile_durations(self, username: str, user_id: str, profile: dict[str, Any]) -> None:
+    async def enrich_profile_durations(
+        self, username: str, user_id: str, profile: dict[str, Any], *, wait_for_tasks: bool = True,
+    ) -> None:
         """Keep target-keyed durations observed during the existing profile visit."""
-        tasks = {task for task in profile.get("_reel_response_tasks", ()) if not task.done()}
+        if not self.missing_duration_targets(username, user_id):
+            profile["profileReelDurationMissing"] = False
+            return
+        tasks = {task for task in profile.get("_reel_response_tasks", ()) if not task.done()} if wait_for_tasks else set()
         if tasks:
             await asyncio.wait(tasks, timeout=PROFILE_REEL_VIEW_RESPONSE_GRACE_SECONDS)
         metadata = profile.get("_reel_metadata")
@@ -3738,10 +3847,7 @@ class ProfileReelViewEnricher:
             return
         changed = False
         async with self.store.lock:
-            for row in self.store.rows:
-                key = (str(row.get("url", "")), str(row.get("collected_at", "")))
-                if key not in self.tracked or str(row.get("username") or "").casefold() != username.casefold():
-                    continue
+            for row in self._tracked_rows_for_user(username):
                 if user_id and str(row.get("user_id") or "") != user_id:
                     continue
                 normalized = normalize_reel_url(row.get("url"))
@@ -3757,38 +3863,42 @@ class ProfileReelViewEnricher:
             if changed:
                 self.store.dirty = True
         if changed:
-            await self.store.flush()
+            await self._flush_profile_history()
         profile["profileReelDurationMissing"] = bool(self.missing_duration_targets(username, user_id))
 
     async def classify_profile_rows(self, page: Any, username: str, user_id: str, profile: dict[str, Any]) -> None:
+        effective_user_id = user_id or str(profile.get("userId") or "")
         candidates = [
-            row for row in self.store.rows
-            if (str(row.get("url", "")), str(row.get("collected_at", ""))) in self.tracked
-            and str(row.get("username") or "").casefold() == username.casefold()
-            and (not user_id or not row.get("user_id") or str(row["user_id"]) == user_id)
+            row for row in self._tracked_rows_for_user(username)
+            if not user_id or not row.get("user_id") or str(row["user_id"]) == user_id
         ]
         if not candidates:
             return
         if not profile.get("accountCountry") and all(row.get("korean_source") == "manual" or record_is_korean(row) is True for row in candidates):
+            profile.setdefault("accountCountry", "")
             return
-        country = profile.get("accountCountry") or await read_profile_account_country(page, username, user_id)
+        country = profile.get("accountCountry") or await read_profile_account_country(page, username, effective_user_id)
         profile["accountCountry"] = country
         if classify_korean(account_country=country) is None:
             return
-        if user_id.isdigit() and (csv_path := getattr(self.store, "csv_path", None)):
-            await asyncio.to_thread(save_account_country, Path(csv_path).parent.parent, user_id, username, country)
+        if effective_user_id.isdigit() and (csv_path := getattr(self.store, "csv_path", None)):
+            try:
+                await asyncio.to_thread(save_account_country, Path(csv_path).parent.parent, effective_user_id, username, country)
+            except (OSError, RuntimeError, ValueError):
+                pass
         keys = {(str(row.get("url", "")), str(row.get("collected_at", ""))) for row in candidates}
         changed = False
         async with self.store.lock:
-            for row in self.store.rows:
-                if (str(row.get("url", "")), str(row.get("collected_at", ""))) in keys:
+            by_key, _ = self._ensure_tracked_index()
+            for key in keys:
+                if (row := by_key.get(key)) is not None:
                     row["account_country"] = country
                     row.update(classification_fields(row))
                     changed = True
             if changed:
                 self.store.dirty = True
         if changed:
-            await self.store.flush()
+            await self._flush_profile_history()
 
     async def retry_detail_durations(self, page: Any, username: str, user_id: str, profile: dict[str, Any]) -> None:
         """One bounded tail retry using each target's own normal page response."""
@@ -3834,7 +3944,114 @@ class ProfileReelViewEnricher:
                     profile.update(status=status, error="Video duration retry encountered an Instagram access restriction.")
             await safe_close(detail_page)
 
+    async def fill_recollection_detail_counts(self, page: Any, username: str, targets: dict[tuple[str, str], str]) -> None:
+        fields = {"like_count": "likeCount", "comment_count": "commentCount",
+                  "share_count": "shareCount", "repost_count": "repostCount"}
+        by_key, _ = self._ensure_tracked_index()
+        if targets.keys() <= by_key.keys():
+            rows = {key: by_key[key] for key in targets}
+        else:
+            rows = {
+                key: row
+                for row in self.store.rows
+                if row.get("url") and row.get("collected_at")
+                and (key := (str(row.get("url") or ""), str(row.get("collected_at") or ""))) in targets
+            }
+        detail_page = None
+        restricted = False
+        changed = False
+
+        def observe(response: Any) -> None:
+            nonlocal restricted
+            restricted = restricted or collection_pause.is_instagram_limit(response)
+
+        try:
+            for key, code in targets.items():
+                row = rows.get(key)
+                if row is None or all(row.get(field) not in (None, "") for field in fields):
+                    continue
+                try:
+                    async with asyncio.timeout(6):
+                        if detail_page is None:
+                            detail_page = await page.context.new_page()
+                            detail_page.on("response", observe)
+                        detail = await read_reel_detail_metadata(
+                            detail_page, code, username=username, page_attempts=1,
+                            required_fields=(
+                                ("commentCount",)
+                                if row.get("comment_count") in (None, "")
+                                else tuple(
+                                    source for field, source in fields.items()
+                                    if field != "share_count" and row.get(field) in (None, "")
+                                ) or tuple(source for field, source in fields.items() if row.get(field) in (None, ""))
+                            ),
+                        )
+                except TimeoutError:
+                    if restricted or detail_page is None:
+                        break
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    if csv_path := getattr(self.store, "csv_path", None):
+                        try:
+                            await asyncio.to_thread(
+                                append_collection_log, Path(csv_path).parent.parent,
+                                "python", "recollection_detail_lookup_failed",
+                                username=username, shortcode=code, error_type=type(error).__name__,
+                            )
+                        except OSError:
+                            pass
+                    break
+                if restricted or re.search(r"/(?:accounts/login|challenge|checkpoint)/", str(detail_page.url), re.I):
+                    break
+                if str(detail.get("username") or "").casefold() != username.casefold():
+                    continue
+                if detail.get("userId") and row.get("user_id") and str(detail["userId"]) != str(row["user_id"]):
+                    continue
+                async with self.store.lock:
+                    by_key_locked, _ = self._ensure_tracked_index()
+                    row = by_key_locked.get(key) or rows.get(key)
+                    if row is None:
+                        continue
+                    for field, source in fields.items():
+                        value = exact_nonnegative_integer(detail.get(source))
+                        if row.get(field) in (None, "") and value is not None:
+                            row[field] = value
+                            self.store.dirty = changed = True
+                    if exact_nonnegative_integer(row.get("view_count")) is None:
+                        view_count = exact_view_counts_from_metadata(code, detail).get(code)
+                        if view_count is not None:
+                            if apply_observed_view_count(
+                                self.store.rows, row, view_count, "instagram_web_reel_detail", isoformat_utc(),
+                            ):
+                                self.store.dirty = changed = True
+                            self.pending.pop(key, None)
+        finally:
+            await safe_close(detail_page)
+            if changed:
+                await self._flush_profile_history()
+
     async def __call__(self, page: Any, payload: dict[str, str], profile: dict[str, Any]) -> dict[str, int]:
+        self._defer_flush = True
+        self._pending_flush = False
+        failed = False
+        try:
+            return await self._enrich_profile(page, payload, profile)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            self._defer_flush = False
+            try:
+                await self._flush_pending_history()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if not failed:
+                    raise
+
+    async def _enrich_profile(self, page: Any, payload: dict[str, str], profile: dict[str, Any]) -> dict[str, int]:
         profile["profileReelViewCounts"] = self.view_counts_for_user(payload)
         if profile.get("status") not in {"success", "web_unavailable"}:
             return {}
@@ -3847,16 +4064,15 @@ class ProfileReelViewEnricher:
         if profile.get("status") == "success" and follower_count is not None:
             updated_followers = False
             async with self.store.lock:
-                for row in self.store.rows:
-                    key = (str(row.get("url", "")), str(row.get("collected_at", "")))
-                    if key in self.tracked and str(row.get("username") or "").casefold() == username.casefold() and (
+                for row in self._tracked_rows_for_user(username):
+                    if (
                         not user_id or not row.get("user_id") or str(row["user_id"]) == user_id
                     ) and row.get("follower_count") != follower_count:
                         row["follower_count"] = follower_count
                         self.store.dirty = True
                         updated_followers = True
             if updated_followers:
-                await self.store.flush()
+                await self._flush_profile_history()
         targets = {
             key: normalized["shortcode"]
             for key, row in list(self.pending.items())
@@ -3864,13 +4080,15 @@ class ProfileReelViewEnricher:
             and (not user_id or not row.get("user_id") or str(row["user_id"]) == user_id)
             and (normalized := normalize_reel_url(row.get("url")))
         }
-        await self.enrich_profile_durations(username, user_id, profile)
+        await self.enrich_profile_durations(username, user_id, profile, wait_for_tasks=not bool(targets))
         duration_targets = self.missing_duration_targets(username, user_id)
         if not targets and not duration_targets:
             await self.classify_profile_rows(page, username, user_id, profile)
             return {}
+        await self._flush_pending_history()
         author = username.casefold()
         observed: dict[str, int] = {}
+        report: dict[str, Any] = {}
         missing = set(targets.values()) | (set(duration_targets.values()) if payload.get("durationRetry") != "1" else set())
         web_timed_out = False
         if missing:
@@ -3882,7 +4100,7 @@ class ProfileReelViewEnricher:
                 nonlocal web_timed_out
                 web_timed_out = True
             retry_options["on_timeout"] = mark_web_timeout
-            report: dict[str, Any] = {"continuous_profile_observer": profile.get("_reel_observer_continuous") is True}
+            report["continuous_profile_observer"] = profile.get("_reel_observer_continuous") is True
             retry_options["lookup_report"] = report
             seed = profile.setdefault("_reel_metadata", {})
             if isinstance(seed, dict):
@@ -3926,33 +4144,50 @@ class ProfileReelViewEnricher:
         counts = {code: observed[code] for code in targets.values() if code in observed}
         updated = 0
         async with self.store.lock:
-            for row in self.store.rows:
-                key = (str(row.get("url", "")), str(row.get("collected_at", "")))
-                shortcode = targets.get(key)
+            by_key, _ = self._ensure_tracked_index()
+            for key, shortcode in targets.items():
+                row = by_key.get(key)
                 count = exact_nonnegative_integer(counts.get(shortcode))
-                if count is not None:
+                if row is not None and count is not None:
                     if apply_observed_view_count(self.store.rows, row, count, "instagram_web_profile", isoformat_utc()):
                         updated += 1
                     self.pending.pop(key, None)
             if updated:
                 self.store.dirty = True
         if updated:
-            await self.store.flush()
+            await self._flush_profile_history()
             profile["profileReelsUpdated"] = updated
-        if self.android_fallback and payload.get("viewRetry") == "1" and (csv_path := getattr(self.store, "csv_path", None)):
+        seen_targets = set(counts) | set(report.get("seen_target_shortcodes", ()))
+        if self.recollection_details and seen_targets:
+            await self.fill_recollection_detail_counts(
+                page, username, {key: code for key, code in targets.items() if code in seen_targets},
+            )
+        retry_exhausted = payload.get("viewRetry") == "1" or (
+            not web_timed_out
+            and report.get("stop_reason") in {"unchanged_grid", "target_seen_exact_unavailable"}
+        )
+        if retry_exhausted:
+            profile["profileReelViewRetryExhausted"] = True
+        if self.android_fallback and retry_exhausted and (csv_path := getattr(self.store, "csv_path", None)):
             data_dir = Path(csv_path).parent.parent
             queued = False
             for key in targets:
                 if row := self.pending.get(key):
-                    job_id = await asyncio.to_thread(enqueue_android_view_count_job, data_dir, row)
+                    try:
+                        job_id = await asyncio.to_thread(enqueue_android_view_count_job, data_dir, row)
+                    except OSError:
+                        job_id = ""
                     if job_id:
                         queued = True
                         self.pending.pop(key, None)
             if queued:
                 profile["profileReelViewFallbackQueued"] = True
-                await asyncio.to_thread(start_android_metric_worker, data_dir)
+                try:
+                    await asyncio.to_thread(start_android_metric_worker, data_dir)
+                except OSError:
+                    pass
         profile["profileReelViewCounts"] = self.view_counts_for_user(payload)
-        await self.enrich_profile_durations(username, user_id, profile)
+        await self.enrich_profile_durations(username, user_id, profile, wait_for_tasks=False)
         if payload.get("durationRetry") == "1" and profile.get("profileReelDurationMissing"):
             await self.retry_detail_durations(page, username, user_id, profile)
         if profile.get("status") not in {"success", "web_unavailable"}:
@@ -4057,7 +4292,12 @@ async def _read_profile_reel_view_counts(
             ))
         }
 
-    async def wait_for_counts(milliseconds: int, *, until_targets: set[str] | None = None) -> dict[str, int]:
+    async def wait_for_counts(
+        milliseconds: int,
+        *,
+        until_targets: set[str] | None = None,
+        baseline_metadata_count: int | None = None,
+    ) -> dict[str, int]:
         if milliseconds <= 0:
             await asyncio.sleep(0)
         remaining = milliseconds
@@ -4069,6 +4309,8 @@ async def _read_profile_reel_view_counts(
             grid_counts.update(await read_exact_profile_grid_counts(page, normalized_username, targets))
             found = exact_target_counts()
             if (until_targets if until_targets is not None else targets) <= completed_targets(found):
+                return found
+            if baseline_metadata_count is not None and len(metadata) > baseline_metadata_count:
                 return found
             delay = min(PROFILE_REEL_VIEW_POLL_MILLISECONDS, remaining)
             await page.wait_for_timeout(delay)
@@ -4123,7 +4365,6 @@ async def _read_profile_reel_view_counts(
         return True
 
     listener_attached = False
-    zoom_changed = False
     try:
         report["seed_exact_target_count"] = len(exact_target_counts())
         page.on("response", on_response)
@@ -4157,9 +4398,6 @@ async def _read_profile_reel_view_counts(
             if _response_status(response) == 429 or re.search(r"/(?:accounts/login|challenge|checkpoint)/", page.url, re.I):
                 report["stop_reason"] = "access_restricted"
                 return {}
-            if retry:
-                await page.evaluate("() => { document.documentElement.style.zoom = '25%'; }")
-                zoom_changed = True
             # Some account pages hydrate their first Reels payload directly
             # into an application/json script instead of emitting a separate
             # GraphQL response.  It contains the same raw play_count value.
@@ -4208,7 +4446,10 @@ async def _read_profile_reel_view_counts(
                     report["scrolls"] += 1
                     # A wheel movement alone says nothing about count hydration.
                     # Leave overlap between virtualized card windows and read them.
-                    found = await wait_for_counts(PROFILE_REEL_VIEW_SCROLL_MILLISECONDS)
+                    found = await wait_for_counts(
+                        PROFILE_REEL_VIEW_SCROLL_MILLISECONDS,
+                        baseline_metadata_count=previous_metadata_count,
+                    )
                     if targets <= completed_targets(found):
                         return found
                     await collect_embedded_reel_metadata(page, metadata, seen_scripts=seen_scripts)
@@ -4264,11 +4505,6 @@ async def _read_profile_reel_view_counts(
         report.update(stop_reason="lookup_error", error_type=type(error).__name__)
         return exact_target_counts()
     finally:
-        if zoom_changed:
-            try:
-                await page.evaluate("() => { document.documentElement.style.zoom = ''; }")
-            except Exception:
-                pass
         if listener_attached:
             try:
                 page.remove_listener("response", on_response)
@@ -4286,6 +4522,7 @@ async def _read_profile_reel_view_counts(
                     observed_counts[shortcode] = count
         seen_targets = targets & (seen_cards | metadata.keys())
         report.update(seen_card_count=len(seen_cards), seen_target_count=len(seen_targets),
+                      seen_target_shortcodes=sorted(seen_targets),
                       unseen_target_count=len(targets - seen_targets))
         found = exact_target_counts()
         report["exact_sources"] = {
@@ -4425,6 +4662,137 @@ async def enrich_missing_profile_reel_view_counts(
                 if apply_observed_view_count(rows, row, found[normalized["shortcode"]], "instagram_web_profile", isoformat_utc()):
                     changed += 1
     return changed
+
+
+async def resolve_pending_reels_via_links(
+    page: Any,
+    data_dir: Path | str,
+    reel_store: Any,
+    profile_views: ProfileReelViewEnricher,
+    follower_enricher: Any | None,
+    *,
+    detached_android_metrics: bool = False,
+    recollection: bool = False,
+    collection_run_id: str = "",
+    diagnostics: Any = None,
+) -> None:
+    """Visit pending Reels directly to resolve renamed authors, missing views, and Android fallback."""
+    if not profile_views.pending or page is None or (callable(getattr(page, "is_closed", None)) and page.is_closed()):
+        return
+    dir_path = Path(data_dir).resolve()
+    by_key, _ = profile_views._ensure_tracked_index()
+    for key, pending_item in list(profile_views.pending.items()):
+        row = by_key.get(key) or pending_item
+        url = str(row.get("url") or "").strip()
+        normalized = normalize_reel_url(url)
+        if not normalized or not url:
+            continue
+        shortcode = normalized["shortcode"]
+        saved_user_id = str(row.get("user_id") or "").strip()
+        saved_username = str(row.get("username") or "").strip().lstrip("@")
+        try:
+            await navigate_with_retries(page, url, attempts=2, diagnostics=diagnostics)
+            await page.wait_for_timeout(DIRECT_REEL_INFO_FRESH_PAGE_SETTLE_MILLISECONDS)
+        except Exception as error:
+            if diagnostics is not None:
+                diagnostics.ui_event("DIRECT_REEL_LINK_FAILED", url=url, error=str(error)[:300])
+            continue
+        embedded: dict[str, dict[str, Any]] = {}
+        await collect_embedded_reel_metadata(page, embedded, include_follower_count=True)
+        detail = embedded.get(shortcode, {})
+        if not detail.get("username"):
+            visible = await extract_visible_reel(page)
+            detail = {**detail, **(visible or {})}
+        observed_username = str(detail.get("username") or "").strip().lstrip("@")
+        observed_user_id = str(detail.get("userId") or "").strip()
+        if observed_username and saved_username and observed_username.casefold() != saved_username.casefold():
+            if not saved_user_id or not observed_user_id or saved_user_id == observed_user_id:
+                effective_uid = observed_user_id or saved_user_id
+                if follower_enricher is not None and effective_uid:
+                    try:
+                        await follower_enricher.track_user(
+                            user_id=effective_uid,
+                            username=observed_username,
+                            seen_at=str(row.get("collected_at") or ""),
+                            enqueue=False,
+                        )
+                    except Exception:
+                        pass
+                async with reel_store.lock:
+                    for r in reel_store.rows:
+                        if (effective_uid and str(r.get("user_id") or "") == effective_uid) or (
+                            str(r.get("url") or "") == url and str(r.get("username") or "").casefold() == saved_username.casefold()
+                        ):
+                            r["username"] = observed_username
+                            if effective_uid and not r.get("user_id"):
+                                r["user_id"] = effective_uid
+                    row["username"] = observed_username
+                    if effective_uid and not row.get("user_id"):
+                        row["user_id"] = effective_uid
+                    reel_store.dirty = True
+                await asyncio.to_thread(
+                    append_collection_log,
+                    dir_path, "python", "reel_author_renamed_resolved",
+                    url=url, user_id=effective_uid,
+                    old_username=saved_username, new_username=observed_username,
+                )
+        effective_username = observed_username or saved_username
+        view_count = exact_view_counts_from_metadata(shortcode, detail).get(shortcode)
+        if view_count is None:
+            view_count = exact_nonnegative_integer(detail.get("viewCount"))
+        if view_count is not None:
+            if apply_observed_view_count(reel_store.rows, row, view_count, "instagram_web_reel_page", isoformat_utc()):
+                reel_store.dirty = True
+            profile_views.pending.pop(key, None)
+        elif effective_username and INSTAGRAM_USERNAME_PATTERN.fullmatch(effective_username):
+            found = await read_profile_reel_view_counts(page, effective_username, {shortcode})
+            if shortcode in found:
+                if apply_observed_view_count(reel_store.rows, row, found[shortcode], "instagram_web_profile", isoformat_utc()):
+                    reel_store.dirty = True
+                profile_views.pending.pop(key, None)
+        has_android_metrics = any(
+            exact_nonnegative_integer(row.get(field)) is not None
+            for field in ("like_count", "comment_count", "share_count", "repost_count", "saved_count")
+        )
+        if not has_android_metrics and detached_android_metrics:
+            try:
+                await asyncio.to_thread(
+                    enqueue_android_metric_job,
+                    dir_path,
+                    row,
+                    collection_run_id=collection_run_id,
+                    collection_number=int(row.get("collection_number") or 0),
+                    recollection=recollection,
+                )
+                await asyncio.to_thread(start_android_metric_worker, dir_path)
+            except OSError:
+                pass
+        if key in profile_views.pending and profile_views.android_fallback:
+            try:
+                job_id = await asyncio.to_thread(enqueue_android_view_count_job, dir_path, row)
+            except OSError:
+                job_id = ""
+            if job_id:
+                profile_views.pending.pop(key, None)
+                try:
+                    await asyncio.to_thread(start_android_metric_worker, dir_path)
+                except OSError:
+                    pass
+    if profile_views.android_fallback and profile_views.pending:
+        fallback_queued = False
+        for key, row in list(profile_views.pending.items()):
+            try:
+                job_id = await asyncio.to_thread(enqueue_android_view_count_job, dir_path, row)
+            except OSError:
+                job_id = ""
+            if job_id:
+                profile_views.pending.pop(key, None)
+                fallback_queued = True
+        if fallback_queued:
+            try:
+                await asyncio.to_thread(start_android_metric_worker, dir_path)
+            except OSError:
+                pass
 
 
 async def read_reel_author_profile(page: Any, reel: dict[str, Any]) -> dict[str, Any]:
@@ -4601,13 +4969,23 @@ async def request_web_follower_count(
         try:
             # Keep this visit's observer and pending parsers alive until its
             # view enrichment finishes, including responses received at handoff.
-            if on_profile is not None and completed_profile is not None:
-                await on_profile(completed_profile)
-            if completed_profile is not None and completed_profile.get("status") in {"success", "web_unavailable"}:
-                observed_id = str(completed_profile.get("userId") or "")
-                completed_profile["accountCountry"] = completed_profile.get("accountCountry") or await read_profile_account_country(
-                    page, normalized, observed_id,
-                )
+            try:
+                if on_profile is not None and completed_profile is not None:
+                    await on_profile(completed_profile)
+                if (
+                    completed_profile is not None
+                    and completed_profile.get("status") in {"success", "web_unavailable"}
+                    and "accountCountry" not in completed_profile
+                ):
+                    observed_id = str(completed_profile.get("userId") or "")
+                    completed_profile["accountCountry"] = await read_profile_account_country(
+                        page, normalized, observed_id,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if completed_profile is not None:
+                    completed_profile.setdefault("enrichmentError", str(error)[:300])
         finally:
             if listener_attached:
                 remove_listener = getattr(page, "remove_listener", None)
@@ -4617,10 +4995,18 @@ async def request_web_follower_count(
                     except Exception:
                         pass
             try:
-                if reels and response_tasks:
+                need_tail_metadata = completed_profile is None or completed_profile.get("profileReelDurationMissing") is not False
+                if reels and response_tasks and need_tail_metadata:
                     await asyncio.wait(response_tasks, timeout=PROFILE_REEL_VIEW_RESPONSE_GRACE_SECONDS)
-                if on_metadata_complete is not None and completed_profile is not None:
-                    await on_metadata_complete(completed_profile)
+                if completed_profile is not None:
+                    completed_profile.pop("_reel_response_tasks", None)
+                if on_metadata_complete is not None and completed_profile is not None and need_tail_metadata:
+                    try:
+                        await on_metadata_complete(completed_profile)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        completed_profile.setdefault("enrichmentError", str(error)[:300])
             finally:
                 await _cancel_pending_response_tasks(response_tasks)
                 if completed_profile is not None:
@@ -4694,38 +5080,46 @@ class SequentialWebFollowerLookup:
             async def finish_profile_metadata(profile: dict[str, Any]) -> None:
                 await self.on_profile.enrich_profile_durations(payload["username"], str(payload.get("userId") or ""), profile)
 
+            started_at = time.monotonic()
             enrich_during_visit = isinstance(self.on_profile, ProfileReelViewEnricher)
-            for attempt in range(self.max_attempts):
-                route_options = {"reels": True, "on_profile": enrich_profile, "on_metadata_complete": finish_profile_metadata} if enrich_during_visit else {}
-                result = await request_web_follower_count(self.page, payload["username"], **route_options)
-                if route_options and result.get("status") == "web_unavailable":
-                    # Keep this loaded grid for view enrichment even if the
-                    # follower header is compact/missing. FollowerEnricher can
-                    # retry the profile once at the queue tail afterwards.
-                    break
-                if result.get("status") not in {"web_error", "web_unavailable"} or attempt + 1 >= self.max_attempts:
-                    break
-                try:
-                    if self.retry_delay_seconds:
-                        await asyncio.sleep(self.retry_delay_seconds * (attempt + 1))
-                    await self._replace_page()
-                except Exception as error:
-                    result = {"status": "web_error", "error": f"Follower page retry failed: {str(error)[:400]}", "source": "instagram_web"}
-                    break
-            if self.on_profile is not None and not enrich_during_visit:
-                await self.on_profile(self.page, payload, result)
-            self.completed_since_recycle += 1
-            if self.completed_since_recycle >= FOLLOWER_PAGE_RECYCLE_LOOKUP_COUNT and result["status"] not in {"rate_limited", "login_required", "challenge_required"}:
-                try:
-                    await self._replace_page()
-                    self.completed_since_recycle = 0
-                except Exception:
-                    pass
-            self.wait_before_next = follower_lookup_delay_seconds(result, self.interval_seconds)
-            if isinstance(self.on_profile, ProfileReelViewEnricher):
-                self.wait_before_next = max(self.wait_before_next, self.interval_seconds)
-            self.last_completed_at = time.monotonic()
-            return result
+            try:
+                for attempt in range(self.max_attempts):
+                    route_options = {"reels": True, "on_profile": enrich_profile, "on_metadata_complete": finish_profile_metadata} if enrich_during_visit else {}
+                    result = await request_web_follower_count(self.page, payload["username"], **route_options)
+                    if route_options and result.get("status") == "web_unavailable":
+                        # Keep this loaded grid for view enrichment even if the
+                        # follower header is compact/missing. FollowerEnricher can
+                        # retry the profile once at the queue tail afterwards.
+                        break
+                    if result.get("status") not in {"web_error", "web_unavailable"} or attempt + 1 >= self.max_attempts:
+                        break
+                    try:
+                        if self.retry_delay_seconds:
+                            await asyncio.sleep(self.retry_delay_seconds * (attempt + 1))
+                        await self._replace_page()
+                    except Exception as error:
+                        result = {"status": "web_error", "error": f"Follower page retry failed: {str(error)[:400]}", "source": "instagram_web"}
+                        break
+                if self.on_profile is not None and not enrich_during_visit:
+                    try:
+                        await self.on_profile(self.page, payload, result)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        result.setdefault("enrichmentError", str(error)[:300])
+                self.completed_since_recycle += 1
+                if self.completed_since_recycle >= FOLLOWER_PAGE_RECYCLE_LOOKUP_COUNT and result["status"] not in {"rate_limited", "login_required", "challenge_required"}:
+                    try:
+                        await self._replace_page()
+                        self.completed_since_recycle = 0
+                    except Exception:
+                        pass
+                return result
+            finally:
+                self.wait_before_next = follower_lookup_delay_seconds(result, self.interval_seconds)
+                if isinstance(self.on_profile, ProfileReelViewEnricher):
+                    self.wait_before_next = max(self.wait_before_next, self.interval_seconds)
+                self.last_completed_at = started_at
 
 
 @dataclass
@@ -5050,14 +5444,13 @@ async def _run_collector_once(
             hashtag_page_url(options.hashtags[0]) if options.hashtags else options.start_url
         )
         if not options.followers_only:
+            await asyncio.to_thread(apply_completed_android_metric_jobs, options.data_dir)
             reel_store = await LongReelStore.create(
                 csv_path,
                 options.checkpoint_items,
                 options.xlsx_layout,
                 options.disable_recollect_cooldown,
             )
-            await asyncio.to_thread(apply_completed_android_metric_jobs, options.data_dir)
-            await reel_store.merge_external_android_metrics()
         executable_path = locate_browser_executable()
         if owns_collection_context:
             async_playwright = load_playwright()
@@ -5074,7 +5467,9 @@ async def _run_collector_once(
         rate_limit_state = rate_limit_state_for_context(context, diagnostics)
         await rate_limit_state.wait_if_limited()
 
-        profile_views = ProfileReelViewEnricher(reel_store, android_fallback=detached_android_metrics)
+        profile_views = ProfileReelViewEnricher(
+            reel_store, android_fallback=detached_android_metrics, recollection_details=profile_android_recollection,
+        )
 
         recollection_targets: dict[tuple[str, str], list[str]] = {}
         if profile_android_recollection:
@@ -5225,7 +5620,12 @@ async def _run_collector_once(
             background=options.background,
             no_login=options.no_login,
         )
-        if options.no_login and refresh_urls:
+        if profile_android_recollection and options.background and not options.no_login:
+            # Background profile recollection reads saved history and visits
+            # creator profiles via follower_runtime; it does not use a Reel feed
+            # page or need an initial home-feed navigation on every batch.
+            page = None
+        elif options.no_login and refresh_urls:
             # Do not make the first saved URL a gate for the entire anonymous
             # refresh. Each URL is checked in the direct-refresh loop so a
             # login-walled Reel can be skipped and the remaining public URLs
@@ -5259,9 +5659,10 @@ async def _run_collector_once(
                 )
             print("로그인 프로필을 사용하지 않는 임시 브라우저로 공개 릴스 수집을 시작합니다.")
         elif options.background:
-            expected_surface = is_instagram_hashtag_surface(page.url) if options.hashtags else is_instagram_reels_surface(page.url)
-            if not expected_surface and not profile_android_recollection:
-                raise CrawlerAccessError("login_required", "Background mode needs a saved Instagram login. Run without --background, sign in once, and retry.")
+            if not profile_android_recollection:
+                expected_surface = is_instagram_hashtag_surface(page.url) if options.hashtags else is_instagram_reels_surface(page.url)
+                if not expected_surface:
+                    raise CrawlerAccessError("login_required", "Background mode needs a saved Instagram login. Run without --background, sign in once, and retry.")
             print("저장된 Instagram 브라우저 프로필로 창 없이 백그라운드 수집을 시작했습니다.")
         else:
             print("브라우저에서 Instagram에 로그인한 뒤 이 창으로 돌아오세요." if profile_android_recollection else "브라우저에서 Instagram에 로그인하고 릴스 화면을 연 뒤 이 창으로 돌아오세요.")
@@ -5282,9 +5683,7 @@ async def _run_collector_once(
             print("릴스 지표를 먼저 저장하고, 팔로워 수집 시 작성자 릴스 탭에서 play_count를 함께 보완합니다.")
 
         captured = duplicate_count = missing_count = filtered_count = 0
-        recollection_web_fallback_results: list[dict[str, Any]] = []
-        recollection_android_results: list[dict[str, Any]] = []
-        recollection_android_jobs: dict[str, dict[str, Any]] = {}
+        recollection_android_jobs: set[str] = set()
         android_metrics_collected = android_metrics_unavailable = android_handoff_deferred = 0
         android_metrics_processed = 0
         collection_run_id = uuid.uuid4().hex
@@ -5519,13 +5918,13 @@ async def _run_collector_once(
             if str(active_page.url) != original_url:
                 await navigate_with_retries(active_page, original_url, diagnostics=diagnostics)
 
-        async def store_hybrid_reel(
+        async def store_reel_snapshot(
             record: dict[str, Any],
             collected: dict[str, Any],
             active_page: Any = None,
             *, recollection: bool = False,
         ) -> dict[str, Any]:
-            """Persist Python-visible fields and hand the same URL to Android."""
+            """Persist verified web fields and queue Android only in hybrid mode."""
             nonlocal next_delay_seconds, android_handoff_deferred
             if reel_store is None:
                 raise RuntimeError("Reel store was not initialized.")
@@ -5535,8 +5934,8 @@ async def _run_collector_once(
                     collected["view_count"] = cached_count
             if inline_profiles:
                 collected["follower_count"] = ""
-            handoff_missing = missing_python_to_android_handoff_fields(collected)
-            handoff_delay = 0.0 if recollection else python_to_android_handoff_delay_seconds(collected)
+            handoff_missing = missing_python_to_android_handoff_fields(collected) if hybrid_android_metrics else ()
+            handoff_delay = python_to_android_handoff_delay_seconds(collected) if hybrid_android_metrics and not recollection else 0.0
             if handoff_delay:
                 android_handoff_deferred += 1
             # Python does not wait for Android. The app worker fills counts
@@ -5573,7 +5972,10 @@ async def _run_collector_once(
                     enqueue=not recollection and not options.hashtags and not options.followers_after_reels,
                     force=exact_nonnegative_integer(collected.get("view_count")) is None,
                 )
-            if options.android_metrics_required and not profile_android_recollection:
+            if not hybrid_android_metrics:
+                android_status = ""
+                android_job_id = ""
+            elif options.android_metrics_required and not profile_android_recollection:
                 if android_pipeline is None:
                     raise RuntimeError("Android metric pipeline was not initialized.")
                 android_pipeline.enqueue(
@@ -5633,7 +6035,7 @@ async def _run_collector_once(
                 "cooldownLabel": stored.get("cooldownLabel", ""),
                 "nextCollectionAt": stored.get("nextCollectionAt", ""),
                 "collectionComplete": True,
-                "likeCountUnavailable": False,
+                "likeCountUnavailable": is_like_count_marked_unavailable(collected.get("like_count")),
                 "androidMetricStatus": android_status,
                 "androidJobId": android_job_id,
             }
@@ -5645,43 +6047,11 @@ async def _run_collector_once(
             if snapshot is None:
                 return None
             record, collected = snapshot
-            stored = await store_hybrid_reel(record, collected, recollection=True)
+            stored = await store_reel_snapshot(record, collected, recollection=True)
             job_id = str(stored.get("androidJobId") or "")
             if job_id:
-                recollection_android_jobs[job_id] = collected
+                recollection_android_jobs.add(job_id)
             return stored
-
-        async def finish_recollection_android_jobs() -> None:
-            pending = dict(recollection_android_jobs)
-            paths = _android_metric_queue_paths(options.data_dir)
-            deadline = asyncio.get_running_loop().time() + ANDROID_RECOLLECTION_WAIT_SECONDS
-            while pending and not stop_event.is_set() and asyncio.get_running_loop().time() < deadline:
-                if await stop_if_shared_stop_requested():
-                    break
-                for job_id, collected in list(pending.items()):
-                    completion_path = paths["recollection_completed"] / f"{job_id}.json"
-                    completion = _read_android_metric_job(completion_path)
-                    if completion is None:
-                        continue
-                    recollection_android_results.append(completion)
-                    android_metrics = completion.get("metrics")
-                    if isinstance(android_metrics, dict) and android_metrics:
-                        await reel_store.enrich_latest_snapshot(
-                            collected,
-                            android_result=AndroidMetricResult(metrics=android_metrics, recollection=True),
-                            fields_to_update=set(android_metrics),
-                        )
-                    completion_path.unlink(missing_ok=True)
-                    pending.pop(job_id)
-                if pending:
-                    recovery_error = android_recovery_failure(options.data_dir)
-                    if recovery_error:
-                        append_collection_log(options.data_dir, "python", "recollection_android_wait_deferred", error=recovery_error, pending_jobs=len(pending))
-                        break
-                    await asyncio.to_thread(start_android_metric_worker, options.data_dir)
-                    await asyncio.sleep(0.5)
-            if pending:
-                append_collection_log(options.data_dir, "python", "recollection_android_jobs_preserved", pending_jobs=len(pending))
 
         async def save_rate_limited_reel(url: str, error: str) -> bool:
             """Persist the failed web visit first, then let Android fill its counts."""
@@ -5706,7 +6076,7 @@ async def _run_collector_once(
             if partial is None:
                 return False
             record, collected = partial
-            stored = await store_hybrid_reel(record, collected)
+            stored = await store_reel_snapshot(record, collected)
             if stored.get("skipped"):
                 return False
             captured += 1
@@ -5760,7 +6130,7 @@ async def _run_collector_once(
                     "uploadAgeFilteredOut": True,
                     "uploadAgeDays": collected["days_since_upload"],
                 }
-            stored = await store_hybrid_reel(record, collected)
+            stored = await store_reel_snapshot(record, collected)
             if inline_profiles and not stored.get("cooldownSkipped"):
                 await collect_inline_profile(collected, page, open_reel=True)
             return stored
@@ -5837,18 +6207,18 @@ async def _run_collector_once(
                     {"viewCount": cached_count, "viewSourceField": "play_count"},
                 )
             defer_profile_metrics = follower_enricher is not None and not anonymous_refresh
-            response_metadata, used_passive_response = await resolve_page_first_reel_metadata(
+            response_metadata, _ = await resolve_page_first_reel_metadata(
                 active_page,
                 record,
                 metadata,
                 metadata_timeout_milliseconds,
-                require_complete_metrics=not hybrid_android_metrics,
+                require_complete_metrics=anonymous_refresh,
                 defer_profile_metrics=defer_profile_metrics,
             )
             if rate_limit_state is not None:
                 await rate_limit_state.wait_if_limited()
             collected = build_collected_record(record, response_metadata)
-            if hybrid_android_metrics and (not collected["user_id"] or not collected["username"]):
+            if not anonymous_refresh and (not collected["user_id"] or not collected["username"]):
                 return {
                     **record,
                     "exactMetricUnavailable": True,
@@ -5879,7 +6249,7 @@ async def _run_collector_once(
                 record,
                 response_metadata,
             )
-            if like_count_unavailable and not hybrid_android_metrics:
+            if like_count_unavailable and anonymous_refresh:
                 collected["like_count"] = UNAVAILABLE_LIKE_COUNT_MARKER
             if options.max_upload_age_days > 0 and not parse_datetime(collected.get("uploaded_at")):
                 seen.add(record["shortcode"])
@@ -5888,98 +6258,21 @@ async def _run_collector_once(
                 seen.add(record["shortcode"])
                 return {**record, "uploadAgeFilteredOut": True, "uploadAgeDays": collected["days_since_upload"]}
 
-            if hybrid_android_metrics:
-                return await store_hybrid_reel(record, collected, active_page)
+            if not anonymous_refresh:
+                return await store_reel_snapshot(record, collected, active_page)
 
             exact_views = exact_view_counts_from_metadata(record["shortcode"], response_metadata)
-            if anonymous_refresh:
-                anonymous_probe = build_anonymous_refresh_from_history(reel_store.rows, collected)
-                if anonymous_probe is None:
-                    seen.add(record["shortcode"])
-                    return {
-                        **record,
-                        "exactMetricUnavailable": True,
-                        "exactMetricStatus": "anonymous_refresh_history_unavailable",
-                        "exactMetricError": "A previous Reel history row is required to preserve static metadata during anonymous refresh.",
-                    }
-                username = str(anonymous_probe.get("username") or "").strip().lstrip("@")
-                follower_key = str(anonymous_probe.get("user_id") or "") or username.casefold()
-                follower_result = exact_follower_result_from_metadata(response_metadata)
-                if follower_result is not None and follower_key:
-                    exact_follower_cache[follower_key] = follower_result
-                elif follower_key in exact_follower_cache:
-                    follower_result = exact_follower_cache[follower_key]
-                else:
-                    follower_result = {
-                        "status": "profile_unavailable",
-                        "error": "Exact follower_count was not present in the current Reel page or its responses.",
-                        "source": "instagram_page",
-                    }
-                anonymous_collected = build_anonymous_refresh_from_exact_metrics(
-                    reel_store.rows,
-                    collected,
-                    record["shortcode"],
-                    exact_views,
-                    follower_result,
-                )
-                if anonymous_collected is None:
-                    seen.add(record["shortcode"])
-                    return {
-                        **record,
-                        "exactMetricUnavailable": True,
-                        "exactMetricStatus": "anonymous_refresh_history_unavailable",
-                        "exactMetricError": "A previous Reel history row is required to preserve static metadata during anonymous refresh.",
-                    }
-                next_delay_seconds = REEL_SUCCESS_INTERVAL_SECONDS
-                diagnostics.stage_start("SAVE_RESULT")
-                try:
-                    stored = await reel_store.append(anonymous_collected)
-                except Exception as error:
-                    diagnostics.stage_failed("SAVE_RESULT", reason=type(error).__name__, error=str(error))
-                    raise
-                diagnostics.stage_success("SAVE_RESULT")
-                if not stored.get("skipped"):
-                    collected_shortcodes.add(record["shortcode"])
-                    await log_python_reel(anonymous_collected)
-                seen.add(record["shortcode"])
-                public_metric_fields = ["view_count", "comment_count"]
-                return {
-                    **record,
-                    "snapshotLabel": stored["label"],
-                    "collectionNumber": stored.get("collection_number"),
-                    "cooldownSkipped": bool(stored.get("skipped")),
-                    "cooldownLabel": stored.get("cooldownLabel", ""),
-                    "nextCollectionAt": stored.get("nextCollectionAt", ""),
-                    "collectionComplete": (
-                        all(exact_nonnegative_integer(anonymous_collected.get(field)) is not None for field in public_metric_fields)
-                        and (
-                            exact_nonnegative_integer(anonymous_collected.get("like_count")) is not None
-                            or is_like_count_marked_unavailable(anonymous_collected.get("like_count"))
-                        )
-                    ),
-                    "likeCountUnavailable": like_count_unavailable,
-                }
-            missing_engagement_field = next(
-                (
-                    field
-                    for field in ["comment_count"]
-                    if exact_nonnegative_integer(collected.get(field)) is None
-                ),
-                "",
-            )
-            if missing_engagement_field:
+            anonymous_probe = build_anonymous_refresh_from_history(reel_store.rows, collected)
+            if anonymous_probe is None:
                 seen.add(record["shortcode"])
                 return {
                     **record,
                     "exactMetricUnavailable": True,
-                    "exactMetricStatus": f"exact_{missing_engagement_field}_unavailable",
-                    "exactMetricError": (
-                        f"Exact {missing_engagement_field} was not present in the embedded/DOM page data"
-                        + (" or the page's passive JSON responses." if used_passive_response else ".")
-                    ),
+                    "exactMetricStatus": "anonymous_refresh_history_unavailable",
+                    "exactMetricError": "A previous Reel history row is required to preserve static metadata during anonymous refresh.",
                 }
-            follower_payload = {"user_id": str(collected["user_id"]), "username": str(collected["username"]), "seen_at": str(collected["collected_at"])}
-            follower_key = follower_payload["user_id"] or follower_payload["username"].casefold()
+            username = str(anonymous_probe.get("username") or "").strip().lstrip("@")
+            follower_key = str(anonymous_probe.get("user_id") or "") or username.casefold()
             follower_result = exact_follower_result_from_metadata(response_metadata)
             if follower_result is not None and follower_key:
                 exact_follower_cache[follower_key] = follower_result
@@ -5991,56 +6284,34 @@ async def _run_collector_once(
                     "error": "Exact follower_count was not present in the current Reel page or its responses.",
                     "source": "instagram_page",
                 }
-            exact_result = apply_exact_metric_results(
+            anonymous_collected = build_anonymous_refresh_from_exact_metrics(
+                reel_store.rows,
                 collected,
                 record["shortcode"],
                 exact_views,
                 follower_result,
             )
-            if exact_result["status"] != "success":
-                if defer_profile_metrics and exact_result["status"] in {"exact_view_unavailable", "exact_follower_unavailable"}:
-                    # Save the current snapshot with blanks; the profile visit
-                    # fills those fields without creating another collection.
-                    pass
-                else:
-                    seen.add(record["shortcode"])
-                    return {
-                        **record,
-                        "exactMetricUnavailable": True,
-                        "exactMetricStatus": exact_result["status"],
-                        "exactMetricError": exact_result["error"],
-                    }
-            if not has_complete_reel_core_data(collected, allow_pending_profile_metrics=defer_profile_metrics):
+            if anonymous_collected is None:
                 seen.add(record["shortcode"])
                 return {
                     **record,
                     "exactMetricUnavailable": True,
-                    "exactMetricStatus": "exact_core_data_unavailable",
-                    "exactMetricError": "Required exact page fields or Reel identity fields were unavailable.",
+                    "exactMetricStatus": "anonymous_refresh_history_unavailable",
+                    "exactMetricError": "A previous Reel history row is required to preserve static metadata during anonymous refresh.",
                 }
-            if inline_profiles:
-                collected["follower_count"] = ""
             next_delay_seconds = REEL_SUCCESS_INTERVAL_SECONDS
             diagnostics.stage_start("SAVE_RESULT")
             try:
-                stored = await reel_store.append(collected)
+                stored = await reel_store.append(anonymous_collected)
             except Exception as error:
                 diagnostics.stage_failed("SAVE_RESULT", reason=type(error).__name__, error=str(error))
                 raise
             diagnostics.stage_success("SAVE_RESULT")
             if not stored.get("skipped"):
                 collected_shortcodes.add(record["shortcode"])
-                profile_views.track(collected)
-                if inline_profiles:
-                    await collect_inline_profile(collected, active_page)
-                elif follower_enricher is not None:
-                    await follower_enricher.track_user(
-                        **follower_payload,
-                        enqueue=not options.hashtags and not options.followers_after_reels,
-                        force=exact_nonnegative_integer(collected.get("view_count")) is None,
-                    )
-                await log_python_reel(collected)
+                await log_python_reel(anonymous_collected)
             seen.add(record["shortcode"])
+            public_metric_fields = ["view_count", "comment_count"]
             return {
                 **record,
                 "snapshotLabel": stored["label"],
@@ -6048,7 +6319,13 @@ async def _run_collector_once(
                 "cooldownSkipped": bool(stored.get("skipped")),
                 "cooldownLabel": stored.get("cooldownLabel", ""),
                 "nextCollectionAt": stored.get("nextCollectionAt", ""),
-                "collectionComplete": has_complete_reel_core_data(collected),
+                "collectionComplete": (
+                    all(exact_nonnegative_integer(anonymous_collected.get(field)) is not None for field in public_metric_fields)
+                    and (
+                        exact_nonnegative_integer(anonymous_collected.get("like_count")) is not None
+                        or is_like_count_marked_unavailable(anonymous_collected.get("like_count"))
+                    )
+                ),
                 "likeCountUnavailable": like_count_unavailable,
             }
 
@@ -6317,7 +6594,11 @@ async def _run_collector_once(
                                 await navigate_with_retries(worker_page, reel_detail_page_url(url), diagnostics=diagnostics)
                                 diagnostics.stage_success("OPEN_REEL")
                                 await worker_page.wait_for_timeout(DIRECT_REEL_SETTLE_MILLISECONDS)
-                                record = await capture_current_reel(worker_page, worker_metadata, DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS)
+                                normalized = normalize_reel_url(url)
+                                record = await capture_current_reel(
+                                    worker_page, worker_metadata, DIRECT_REEL_METADATA_TIMEOUT_MILLISECONDS,
+                                    expected_shortcode=normalized["shortcode"] if normalized else "",
+                                )
                                 await report_direct_result(index, url, record)
                             except CrawlerAccessError as error:
                                 if can_skip_anonymous_refresh_access_error(error, no_login=options.no_login):
@@ -6366,10 +6647,11 @@ async def _run_collector_once(
                             await async_input("현재 릴스를 다시 수집하려면 Enter를 누르세요: ")
                         else:
                             await page.wait_for_timeout(next_delay_seconds * 1000)
+                        normalized = normalize_reel_url(url)
                         await report_direct_result(
                             index,
                             url,
-                            await capture_current_reel(),
+                            await capture_current_reel(expected_shortcode=normalized["shortcode"] if normalized else ""),
                         )
                     except CrawlerAccessError as error:
                         if profile_android_recollection and error.code in {"profile_unavailable", "metric_unavailable", "identity_mismatch"}:
@@ -6594,22 +6876,42 @@ async def _run_collector_once(
         if merged:
             reel_store.dirty = True
             await reel_store.flush()
+        if profile_views.pending:
+            active_fallback_page = follower_runtime.page if follower_runtime and not follower_runtime.page.is_closed() else page
+            await resolve_pending_reels_via_links(
+                active_fallback_page,
+                options.data_dir,
+                reel_store,
+                profile_views,
+                follower_enricher,
+                detached_android_metrics=detached_android_metrics,
+                recollection=profile_android_recollection,
+                collection_run_id=collection_run_id,
+                diagnostics=diagnostics,
+            )
+            if reel_store.dirty:
+                await reel_store.flush()
         if recollection_android_jobs:
-            await finish_recollection_android_jobs()
+            completion_dir = _android_metric_queue_paths(options.data_dir)["recollection_completed"]
+            pending_recollections = sum(
+                not (completion_dir / f"{job_id}.json").exists() for job_id in recollection_android_jobs
+            )
+            if pending_recollections:
+                append_collection_log(options.data_dir, "python", "recollection_android_jobs_preserved",
+                                      pending_jobs=pending_recollections)
         if detached_android_metrics:
             await asyncio.to_thread(apply_completed_android_metric_jobs, options.data_dir)
             await reel_store.merge_external_android_metrics()
+        try:
+            from .caption_refresh import drain_caption_refresh_queue
+            await drain_caption_refresh_queue(page, options.data_dir)
+        except Exception:
+            pass
         if follower_enricher is not None:
             users_xlsx = await asyncio.to_thread(write_users_xlsx, options.data_dir)
             print(f"사용자 정보 저장 완료: {users_xlsx}")
         print(f"Follower data merged into {csv_path.name}: {merged}")
         output_paths = await reel_store.export_outputs()
-        if recollection_android_results:
-            await asyncio.to_thread(
-                write_count_history_xlsx, options.data_dir, reel_store.rows,
-                android_results=recollection_android_results,
-                web_results=recollection_web_fallback_results,
-            )
         await safe_close(follower_runtime.browser if follower_runtime else None)
         follower_runtime = None
         await safe_close(view_page)

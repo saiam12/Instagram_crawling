@@ -76,7 +76,7 @@ class SheetsKeyPool(GeminiKeyPool):
         self.models = self._load_models() if models is None else list(models)
         supported = SUPPORTED_FLASH_MODELS if models is None else SUPPORTED_POOL_MODELS
         if not self.models or any(m not in supported for m in self.models):
-            raise SheetsPoolError("공용 풀은 Gemini 3.6/3.8 Flash, Antigravity 가이드, Gemini Embedding 2를 지원합니다. 3.5/3.7 및 Lite는 사용할 수 없습니다.")
+            raise SheetsPoolError("공용 풀은 Gemini 3.5 Flash Lite, 3.6/3.8 Flash, Antigravity 가이드, Gemini Embedding 2를 지원합니다. 3.5/3.7 Flash는 사용할 수 없습니다.")
         if len(dict(self.keys)) != len(self.keys):
             raise SheetsPoolError("API 키의 별칭을 중복 없이 .env에 설정하세요.")
         self.combos = [Combo(label, key, model) for label, key in self.keys for model in self.models]

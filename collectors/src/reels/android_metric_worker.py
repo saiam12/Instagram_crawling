@@ -72,6 +72,7 @@ from .reel_records import (
     enrich_reel_collection_rows,
     exact_nonnegative_integer,
     isoformat_utc,
+    normalize_reel_url,
     parse_datetime,
     utc_now,
 )
@@ -107,6 +108,8 @@ def enqueue_android_metric_job(
     python_total: int = 0,
     collection_number: int = 0,
     recollection: bool = False,
+    missing_count_fields: Sequence[str] = (),
+    retry_missing_title: bool = False,
 ) -> str:
     """Atomically persist a URL for the independent Android worker."""
     url = str(record.get("url", "")).strip()
@@ -119,7 +122,8 @@ def enqueue_android_metric_job(
     payload = {
         "job_id": job_id,
         "queued_at": isoformat_utc(),
-        "target": {"url": url, "collected_at": collected_at, "username": str(record.get("username") or "")},
+        "target": {"url": url, "collected_at": collected_at, "username": str(record.get("username") or ""),
+                   "title": str(record.get("title") or ""), "hashtags": str(record.get("hashtags") or "")},
         "python_metrics": {
             field: record.get(field, "")
             for field in (*PYTHON_ANDROID_COMPARISON_COUNT_FIELDS, "ad")
@@ -137,6 +141,10 @@ def enqueue_android_metric_job(
             "ui_delay_seconds": max(0.1, float(ui_delay_seconds)),
         },
     }
+    if missing_count_fields:
+        payload["missing_count_fields"] = list(missing_count_fields)
+    if retry_missing_title:
+        payload["retry_missing_title"] = True
     write_json_atomic(paths["pending"] / f"{job_id}.json", payload)
     return job_id
 
@@ -175,7 +183,7 @@ def _recover_android_metric_working_jobs(paths: dict[str, Path]) -> None:
     for working in paths["working"].glob("*.json"):
         destination = paths["pending"] / working.name
         job = _read_android_metric_job(working) or {}
-        completed_path = paths["completed"] / working.name
+        completed_path = _android_completion_path(paths, job, working.name)
         published = _read_android_metric_job(completed_path)
         completed = next((
             candidate for candidate in (job.get("saved_completion"), published)
@@ -185,6 +193,7 @@ def _recover_android_metric_working_jobs(paths: dict[str, Path]) -> None:
             # A completion write may succeed before its mirror or working-file
             # cleanup fails. Finish that commit without collecting new values.
             if published != completed:
+                completed_path.parent.mkdir(parents=True, exist_ok=True)
                 write_json_atomic(completed_path, completed)
             if job.get("recollection"):
                 mirror = paths["recollection_completed"] / working.name
@@ -208,7 +217,7 @@ def _recover_android_metric_working_jobs(paths: dict[str, Path]) -> None:
 
 def _android_view_target_is_collected(data_dir: Path, target: dict[str, Any]) -> bool:
     history = data_dir / REEL_HISTORY_DIRECTORY / REEL_HISTORY_FILENAME
-    rows = read_csv_objects(history)[1] if history.exists() else []
+    rows = read_csv_objects(history, synchronize_history=True)[1] if history.exists() else []
     return any(
         row.get("url") == target.get("url")
         and row.get("collected_at") == target.get("collected_at")
@@ -225,7 +234,7 @@ def prune_collected_android_view_jobs(data_dir: Path) -> int:
     if not jobs:
         return 0
     history = data_dir / REEL_HISTORY_DIRECTORY / REEL_HISTORY_FILENAME
-    rows = read_csv_objects(history)[1] if history.exists() else []
+    rows = read_csv_objects(history, synchronize_history=True)[1] if history.exists() else []
     collected = {
         (str(row.get("url", "")), str(row.get("collected_at", "")))
         for row in rows if exact_visible_reel_count(str(row.get("view_count", ""))) is not None
@@ -246,19 +255,8 @@ def _claim_android_metric_job(paths: dict[str, Path]) -> tuple[Path, dict[str, A
     paths["pending"].mkdir(parents=True, exist_ok=True)
     paths["working"].mkdir(parents=True, exist_ok=True)
 
-    def job_priority(path: Path) -> tuple[int, datetime, str]:
+    def queue_order(path: Path) -> tuple[datetime, str]:
         job = _read_android_metric_job(path) or {}
-        kind = str(job.get("kind") or "")
-        # The related-tag job is awaited before candidate Reel collection.
-        # Exact one-tag jobs are best-effort idle work and must yield to every
-        # actual Reel metric job.
-        priority = (
-            -1 if kind == "app_restart"
-            else 0 if kind == "related_hashtag_post_counts"
-            else 3 if kind == "profile_view_count"
-            else 2 if kind == "hashtag_post_count"
-            else 1
-        )
         queued_at = str(job.get("retry_queued_at") or job.get("queued_at") or "")
         try:
             timestamp = datetime.fromisoformat(queued_at.replace("Z", "+00:00"))
@@ -266,11 +264,11 @@ def _claim_android_metric_job(paths: dict[str, Path]) -> tuple[Path, dict[str, A
             timestamp = datetime.min.replace(tzinfo=timezone.utc)
         if timestamp.tzinfo is None:
             timestamp = timestamp.replace(tzinfo=timezone.utc)
-        return priority, timestamp, path.name
+        return timestamp, path.name
 
     for pending in sorted(
         paths["pending"].glob("*.json"),
-        key=job_priority,
+        key=queue_order,
     ):
         queued_job = _read_android_metric_job(pending) or {}
         if queued_job.get("kind") == "profile_view_count" and not ANDROID_PROFILE_VIEW_FALLBACK_ENABLED:
@@ -298,6 +296,16 @@ def _claim_android_metric_job(paths: dict[str, Path]) -> tuple[Path, dict[str, A
     return None
 
 
+def _android_completion_path(paths: dict[str, Path], job: dict[str, Any], name: str) -> Path:
+    # Older browser processes must not consume a fill-only result as a regular update.
+    completion = job.get("saved_completion") or {}
+    if completion.get("observed_hashtags") is not None or completion.get("identity_author_only") is True:
+        return paths["root"] / "hashtag_identity_completed" / name
+    if "missing_count_fields" in job:
+        return paths["root"] / "missing_counts_completed" / name
+    return paths["completed"] / name
+
+
 def _write_android_metric_completion(
     paths: dict[str, Path],
     working_path: Path,
@@ -306,6 +314,7 @@ def _write_android_metric_completion(
 ) -> None:
     paths["completed"].mkdir(parents=True, exist_ok=True)
     target = job.get("target") if isinstance(job.get("target"), dict) else {}
+    backfill_fields = set(job.get("missing_count_fields") or ()) & {"share_count", "comment_count", "repost_count"}
     payload = {
         "job_id": str(job.get("job_id", working_path.stem)),
         "kind": str(job.get("kind") or ""),
@@ -326,15 +335,32 @@ def _write_android_metric_completion(
         "status": result.status,
         "error": result.error[:500],
         "observed_reel_url": result.observed_reel_url,
+        "identity_like_fallback": result.identity_like_fallback,
+        "observed_caption": result.observed_caption,
+        "observed_hashtags": result.observed_hashtags,
+        "identity_author_only": result.identity_author_only,
         "observed_username": result.observed_username,
+        "caption_modified": getattr(result, "caption_modified", False),
     }
     if result.like_count_private is True:
         payload["metrics"]["like_count"] = UNAVAILABLE_LIKE_COUNT_MARKER
+    if "missing_count_fields" in job:
+        payload["missing_count_fields"] = sorted(backfill_fields)
+        payload["metrics"] = {
+            field: value for field, value in result.metrics.items()
+            if field in backfill_fields and field not in result.compact_fields
+            and exact_nonnegative_integer(value) is not None
+        }
+        payload["like_count_private"] = None
+        payload["comment_count_disabled"] = None
+        payload["android_mismatch"] = ""
     # Retain the accepted result until both publication and cleanup finish.
     # A browser process may consume the public completion before that point.
     job["saved_completion"] = payload
     write_json_atomic(working_path, job)
-    write_json_atomic(paths["completed"] / working_path.name, payload)
+    completion_path = _android_completion_path(paths, job, working_path.name)
+    completion_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(completion_path, payload)
     if job.get("kind") == "profile_view_count" and exact_nonnegative_integer(result.metrics.get("view_count")) is None:
         write_json_atomic(paths["completed"].parent / "view_failed" / working_path.name, {
             **payload, "target": dict(target), "needs_review": True,
@@ -368,7 +394,7 @@ def android_metric_terminal_line(
         if field == "view_count":
             continue
         value = combined_values.get(field, "")
-        rendered = f"{value:,}" if isinstance(value, int) else str(value or "unavailable")
+        rendered = f"{value:,}" if isinstance(value, int) else ("unavailable" if value in (None, "") else str(value))
         fields.append(f"{field}={rendered}")
     fields.append(f"attempt_count={max(0, int(attempts))}")
     return f"[Android] [{max(1, int(current))}/{max(1, int(total))}] {reel_url} | " + ", ".join(fields)
@@ -447,7 +473,11 @@ def apply_completed_android_metric_jobs(
     """Merge completed app metrics into history without racing browser writes."""
     destination = Path(data_dir).resolve()
     paths = _android_metric_queue_paths(destination)
-    completed_paths = sorted(paths["completed"].glob("*.json")) if paths["completed"].exists() else []
+    completed_paths = sorted([
+        *paths["completed"].glob("*.json"),
+        *(paths["root"] / "missing_counts_completed").glob("*.json"),
+        *(paths["root"] / "hashtag_identity_completed").glob("*.json"),
+    ])
     if not completed_paths:
         return {"applied": 0, "updated": 0, "pending": 0}
     history_path = destination / REEL_HISTORY_DIRECTORY / REEL_HISTORY_FILENAME
@@ -496,6 +526,14 @@ def apply_completed_android_metric_jobs(
                                           observed_at=result.get("completed_at"), reason=reason, view_count=count)
                 applied_paths.append(completed)
                 continue
+            if "missing_count_fields" in result:
+                for field in set(result["missing_count_fields"]) & {"share_count", "comment_count", "repost_count"}:
+                    count = exact_nonnegative_integer(metrics.get(field))
+                    if field not in result.get("compact_fields", ()) and row.get(field) in (None, "") and count is not None:
+                        row[field] = count
+                        updated += 1
+                applied_paths.append(completed)
+                continue
             mismatch = str(result.get("android_mismatch", "") or "")
             if mismatch and row.get("android_mismatch") != mismatch:
                 row["android_mismatch"] = mismatch
@@ -510,10 +548,24 @@ def apply_completed_android_metric_jobs(
                 comment_count_disabled=result.get("comment_count_disabled"),
                 status=str(result.get("status") or "unavailable"),
             ))
+            if merged.get("like_count") == UNAVAILABLE_LIKE_COUNT_MARKER:
+                initial_row = next((r for r in rows if str(r.get("url", "")) == str(row.get("url", "")) and str(r.get("collection_number", "")).strip() in {"1", ""}), None)
+                if initial_row and str(initial_row.get("like_count", "")).strip() in {"0", "0.0"}:
+                    merged["like_count"] = 0
             for field in ANDROID_TERMINAL_METRIC_FIELDS:
                 if row.get(field) != merged.get(field):
                     row[field] = merged.get(field, "")
                     updated += 1
+            if result.get("caption_modified") is True:
+                from .caption_refresh import enqueue_caption_refresh_job
+                shortcode = str(target.get("shortcode") or (normalize_reel_url(str(target.get("url") or "")) or {}).get("shortcode", ""))
+                if shortcode:
+                    enqueue_caption_refresh_job(
+                        destination,
+                        url=str(target.get("url") or ""),
+                        shortcode=shortcode,
+                        username=expected_username,
+                    )
             applied_paths.append(completed)
         if applied_paths:
             rows = enrich_reel_collection_rows(apply_korean_overrides(rows, destination))
@@ -586,7 +638,7 @@ def python_metrics_for_android_job(data_dir: Path | str, job: dict[str, Any]) ->
     history_path = Path(data_dir).resolve() / REEL_HISTORY_DIRECTORY / REEL_HISTORY_FILENAME
     if not url or not history_path.exists() or not history_path.stat().st_size:
         return {}
-    _fields, rows = read_csv_objects(history_path)
+    _fields, rows = read_csv_objects(history_path, synchronize_history=True)
     for row in reversed(rows):
         if str(row.get("url", "")) == url and str(row.get("collected_at", "")) == collected_at:
             return {
@@ -594,6 +646,37 @@ def python_metrics_for_android_job(data_dir: Path | str, job: dict[str, Any]) ->
                 for field in (*PYTHON_ANDROID_COMPARISON_COUNT_FIELDS, "ad")
             }
     return {}
+
+
+def _android_job_identity(destination: Path, target: dict[str, Any]) -> dict[str, str]:
+    if title := str(target.get("title") or "").strip():
+        return {"expected_caption": title, "expected_hashtags": str(target.get("hashtags") or "")}
+    if "hashtags" in target:
+        return {"expected_hashtags": str(target["hashtags"] or "")}
+    history = destination / REEL_HISTORY_DIRECTORY / REEL_HISTORY_FILENAME
+    journal = Path(f"{history}.pending.jsonl")
+    try:
+        pending_lines = journal.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        pending_lines = []
+    reference = None
+    for line in reversed(pending_lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("url") == target.get("url") and row.get("collected_at") == target.get("collected_at"):
+            reference = row
+            break
+    if reference is None and history.exists():
+        reference = next((row for row in reversed(read_csv_objects(history, synchronize_history=True)[1])
+                          if row.get("url") == target.get("url") and row.get("collected_at") == target.get("collected_at")), None)
+    if reference is None:
+        return {}
+    identity = {"expected_hashtags": str(reference.get("hashtags") or "")}
+    if title := str(reference.get("title") or "").strip():
+        identity["expected_caption"] = title
+    return identity
 
 
 def run_android_metric_worker(
@@ -782,8 +865,6 @@ def run_android_metric_worker(
                 continue
             if tag_job_kind == "profile_view_count":
                 target = job.get("target") or {}
-                def metrics_waiting() -> bool:
-                    return any((_read_android_metric_job(p) or {}).get("kind") != "profile_view_count" for p in paths["pending"].glob("*.json"))
                 # Web may already have completed this exact snapshot.
                 if _android_view_target_is_collected(destination, target):
                     working_path.unlink(missing_ok=True)
@@ -796,15 +877,13 @@ def run_android_metric_worker(
                     if now - last_view_check >= 0.5:
                         last_view_check = now
                         view_collected = _android_view_target_is_collected(destination, target)
-                    return view_collected or metrics_waiting()
+                    return view_collected
                 result = enricher.collect_profile_view_count(
-                    str(target.get("url") or ""), str(target.get("username") or ""), should_yield=should_yield_view,
+                    str(target.get("url") or ""), str(target.get("username") or ""),
+                    should_yield=should_yield_view, **_android_job_identity(destination, target),
                 )
                 if _android_view_target_is_collected(destination, target):
                     working_path.unlink(missing_ok=True)
-                    continue
-                if not result.metrics and (metrics_waiting() or "yielded" in result.error.casefold()):
-                    os.replace(working_path, paths["pending"] / working_path.name)
                     continue
                 job["attempts"] = max(0, int(job.get("attempts", 0) or 0)) + 1
                 if (
@@ -932,6 +1011,7 @@ def run_android_metric_worker(
                 infrastructure_attempts = 0
             normal_attempts = max(0, attempts - infrastructure_attempts)
             python_metrics = python_metrics_for_android_job(destination, job)
+            expected_identity = _android_job_identity(destination, target)
             diagnostics.begin_media(
                 current_url=str(target.get("url", "")),
                 collection_number=job.get("collection_number"),
@@ -986,8 +1066,11 @@ def run_android_metric_worker(
                 try:
                     ui_read_attempted = True
                     result = enricher.enrich(
-                        str(target.get("url", "")), recollection=bool(job.get("recollection")),
+                        str(target.get("url", "")),
+                        recollection=bool(job.get("recollection") or job.get("missing_count_fields")),
                         expected_username=str(target.get("username") or ""),
+                        expected_like_count=python_metrics.get("like_count"),
+                        **expected_identity,
                     )
                 except Exception as error:
                     result = AndroidMetricResult(status="unavailable", error=str(error)[:500])
@@ -1010,6 +1093,8 @@ def run_android_metric_worker(
                 if result.status == "skipped":
                     break
                 if result.status == "collected":
+                    if job.get("missing_count_fields"):
+                        break
                     mismatches = compare_python_and_android_counts(
                         python_metrics,
                         {field: value for field, value in result.metrics.items() if field not in ANDROID_COLLECTION_FIELDS},
@@ -1209,6 +1294,10 @@ def run_android_metric_worker(
             unavailable += int(result.status != "collected")
             if result.status == "collected":
                 consecutive_failures = 0
+                _write_android_metric_worker_status(
+                    paths, state="running", device_error="",
+                    ui_timeout_streak=0, distinct_ui_failures=0,
+                )
             else:
                 consecutive_failures += 1
             if processed % ANDROID_METRIC_QUEUE_EXPORT_BATCH_SIZE == 0:

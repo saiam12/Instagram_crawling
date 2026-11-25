@@ -9,7 +9,7 @@ UIAutomator inspection, or taps on visible read-only controls.
 
 from __future__ import annotations
 
-from .reel_records import normalize_search_grid_reel_url
+from .reel_records import caption_without_hashtags, exact_nonnegative_integer, normalize_search_grid_reel_url
 
 import csv
 import ctypes
@@ -18,12 +18,15 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+import unicodedata
 import uuid
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 from xml.etree import ElementTree
@@ -37,6 +40,7 @@ from .collection_diagnostics import CollectorDiagnostics
 INSTAGRAM_PACKAGE = "com.instagram.android"
 ANDROID_COLLECTION_FIELDS = ("like_count", "share_count", "repost_count", "saved_count")
 ANDROID_OWNED_FIELDS = ANDROID_COLLECTION_FIELDS
+WEB_PREFERRED_COUNT_FIELDS = ("like_count", "comment_count")
 _RATE_LIMIT_SIGNAL = re.compile(
     r"429|too\s+many\s+requests|rate[_\s-]?limit|throttled|please\s+wait\s+a\s+few\s+minutes|"
     r"try\s+again\s+later|요청을\s*처리할\s*수\s*없습니다|잠시\s*후\s*다시",
@@ -102,6 +106,10 @@ class AndroidMetricsError(RuntimeError):
     """The app is unavailable or did not render a usable public surface."""
 
 
+class InstagramAnrRecovered(AndroidMetricsError):
+    """Instagram was relaunched after its system dialog was dismissed."""
+
+
 @dataclass(frozen=True)
 class UiNode:
     text: str
@@ -129,7 +137,12 @@ class AndroidMetricResult:
     status: str = "collected"
     error: str = ""
     observed_reel_url: str = ""
+    identity_like_fallback: bool = False
     observed_username: str = ""
+    observed_caption: str = ""
+    observed_hashtags: str | None = None
+    identity_author_only: bool = False
+    caption_modified: bool = False
 
     def display_value(self, field_name: str) -> str:
         if field_name == "audio_name":
@@ -145,6 +158,50 @@ def _reel_author_matches(expected: object, observed: object) -> bool:
     return bool(authors[0]) and (not expected or expected in [author.lstrip('@') for author in authors])
 
 
+def _likes_match(expected, observed):
+    if isinstance(expected, str) and re.fullmatch(r"[0-9]+", expected.strip()):
+        expected = int(expected)
+    left = exact_nonnegative_integer(expected)
+    right = exact_nonnegative_integer(observed)
+    return left is not None and right is not None and abs(left - right) <= 10
+
+
+def reel_caption_key(value: object) -> str:
+    # Instagram adds a trailing ellipsis to its collapsed caption preview.
+    return " ".join(str(value or "").split()).removesuffix(" …").strip()
+
+
+def _caption_preview_prefix(value: object) -> str:
+    preview = re.sub(r"(?:#\s*)?(?:…|\.\.\.)$", "", str(value or "").strip())
+    return caption_without_hashtags(preview)
+
+
+def _hashtag_identity(value: object) -> str:
+    normalized = unicodedata.normalize("NFC", str(value or "")).casefold()
+    return " ".join(sorted(set(re.findall(r"#[\w]+", normalized))))
+
+
+def _hashtag_preview_matches(preview: object, expected_hashtags: object) -> bool:
+    text = unicodedata.normalize("NFC", str(preview or "")).strip().casefold()
+    visible = re.sub(r"(?:…|\.{2,})$", "", text).strip()
+    if not re.fullmatch(r"(?:#[\w]+\s*)+", visible):
+        return False
+    tags = re.findall(r"#[\w]+", visible)
+    expected = set(_hashtag_identity(expected_hashtags).split())
+    # The collapsed preview can cut its last hashtag without exposing an ellipsis.
+    return all(tag in expected for tag in tags[:-1]) and any(
+        tag.startswith(tags[-1]) for tag in expected
+    )
+
+
+def _reel_caption_nodes(xml: str) -> list[ElementTree.Element]:
+    component = ElementTree.fromstring(xml).find(
+        './/*[@resource-id="com.instagram.android:id/clips_caption_component"]'
+    )
+    return [node for node in component.iter()
+            if (node.get("content-desc") or node.get("text") or "").strip()] if component is not None else []
+
+
 def android_result_matches_reel(result: dict[str, object], row: dict[str, object]) -> bool:
     observed_url = str(result.get("observed_reel_url") or "")
     host = urlparse(observed_url).hostname or ""
@@ -152,6 +209,19 @@ def android_result_matches_reel(result: dict[str, object], row: dict[str, object
     target = normalize_search_grid_reel_url(row.get("url"))
     expected = str(row.get("username") or "").strip().lstrip('@').casefold()
     actual = str(result.get("observed_username") or "").strip().lstrip('@').casefold()
+    caption = _caption_preview_prefix(result.get("observed_caption"))
+    if result.get("identity_author_only") is True and not observed_url:
+        return bool(target and expected and _reel_author_matches(expected, actual))
+    if result.get("observed_hashtags") is not None:
+        return bool(target and expected and _reel_author_matches(expected, actual)
+                    and _hashtag_preview_matches(result["observed_hashtags"], row.get("hashtags")))
+    if not observed_url and caption and target and expected and _reel_author_matches(expected, actual):
+        return reel_caption_key(row.get("title")).startswith(caption)
+    if result.get("identity_like_fallback") is True and not observed_url and target and expected and _reel_author_matches(expected, actual):
+        metrics = result.get("metrics") or {}
+        reference = result.get("python_metrics") or {}
+        if isinstance(metrics, dict) and isinstance(reference, dict) and "like_count" not in (result.get("compact_fields") or ()):
+            return _likes_match(reference.get("like_count"), metrics.get("like_count"))
     return bool((host == "instagram.com" or host.endswith(".instagram.com"))
                 and observed and target and observed["shortcode"] == target["shortcode"]
                 and _reel_author_matches(expected, actual))
@@ -485,51 +555,28 @@ class AdbAndroidUiDriver:
                     raise
         raise AssertionError("Unreachable UI dump retry state")
 
-    def copy_current_reel_url(self) -> str:
-        previous = _read_windows_clipboard_text()
-        sentinel = f"view-assist-{uuid.uuid4().hex}"
-        opened = False
+    def read_screen_ocr(self) -> list[dict]:
+        if os.name != "nt":
+            return []
+        script = Path(__file__).resolve().parents[2] / "scripts" / "android" / "read-screen-ocr.ps1"
         try:
-            nodes = parse_ui_xml(self.dump_ui())
-            share = next((n for n in nodes if n.resource_id.endswith(":id/direct_share_button")), None)
-            if share is None:
-                return ""
-            _set_windows_clipboard_text(sentinel)
-            self.tap_bounds(share.bounds)
-            opened = True
-            for _ in range(4):
-                nodes = parse_ui_xml(self.dump_ui())
-                copy = next((n for n in nodes if n.visible_text.casefold() in {"copy link", "링크 복사"}), None)
-                if copy:
-                    self.tap_bounds(copy.bounds)
-                    for _ in range(5):
-                        time.sleep(0.1)
-                        value = _read_windows_clipboard_text() or ""
-                        # Emulator clipboard sync can briefly expose no text
-                        # before the copied URL arrives. Keep polling then.
-                        if value and value != sentinel:
-                            return value if re.match(r"https://(?:www\.)?instagram\.com/(?:reel|reels|p)/[A-Za-z0-9_-]+/", value) else ""
-                    return ""
-                time.sleep(0.2)
-            return ""
-        finally:
-            try:
-                if opened:
-                    nodes = parse_ui_xml(self.dump_ui())
-                    if any(n.visible_text.casefold() in {"copy link", "링크 복사"} for n in nodes):
-                        self.press_back()
-            except (AndroidMetricsError, OSError) as error:
-                warnings.warn(f"Reel link menu cleanup failed: {error}", RuntimeWarning)
-            finally:
-                for attempt in range(3):
-                    try:
-                        _set_windows_clipboard_text(previous or "")
-                        break
-                    except OSError as error:
-                        if attempt == 2:
-                            warnings.warn(f"Reel link clipboard restore failed: {error}", RuntimeWarning)
-                        else:
-                            time.sleep(0.1)
+            png = subprocess.run(
+                [str(self.adb_path), "-s", self.device_id, "exec-out", "screencap", "-p"],
+                capture_output=True, check=True, timeout=4,
+            ).stdout
+            with tempfile.TemporaryDirectory() as directory:
+                image = Path(directory) / "screen.png"
+                image.write_bytes(png)
+                output = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-File", str(script), str(image)],
+                    capture_output=True, check=True, timeout=8, encoding="utf-8-sig",
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                ).stdout
+            return json.loads(output)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            if self.diagnostics is not None:
+                self.diagnostics.ui_event("METRIC_OCR_FAILED", reason=type(error).__name__)
+            return []
 
     def reset_ui_automation(self) -> bool:
         """Remove a device-side UIAutomator left behind by a host timeout."""
@@ -550,6 +597,18 @@ class AdbAndroidUiDriver:
         if self.diagnostics is not None:
             self.diagnostics.emit("UI_AUTOMATOR_RESET", success=success, error=error)
         return success
+
+    def focused_instagram_anr(self) -> str:
+        result = self._run("shell", "dumpsys", "window", timeout_seconds=5)
+        match = re.search(
+            r"^\s*mCurrentFocus=Window\{(\S+) [^\r\n]*?Application Not Responding:\s*"
+            r"com\.instagram\.android\s*\}", result.stdout, re.M | re.I,
+        )
+        return match[1] if match else ""
+
+    def restart_unresponsive_instagram(self) -> None:
+        self._run("shell", "am", "force-stop", INSTAGRAM_PACKAGE, timeout_seconds=5)
+        self.launch_instagram()
 
     def restart_instagram(self, reel_url: str) -> None:
         # Bring Instagram's card to the center of Overview before dismissing it.
@@ -1017,6 +1076,31 @@ def _countless_reel_icons(xml: str) -> set[str]:
     return missing
 
 
+def _read_missing_ocr_counts(
+    nodes: Sequence[UiNode], fields: set[str], read_words: Callable,
+) -> tuple[dict[str, int], set[str]]:
+    regions: dict[str, list[tuple[int, ...]]] = {}
+    for node in nodes:
+        name = _metric_key(node)
+        if name in fields and (bounds := re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.bounds)):
+            regions.setdefault(name, []).append(tuple(map(int, bounds.groups())))
+    unique = {name: boxes[0] for name, boxes in regions.items() if len(boxes) == 1}
+    if not unique:
+        return {}, set()
+    words = read_words()
+    counts = {}
+    uncertain = set()
+    for name, (left, top, right, bottom) in unique.items():
+        labels = [word["text"] for word in words
+                  if left <= word["x"] < word["right"] <= right
+                  and top <= word["y"] < word["bottom"] <= bottom]
+        if len(labels) == 1 and re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)", labels[0]):
+            counts[name] = int(labels[0].replace(",", ""))
+        elif any(re.search(r"\d", label) for label in labels):
+            uncertain.add(name)
+    return counts, uncertain
+
+
 def _first_matching_node(nodes: Sequence[UiNode], predicate: object) -> UiNode | None:
     matcher = predicate
     return next((node for node in nodes if callable(matcher) and matcher(node)), None)
@@ -1036,9 +1120,52 @@ def _is_reel_paused(xml: str) -> bool:
     )
 
 
-def _is_reel_ready_for_metrics(xml: str, *, recollection: bool = False) -> bool:
+_REEL_SERIES_AUTHOR_PATTERNS = (
+    re.compile(r"^Profile picture of (?P<author>[A-Za-z0-9_.]+)", re.I),
+    re.compile(r"^(?P<author>[A-Za-z0-9_.]+)님의 프로필 사진$"),
+    re.compile(r"^From (?P<author>[A-Za-z0-9_.]+)$", re.I),
+    re.compile(r"^Reel by (?P<author>[A-Za-z0-9_.]+)\.", re.I),
+)
+
+
+def _reel_authors(xml: str) -> list[str]:
     nodes = parse_ui_xml(xml)
-    author = any("author_username" in node.resource_id and (node.text or node.content_desc).strip() for node in nodes)
+    authors = [
+        (node.text or node.content_desc).strip()
+        for node in nodes
+        if "author_username" in node.resource_id.casefold() and (node.text or node.content_desc).strip()
+    ]
+    if len(authors) != 1:
+        return authors
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return authors
+    candidate_elements = [
+        *(
+            element
+            for component in root.findall('.//*[@resource-id="com.instagram.android:id/clips_author_info_component"]')
+            for element in component.iter("node")
+        ),
+        *root.findall('.//*[@resource-id="com.instagram.android:id/clips_author_profile_pic"]'),
+        *root.findall('.//*[@resource-id="com.instagram.android:id/clips_media_component"]'),
+        *root.findall('.//*[@resource-id="com.instagram.android:id/clips_video_container"]'),
+    ]
+    fallbacks: list[str] = []
+    for element in candidate_elements:
+        label = (element.attrib.get("content-desc") or element.attrib.get("text") or "").strip()
+        for pattern in _REEL_SERIES_AUTHOR_PATTERNS:
+            if match := pattern.match(label):
+                author = match.group("author")
+                if author.casefold() not in {item.casefold() for item in fallbacks}:
+                    fallbacks.append(author)
+    if len(fallbacks) == 1 and not _reel_author_matches(fallbacks[0], authors[0]):
+        return fallbacks
+    return authors
+
+
+def _is_reel_ready_for_metrics(xml: str, *, recollection: bool = False) -> bool:
+    author = bool(_reel_authors(xml))
     metrics = extract_recollection_metrics(xml)[0] if recollection else extract_visible_metrics(xml)
     fields = set(metrics) | _countless_reel_icons(xml)
     return _is_reel_detail_surface(xml) and author and bool(fields.intersection(ANDROID_COLLECTION_FIELDS))
@@ -1214,11 +1341,13 @@ class AndroidReelMetricsEnricher:
             except AndroidMetricsError as error:
                 if not _is_ui_read_error(error):
                     raise
+                self._recover_instagram_anr()
                 last_read_error = error
                 consecutive_unreadable += 1
                 if deadline is not None or consecutive_unreadable >= max(1, max_consecutive_unreadable or 2):
                     raise
                 continue
+            self._recover_instagram_anr(xml)
             rate_limit_signal = detect_android_rate_limit_signal(xml)
             if rate_limit_signal and self.diagnostics is not None:
                 self.diagnostics.rate_limit_suspected(rate_limit_signal)
@@ -1231,6 +1360,33 @@ class AndroidReelMetricsEnricher:
         if last_read_error is not None:
             raise last_read_error
         return xml
+
+    def _recover_instagram_anr(self, xml: str | None = None) -> None:
+        if xml is not None and not any(re.fullmatch(
+            r"Instagram\s*(?:isn['’]t responding|is not responding|이\s*응답하지 않습니다\.?)",
+            node.visible_text.strip(), re.I,
+        ) for node in parse_ui_xml(xml)):
+            return
+        focused_anr = getattr(self.driver, "focused_instagram_anr", None)
+        restart = getattr(self.driver, "restart_unresponsive_instagram", None)
+        if not callable(focused_anr) or not callable(restart):
+            return
+        try:
+            window = focused_anr()
+            if not window:
+                return
+            deadline = time.monotonic() + 60
+            while (remaining := deadline - time.monotonic()) > 0:
+                time.sleep(min(5, remaining))
+                if focused_anr() != window:
+                    return
+        except AndroidMetricsError:
+            # A failed ADB probe cannot confirm that the same app dialog persists.
+            return
+        restart()
+        if self.diagnostics is not None:
+            self.diagnostics.emit("INSTAGRAM_ANR_RELAUNCHED")
+        raise InstagramAnrRecovered("Instagram was relaunched after an app-not-responding dialog.")
 
     def prepare_reel_retry(self) -> None:
         """Leave the stuck Reel so reopening the same deep link redraws it."""
@@ -1337,7 +1493,66 @@ class AndroidReelMetricsEnricher:
                     self.driver.tap_bounds(target_bounds)
         return xml
 
-    def enrich(self, reel_url: str, *, recollection: bool = False, expected_username: str = "") -> AndroidMetricResult:
+    def _verify_reel_caption(
+        self, reel_xml: str, author: str, expected_username: str, expected_caption: str,
+        *, expected_hashtags: str | None = None,
+    ) -> str | None:
+        hashtag_only = not reel_caption_key(expected_caption) and expected_hashtags is not None
+        if not expected_username.strip():
+            failure = "EXPECTED_USERNAME_MISSING"
+        elif not _reel_author_matches(expected_username, author):
+            failure = "AUTHOR_MISMATCH"
+        else:
+            caption_nodes = _reel_caption_nodes(reel_xml)
+            expected = reel_caption_key(expected_caption)
+
+            raw_previews = [node.get("content-desc") or node.get("text") or "" for node in caption_nodes]
+            previews = {preview.strip() for preview in raw_previews}
+
+            if all(preview.casefold() in {"", "see more", "더 보기", "…", "..."} for preview in previews):
+                return ""
+            if previews and all(_hashtag_preview_matches(preview, expected_hashtags) for preview in previews):
+                preview = max(previews, key=len)
+                if self.diagnostics is not None:
+                    self.diagnostics.emit("REEL_IDENTITY_HASHTAG_PREVIEW_VERIFIED", preview=preview,
+                                          web_hashtags=expected_hashtags)
+                return preview
+            if not hashtag_only:
+                for preview in previews:
+                    prefix = _caption_preview_prefix(preview)
+                    if prefix and expected.startswith(prefix):
+                        if self.diagnostics is not None:
+                            self.diagnostics.emit("REEL_IDENTITY_CAPTION_VERIFIED", compared_characters=len(prefix))
+                        return preview
+            # Author matched! When caption is edited or differing, fall back to author-only match.
+            caption_mismatched = bool(expected_caption or hashtag_only)
+            self._last_caption_modified = caption_mismatched
+            if self.diagnostics is not None:
+                self.diagnostics.emit(
+                    "REEL_IDENTITY_AUTHOR_VERIFIED",
+                    expected_username=expected_username,
+                    android_username=author,
+                    reason="CAPTION_MISMATCH_AUTHOR_ACCEPTED" if caption_mismatched else "AUTHOR_ONLY",
+                )
+            return ""
+        if self.diagnostics is not None:
+            self.diagnostics.android_identity_failure(
+                "REEL_IDENTITY_CAPTION_FAILED",
+                reason=failure,
+                detailed_only=failure not in {"HASHTAG_PREVIEW_NOT_VERIFIED", "CAPTION_PREVIEW_MISMATCH"},
+                expected_username=expected_username,
+                android_username=author,
+                web_caption=expected_caption,
+                web_hashtags=expected_hashtags,
+                android_caption_previews=[
+                    node.get("content-desc") or node.get("text") or ""
+                    for node in _reel_caption_nodes(reel_xml)
+                ],
+                android_ui_xml=reel_xml,
+            )
+        return None
+
+    def enrich(self, reel_url: str, *, recollection: bool = False, expected_username: str = "", expected_like_count: object = None, expected_caption: str = "", expected_hashtags: str | None = None) -> AndroidMetricResult:
         target = normalize_search_grid_reel_url(reel_url)
         if target is None:
             return AndroidMetricResult(status="unavailable", error="Invalid Reel identity")
@@ -1355,8 +1570,7 @@ class AndroidReelMetricsEnricher:
             self._reel_paused_for_collection = False
             reel_xml = ""
             def reel_ready(candidate: str) -> bool:
-                authors = [n.text or n.content_desc for n in parse_ui_xml(candidate)
-                           if "author_username" in n.resource_id.casefold() and (n.text or n.content_desc).strip()]
+                authors = _reel_authors(candidate)
                 return (len(authors) == 1
                         and _reel_author_matches(expected_username, authors[0])
                         and _is_reel_ready_for_metrics(candidate, recollection=recollection))
@@ -1393,6 +1607,8 @@ class AndroidReelMetricsEnricher:
                         target="reel",
                     )
                 except AndroidMetricsError as error:
+                    if isinstance(error, InstagramAnrRecovered) and launch_attempt < 2:
+                        continue
                     if launch_attempt == 2 or not _is_ui_read_error(error):
                         raise
                     if self.diagnostics is not None:
@@ -1414,10 +1630,11 @@ class AndroidReelMetricsEnricher:
                     self.prepare_reel_retry()
             else:
                 if self.diagnostics is not None:
-                    self.diagnostics.emit("REEL_IDENTITY_REJECTED", expected_url=reel_url,
+                    self.diagnostics.android_identity_failure("REEL_IDENTITY_REJECTED", expected_url=reel_url,
+                                          android_ui_xml=reel_xml,
                                           expected_username=expected_username,
-                                          observed_usernames=[n.text or n.content_desc for n in parse_ui_xml(reel_xml)
-                                                              if "author_username" in n.resource_id.casefold()])
+                                          details={"web_caption": expected_caption, "web_hashtags": expected_hashtags},
+                                          observed_usernames=_reel_authors(reel_xml))
                 if self.diagnostics is not None:
                     self.diagnostics.stage_timeout("WAIT_FOR_RENDER", target="reel")
                     self.diagnostics.stage_failed("OPEN_REEL", reason="UI_RENDER_FAILED")
@@ -1427,15 +1644,7 @@ class AndroidReelMetricsEnricher:
                 return AndroidMetricResult(status="unavailable", error=describe_android_surface(reel_xml))
             if self.diagnostics is not None:
                 self.diagnostics.stage_start("READ_USERNAME")
-                author = next(
-                    (
-                        node.text or node.content_desc
-                        for node in parse_ui_xml(reel_xml)
-                        if "clips_author_username" in node.resource_id.casefold()
-                        or "author_username" in node.resource_id.casefold()
-                    ),
-                    "",
-                )
+                author = next(iter(_reel_authors(reel_xml)), "")
                 if author:
                     self.diagnostics.update_media(username=author)
                     self.diagnostics.stage_success("READ_USERNAME")
@@ -1452,21 +1661,33 @@ class AndroidReelMetricsEnricher:
                     if name in seen_fields:
                         return AndroidMetricResult(status="unavailable", error="Ambiguous Reel metric nodes")
                     seen_fields.add(name)
-            copy_url = getattr(self.driver, "copy_current_reel_url", None)
-            observed = normalize_search_grid_reel_url(copy_url()) if callable(copy_url) else None
-            if observed is None or observed["shortcode"] != target["shortcode"]:
-                if self.diagnostics is not None:
-                    self.diagnostics.emit("REEL_IDENTITY_REJECTED", expected_url=reel_url,
-                                          expected_username=expected_username,
-                                          observed_url=observed["url"] if observed else "")
-                return AndroidMetricResult(status="unavailable", error="Reel permalink identity could not be verified")
+            author = next(iter(_reel_authors(reel_xml)), "")
             metrics, compact_fields = extract_recollection_metrics(reel_xml)
             like_count_private = _like_count_is_private(reel_xml)
+            uncertain_ocr_fields = set()
+            read_words = getattr(self.driver, "read_screen_ocr", None)
+            if callable(read_words):
+                read_words = cache(read_words)
+                fields = {*ANDROID_COLLECTION_FIELDS, "comment_count"} - metrics.keys()
+                if like_count_private:
+                    fields.discard("like_count")
+                ocr_counts, uncertain_ocr_fields = _read_missing_ocr_counts(parse_ui_xml(reel_xml), fields, read_words)
+                metrics.update(ocr_counts)
+                if ocr_counts and self.diagnostics is not None:
+                    self.diagnostics.ui_event("METRIC_OCR_USED", fields=sorted(ocr_counts))
+            caption = self._verify_reel_caption(
+                reel_xml, author, expected_username, expected_caption,
+                expected_hashtags=expected_hashtags,
+            )
+            if caption is None:
+                return AndroidMetricResult(status="unavailable", error="Reel author and caption could not be verified")
             # Only a verified Reel may interpret a rendered count-less button
             # as zero. Absent controls and failed UI/identity reads stay missing.
-            for name in _countless_reel_icons(reel_xml):
+            for name in _countless_reel_icons(reel_xml) - uncertain_ocr_fields:
                 if name != "like_count" or not like_count_private:
                     metrics.setdefault(name, 0)
+            for name in {"comment_count", "repost_count", "share_count", "saved_count"} - uncertain_ocr_fields:
+                metrics.setdefault(name, 0)
             if not recollection:
                 metrics = {name:value for name,value in metrics.items()
                            if name in ANDROID_COLLECTION_FIELDS or (name == "comment_count" and value == 0)}
@@ -1485,10 +1706,14 @@ class AndroidReelMetricsEnricher:
                     status="unavailable",
                     error="Instagram rendered the Reel author but exposed no readable count after retries.",
                 )
+            hashtag_preview_verified = _hashtag_preview_matches(caption, expected_hashtags)
             return AndroidMetricResult(
                 metrics=metrics,
-                observed_reel_url=observed["url"],
-                observed_username=next(n.text or n.content_desc for n in parse_ui_xml(reel_xml) if "author_username" in n.resource_id.casefold()),
+                observed_username=author,
+                observed_caption=caption if expected_caption and not hashtag_preview_verified else "",
+                observed_hashtags=caption if caption and (not expected_caption or hashtag_preview_verified) else None,
+                identity_author_only=caption == "",
+                caption_modified=getattr(self, "_last_caption_modified", False),
                 compact_fields=compact_fields,
                 recollection=recollection,
                 like_count_private=like_count_private,
@@ -1525,7 +1750,7 @@ class AndroidReelMetricsEnricher:
             return False
 
     def collect_profile_view_count(
-        self, url: str, username: str, *, should_yield: Callable[[], bool] = lambda: False,
+        self, url: str, username: str, *, expected_caption: str = "", expected_hashtags: str | None = None, should_yield: Callable[[], bool] = lambda: False,
         timeout_seconds: float = 60.0,
     ) -> AndroidMetricResult:
         """Fallback after web failure: read exact views in Likes and plays."""
@@ -1553,24 +1778,14 @@ class AndroidReelMetricsEnricher:
             detail = self._wait_for_surface(_is_reel_detail_surface, attempts=2)
             if not _is_reel_detail_surface(detail):
                 return AndroidMetricResult(status="unavailable", error="Reel detail did not render")
-            nodes = parse_ui_xml(detail)
-            if not any(n.resource_id.endswith(":id/clips_author_username") and _reel_author_matches(username, n.text or n.content_desc) for n in nodes):
+            authors = _reel_authors(detail)
+            if len(authors) != 1 or not _reel_author_matches(username, authors[0]):
                 return AndroidMetricResult(status="unavailable", error="Reel author mismatch")
-            authors = [n for n in nodes if "author_username" in n.resource_id.casefold()]
-            copy_url = getattr(self.driver, "copy_current_reel_url", None)
-            observed = normalize_search_grid_reel_url(copy_url()) if callable(copy_url) and len(authors) == 1 else None
-            if observed is None or observed["shortcode"] != target[1]:
-                return AndroidMetricResult(status="unavailable", error="Reel permalink identity could not be verified")
-            # Closing Copy link animates asynchronously. Wait for the Reel
-            # again before tapping Likes; the closing sheet can consume taps.
-            detail = self._wait_for_surface(_is_reel_detail_surface, attempts=2)
-            nodes = parse_ui_xml(detail)
-            authors = [n for n in nodes if "author_username" in n.resource_id.casefold()]
-            if len(authors) != 1 or not _reel_author_matches(username, authors[0].text or authors[0].content_desc):
-                return AndroidMetricResult(status="unavailable", error="Reel author mismatch after link verification")
-            if not any("clips_pause_button" in n.resource_id and n.content_desc.casefold() == "play" for n in nodes):
-                self.driver.tap_screen_center()
-            # The visible permalink and author were both verified above.
+            caption = self._verify_reel_caption(
+                detail, authors[0], username, expected_caption, expected_hashtags=expected_hashtags,
+            )
+            if caption is None:
+                return AndroidMetricResult(status="unavailable", error="Reel author and caption could not be verified")
             like_count = next((n for n in parse_ui_xml(detail) if n.resource_id.endswith((":id/like_count", ":id/likes_count"))
                                or n.text.strip().casefold() in {"likes", "좋아요"}), None)
             if like_count is None:
@@ -1589,8 +1804,11 @@ class AndroidReelMetricsEnricher:
                     continue
                 for value in (node.text.strip(), re.sub(r"\s+views$", "", node.content_desc.strip(), flags=re.I)):
                     if re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)", value):
+                        hashtag_preview_verified = _hashtag_preview_matches(caption, expected_hashtags)
                         return AndroidMetricResult(metrics={"view_count": int(value.replace(",", ""))},
-                                                   observed_reel_url=observed["url"], observed_username=username)
+                                                   observed_caption=caption if expected_caption and not hashtag_preview_verified else "", observed_username=authors[0],
+                                                   observed_hashtags=caption if caption and (not expected_caption or hashtag_preview_verified) else None,
+                                                   identity_author_only=caption == "")
             return AndroidMetricResult(status="unavailable", error="Exact Likes and plays view_count unavailable")
         except (AndroidMetricsError, OSError) as error:
             return AndroidMetricResult(status="unavailable", error=str(error)[:500])
@@ -1772,7 +1990,7 @@ class AndroidReelMetricsEnricher:
 
 
 def merge_android_metrics(record: dict[str, object], result: AndroidMetricResult) -> dict[str, object]:
-    """Use Android counts where observed; keep web-only fields unchanged."""
+    """Use Android counts where observed, with web priority for likes and comments."""
     merged = dict(record)
     fields = (*ANDROID_COLLECTION_FIELDS, "comment_count") if result.recollection or result.metrics.get("comment_count") == 0 else ANDROID_COLLECTION_FIELDS
     for field_name in fields:
@@ -1780,9 +1998,18 @@ def merge_android_metrics(record: dict[str, object], result: AndroidMetricResult
             merged[field_name] = result.metrics[field_name]
     if result.like_count_private is True:
         merged["like_count"] = "X"
-    return apply_metric_visibility_rules(
+    merged = apply_metric_visibility_rules(
         merged,
         comment_count_disabled=result.comment_count_disabled is True,
+    )
+    merged.update({field: record[field] for field in WEB_PREFERRED_COUNT_FIELDS
+                   if has_web_count(record.get(field))})
+    return merged
+
+
+def has_web_count(value: object) -> bool:
+    return str(value if value is not None else "").strip().casefold() == "x" or (
+        not isinstance(value, bool) and not needs_android_metric_fallback(value)
     )
 
 

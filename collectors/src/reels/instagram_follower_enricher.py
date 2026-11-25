@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .reel_store import replace_file_with_retry
+from .reel_store import open_csv_snapshot, replace_file_with_retry
 from .korean_classification import classify_korean, apply_account_countries, save_account_country
 
 
@@ -83,10 +83,11 @@ def _validate_exact_follower_result(result: dict[str, Any]) -> dict[str, Any]:
     return validated
 
 
-def read_csv_objects(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+def read_csv_objects(path: Path, *, synchronize_history: bool = False) -> tuple[list[str], list[dict[str, str]]]:
     if not path.exists() or path.stat().st_size == 0:
         return [], []
-    with path.open("r", newline="", encoding="utf-8-sig") as file:
+    stream = open_csv_snapshot(path) if synchronize_history else path.open("r", newline="", encoding="utf-8-sig")
+    with stream as file:
         reader = csv.DictReader(file)
         return list(reader.fieldnames or []), [dict(row) for row in reader]
 
@@ -295,11 +296,15 @@ class FollowerEnricher:
         row = self.user_id_index.get(user_id) if user_id else None
         if row is None and username:
             row = self.username_index.get(username.lower())
-        if row is not None and (
-            (user_id and row.get("user_id") and user_id != str(row["user_id"]))
-            or (username and row.get("username") and username.lower() != str(row["username"]).lower())
-        ):
-            raise ValueError("Conflicting Instagram user_id and username; author identity must be recollected.")
+        if row is not None:
+            existing_uid = str(row.get("user_id") or "")
+            existing_uname = str(row.get("username") or "").lower()
+            if user_id and existing_uid and user_id != existing_uid:
+                raise ValueError("Conflicting Instagram user_id and username; author identity must be recollected.")
+            if username and existing_uname and username.lower() != existing_uname:
+                other = self.username_index.get(username.lower())
+                if other is not None and other is not row and str(other.get("user_id") or "") not in ("", user_id):
+                    raise ValueError(f"Conflicting Instagram username @{username} already claimed by user {other.get('user_id')}.")
         if row is None:
             key = f"id:{user_id}" if user_id else f"username:{username.lower()}"
             row = {field: "" for field in self.user_fields}
@@ -615,6 +620,7 @@ class FollowerEnricher:
         retry_views = (
             status in {"success", "web_unavailable"}
             and not result.get("profileReelViewFallbackQueued")
+            and not result.get("profileReelViewRetryExhausted")
             and any(count is None for count in result.get("profileReelViewCounts", []))
             and key not in self.view_tail_retried
         )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .reel_store import open_csv_snapshot
+
 import asyncio
 import csv
 import hashlib
@@ -79,7 +81,7 @@ def _read_rows(data_root: Path) -> list[dict[str, str]]:
     if not path.is_file():
         return []
     try:
-        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+        with open_csv_snapshot(path) as handle:
             return apply_korean_overrides(csv.DictReader(handle), data_root)
     except (OSError, UnicodeError, csv.Error):
         return []

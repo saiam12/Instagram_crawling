@@ -22,6 +22,7 @@
       <div class="nav-group" role="group" aria-labelledby="nav-insights"><p id="nav-insights" class="nav-group-label">데이터 활용</p>
         <a href="/visualize.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M4 4v16h17M8 16v-5m5 5V7m5 9V4"/></svg></span>수집 시각화</a>
         <a href="/analysis.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18M15 9v12M9 15h12"/></svg></span>분석 시각화</a>
+        <a href="/analysis.html?compare=1" class="nav-link"><span aria-hidden="true">▤</span>임시 분석 비교</a>
         <a href="/recommend.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8Z"/></svg></span>영상 기획 추천</a>
       </div>
     </nav>
@@ -55,6 +56,7 @@
       <dl id="round-counts" class="round-counts"><div><dt>수집 회차</dt><dd>확인 중</dd></div></dl>
     </section>
 
+    <div class="runtime-pair">
     <section class="runtime-panel" aria-label="수집기 동작 시간" hidden>
       <div class="runtime-heading"><h2 id="runtime-heading">실행 시간</h2></div>
       <dl class="runtime-values">
@@ -64,6 +66,12 @@
       </dl>
       <details class="runtime-schedule"><summary>수집 일정</summary><p class="schedule-line" id="schedule"></p></details>
     </section>
+    <section class="runtime-panel session-new" aria-labelledby="session-new-heading" hidden>
+      <div class="runtime-heading"><h2 id="session-new-heading">신규 수집</h2></div>
+      <p id="session-new-count">—</p>
+      <small>이번 실행 · 1차</small>
+    </section>
+    </div>
 
 
 
@@ -108,14 +116,15 @@
 
     <div id="data-history-layout" class="resizable-panels data-history-layout">
     <section id="data" class="section panel">
-      <div class="section-heading"><div><h2>실시간 데이터</h2></div><button disabled id="live-toggle" class="button secondary" aria-pressed="false" type="button">데이터 갱신 일시정지</button></div>
-      <div class="table-toolbar"><div class="search-field"><label class="sr-only" for="search">작성자, 내용, URL 검색</label><span aria-hidden="true">⌕</span><input id="search" type="search" autocomplete="off" placeholder="작성자, 내용, URL 검색"><button disabled id="clear-search" type="button" aria-label="검색어 지우기" hidden>×</button></div><label class="sr-only" for="round-filter">수집 회차</label><select id="round-filter"><option value="all">전체 회차</option></select><label class="sr-only" for="data-korean">릴스 구분</label><select id="data-korean" aria-describedby="korean-scope-note"><option value="all">전체 구분</option><option value="true">한국</option><option value="false">외국</option><option value="unknown">미확인 (-)</option></select><label class="sr-only" for="data-filter">Android 값 필터</label><select id="data-filter"><option value="all">전체 기록</option><option value="available">공유·저장 값 있음</option><option value="missing">공유·저장 누락 있음</option></select><label class="sr-only" for="page-size">페이지당 기록 수</label><select id="page-size"><option value="20">20개씩</option><option value="50">50개씩</option><option value="100">100개씩</option></select></div>
+      <div class="section-heading"><div><h2>실시간 데이터</h2></div><div class="data-heading-tools"><div class="collection-dates" role="group" aria-label="수집 시각 범위, 한국 시간"><label for="date-from">수집 시작일</label><input id="date-from" type="date"><label for="date-to">수집 종료일</label><input id="date-to" type="date"></div><button disabled id="live-toggle" class="button secondary" aria-pressed="false" type="button">데이터 갱신 일시정지</button></div></div>
+      <div id="missing-metrics" class="missing-metrics" role="group" aria-label="지표별 누락 필터"><span>지표별 누락</span><button type="button" class="button secondary compact" data-missing="view_count" aria-pressed="false">조회수 <strong>—</strong></button><button type="button" class="button secondary compact" data-missing="like_count" aria-pressed="false">좋아요 <strong>—</strong></button><button type="button" class="button secondary compact" data-missing="comment_count" aria-pressed="false">댓글 <strong>—</strong></button><button type="button" class="button secondary compact" data-missing="share_count" aria-pressed="false">공유 <strong>—</strong></button><button type="button" class="button secondary compact" data-missing="repost_count" aria-pressed="false">리포스트 <strong>—</strong></button><button type="button" class="button secondary compact" data-missing="saved_count" aria-pressed="false">저장 <strong>—</strong></button></div>
+      <div class="table-toolbar"><div class="search-field"><label class="sr-only" for="search">작성자, 내용, URL 검색</label><span aria-hidden="true">⌕</span><input id="search" type="search" autocomplete="off" placeholder="작성자, 내용, URL 검색"><button disabled id="clear-search" type="button" aria-label="검색어 지우기" hidden>×</button></div><label class="sr-only" for="round-filter">수집 회차</label><select id="round-filter"><option value="all">전체 회차</option></select><label class="sr-only" for="data-korean">릴스 구분</label><select id="data-korean" aria-describedby="korean-scope-note"><option value="all">전체 구분</option><option value="true">한국</option><option value="false">외국</option><option value="unknown">미확인 (-)</option></select><label class="sr-only" for="data-filter">수집 값 필터</label><select id="data-filter"><option value="all">전체 기록</option><option value="metrics-missing">누락 지표 있음</option><option value="metrics-available">누락 지표 없음</option></select><label class="sr-only" for="page-size">페이지당 기록 수</label><select id="page-size"><option value="20">20개씩</option><option value="50">50개씩</option><option value="100">100개씩</option></select></div>
       <div id="data-feedback" class="table-feedback" role="status">데이터를 불러오는 중입니다.</div>
-      <div class="table-scroll" tabindex="0" role="region" aria-label="수집 데이터 표, 가로로 스크롤할 수 있습니다"><table><caption class="sr-only">최근 수집 기록. 제목을 선택하면 모든 수집 값을 확인합니다.</caption><thead><tr><th scope="col">릴스 / 작성자</th><th scope="col">수집 시각 ↓</th><th scope="col" class="numeric">조회수</th><th scope="col" class="numeric">좋아요</th><th scope="col" class="numeric">공유</th><th scope="col" class="numeric">저장</th><th scope="col">앱 보강 값</th></tr></thead><tbody id="data-rows"><tr><td colspan="7" class="empty">실시간 데이터를 준비하고 있습니다.</td></tr></tbody></table></div>
-      <footer class="table-footer"><span id="data-range">—</span><nav aria-label="수집 기록 페이지"><button id="previous" class="button secondary compact" disabled type="button">이전</button><span id="page-label" aria-live="polite">1 / 1</span><button id="next" class="button secondary compact" disabled type="button">다음</button></nav></footer>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="수집 데이터 표, 가로로 스크롤할 수 있습니다"><table><caption class="sr-only">최근 수집 기록. 제목을 선택하면 모든 수집 값을 확인합니다.</caption><thead><tr><th scope="col">릴스 / 작성자</th><th scope="col">수집 시각 ↓</th><th scope="col" class="numeric">조회수</th><th scope="col" class="numeric">좋아요</th><th scope="col" class="numeric">댓글</th><th scope="col" class="numeric">공유</th><th scope="col" class="numeric">리포스트</th><th scope="col" class="numeric">저장</th><th scope="col">수집 상태</th></tr></thead><tbody id="data-rows"><tr><td colspan="9" class="empty">실시간 데이터를 준비하고 있습니다.</td></tr></tbody></table></div>
+      <footer class="table-footer"><span id="data-range">—</span><nav aria-label="수집 기록 페이지"><button id="first" class="button secondary compact" disabled type="button" aria-label="첫 페이지">&lt;&lt;</button><button id="previous" class="button secondary compact" disabled type="button" aria-label="이전 페이지">&lt;</button><span id="page-label" aria-live="polite">1 / 1</span><button id="next" class="button secondary compact" disabled type="button" aria-label="다음 페이지">&gt;</button><button id="last" class="button secondary compact" disabled type="button" aria-label="마지막 페이지">&gt;&gt;</button></nav></footer>
     </section>
       <div class="panel-divider" role="separator" tabindex="0" aria-orientation="vertical" aria-label="실시간 데이터와 상태 이력 너비 조절" aria-valuemin="30" aria-valuemax="75" aria-valuenow="65" title="드래그 또는 방향키로 너비 조절 · 두 번 클릭하면 초기화"><span aria-hidden="true">⋮</span></div>
-    <section id="events" class="section panel"><div class="section-heading"><div><h2>상태 이력</h2></div><label class="sr-only" for="event-filter">이력 필터</label><select id="event-filter"><option value="all">최근 이력 전체</option><option value="problems">종료·오류·복구</option></select></div><ol id="event-list" class="event-list"><li class="empty">기록을 불러오는 중입니다.</li></ol></section>
+    <section id="events" class="section panel"><div class="section-heading"><div><h2>상태 이력</h2></div><label class="sr-only" for="event-filter">이력 필터</label><select id="event-filter"><option value="all">최근 이력 전체</option><option value="problems">종료·오류·복구</option></select></div><ol id="event-list" class="event-list"><li class="empty">기록을 불러오는 중입니다.</li></ol><footer class="table-footer"><nav aria-label="상태 이력 페이지"><button id="event-previous" class="button secondary compact" disabled type="button" aria-label="이전 페이지">&lt;</button><span id="event-page-label" aria-live="polite">1 / 1</span><button id="event-next" class="button secondary compact" disabled type="button" aria-label="다음 페이지">&gt;</button></nav></footer></section>
     </div>
 
     <div id="management-layout" class="management-grid resizable-panels">

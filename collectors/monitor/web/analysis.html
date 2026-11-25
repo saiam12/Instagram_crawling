@@ -17,20 +17,33 @@
       <div class="nav-group" role="group" aria-labelledby="nav-insights"><p id="nav-insights" class="nav-group-label">데이터 활용</p>
         <a href="/visualize.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M4 4v16h17M8 16v-5m5 5V7m5 9V4"/></svg></span>수집 시각화</a>
         <a href="/analysis.html" class="nav-link" aria-current="page"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18M15 9v12M9 15h12"/></svg></span>분석 시각화</a>
+        <a href="/analysis.html?compare=1" class="nav-link" id="compare-nav"><span aria-hidden="true">▤</span>임시 분석 비교</a>
         <a href="/recommend.html" class="nav-link"><span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8Z"/></svg></span>영상 기획 추천</a>
       </div>
     </nav>
     <div class="sidebar-bottom"><span class="local-dot" aria-hidden="true"></span>로컬 모니터</div>
   </aside>
   <main id="main">
-    <header class="page-header"><div><h1>분석 데이터 시각화</h1></div><div class="header-tools"><button id="theme-toggle" class="button secondary" type="button" aria-pressed="false">다크모드</button></div></header>
+    <header class="page-header"><div><h1 id="analysis-title">분석 데이터 시각화</h1></div><div class="header-tools"><button id="theme-toggle" class="button secondary" type="button" aria-pressed="false">다크모드</button></div></header>
     <section class="panel analysis-source" aria-label="분석 자료">
-      <div><strong>참고 분석 파일</strong><p>collectors/data/collector/reel_analysis.json</p><p id="source-status" role="status" aria-live="polite">저장된 작업을 확인하고 있습니다.</p><p id="analysis-cache" class="visual-note" role="status"></p></div>
+      <div><strong>참고 분석 파일</strong><p id="analysis-source-path">collectors/data/collector/reel_analysis.json</p><p id="source-status" role="status" aria-live="polite">저장된 작업을 확인하고 있습니다.</p><p id="analysis-cache" class="visual-note" role="status"></p></div>
       <button id="reload-analysis" class="button primary" type="button" disabled>최신 분석 불러오기</button>
     </section>
     <p id="analysis-error" class="file-error" role="alert" hidden></p>
     <section id="analysis-empty" class="panel visual-empty"><h2>분석 파일을 확인하고 있습니다</h2><p>콘텐츠 유형·추천 타겟·Hook·소구점·장면 길이를 집계합니다.</p></section>
+    <section id="cohort-comparison" class="panel cohort-comparison" hidden aria-labelledby="cohort-title">
+      <div class="section-heading"><h2 id="cohort-title">네 그룹 비교</h2><p id="cohort-overlap" class="visual-note"></p></div>
+      <div class="cohort-scroll" tabindex="0" role="region" aria-label="그룹별 선정 지표와 분석 진행">
+        <table><caption class="sr-only">그룹별 선정 지표와 분석 진행</caption><thead id="cohort-summary-head"></thead><tbody id="cohort-summary"></tbody></table>
+      </div>
+      <div class="cohort-feature field"><label for="cohort-field">비교할 분석 항목</label><select id="cohort-field"></select></div>
+      <p class="visual-note">분석 결과가 있는 릴스를 분모로 집계합니다. 복수 분류 항목은 비율 합계가 100%를 넘을 수 있습니다.</p>
+      <div class="cohort-scroll" tabindex="0" role="region" aria-label="그룹별 분석 특징 분포">
+        <table><caption class="sr-only">그룹별 분석 특징 분포</caption><thead id="cohort-feature-head"></thead><tbody id="cohort-distribution"></tbody></table>
+      </div>
+    </section>
     <div id="analysis-results" hidden>
+      <h2 id="cohort-detail-title" class="cohort-detail-title" hidden></h2>
       <section class="panel analysis-filters" aria-label="분석 필터">
         <div class="field"><label for="analysis-search">분석 내용 검색</label><input id="analysis-search" type="search" maxlength="200" placeholder="릴스 ID · 요약 · 소구점"></div>
         <div class="field"><label for="analysis-type">콘텐츠 유형</label><select id="analysis-type"><option value="all">전체 유형</option></select></div>
@@ -51,7 +64,8 @@
         <section class="panel analysis-chart"><h2>콘텐츠 유형</h2><p>분석에 기록된 분류 · 상위 10개</p><div id="chart-content"></div></section>
         <section class="panel analysis-chart"><h2>추천 타겟 연령</h2><p>복수 선택 · 20~30대 분류는 하나로 유지</p><div id="chart-ages"></div></section>
         <section class="panel analysis-chart"><h2>추천 타겟 성별</h2><p>분석자가 추천한 타겟 · 실제 시청자 아님</p><div id="chart-genders"></div></section>
-        <section class="panel analysis-chart"><h2>Hook 강도</h2><p>분석의 strong / medium / weak 분류</p><div id="chart-hook"></div></section>
+        <section class="panel analysis-chart"><h2>훅 강도</h2><p>강함 · 보통 · 약함</p><div id="chart-hook"></div></section>
+        <section class="panel analysis-chart"><h2>훅 유형</h2><p>첫 3초의 주된 방식 · 유형이 없는 기록은 미상</p><div id="chart-hook-type"></div></section>
         <section class="panel analysis-chart"><h2>핵심 소구 유형</h2><p>복수 선택 · 릴스당 중복 제거 · 상위 10개</p><div id="chart-appeals"></div></section>
       </div>
       <section class="analysis-metrics" aria-labelledby="analysis-metrics-title">

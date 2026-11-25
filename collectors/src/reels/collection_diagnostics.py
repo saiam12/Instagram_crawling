@@ -131,6 +131,7 @@ class CollectorDiagnostics:
         self._first_limit: dict[str, object] | None = None
         self._suspected_keys: set[tuple[int, str, str]] = set()
         self._finished = False
+        self._android_identity_details_remaining = 10
         self._lock = threading.RLock()
         logs_dir = self.data_dir / "logs"
         self.diagnostics_dir = self.data_dir / "diagnostics"
@@ -218,6 +219,7 @@ class CollectorDiagnostics:
                 excluded = {
                     "timestamp", "event", "component", "run_mode", "elapsed_seconds",
                     "attempted_media", "success_count", "failed_count", "current_stage",
+                    "android_ui_xml",
                 }
                 details = " ".join(
                     f"{key}={value}" for key, value in payload.items()
@@ -237,6 +239,19 @@ class CollectorDiagnostics:
             except OSError:
                 pass
             return payload
+
+    def android_identity_failure(
+        self, event: str, *, android_ui_xml: str, detailed_only: bool = False,
+        details: dict[str, object] | None = None, **values: object,
+    ) -> None:
+        with self._lock:
+            if self._android_identity_details_remaining:
+                self._android_identity_details_remaining -= 1
+                values.update(details or {})
+                values["android_ui_xml"] = android_ui_xml
+            elif detailed_only:
+                return
+            self.emit(event, **values)
 
     def begin_media(
         self, *, current_url: str = "", shortcode: str = "", username: str = "",

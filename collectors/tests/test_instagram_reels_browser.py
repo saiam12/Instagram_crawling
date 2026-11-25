@@ -101,6 +101,48 @@ def read_xlsx_header(path: Path) -> list[str]:
 
 
 class CollectorUtilityTests(unittest.TestCase):
+    def test_like_attribution_is_not_saved_as_a_caption(self):
+        for notice in (
+            "__eunjoo_님 여러 명이 좋아합니다",
+            "hyo.k._.k님 여러 명이 좋아합니다",
+            "creator님 외 12명이 좋아합니다",
+            "Liked by creator and others",
+            "좋아요 1,234개",
+            "1,234 likes",
+        ):
+            with self.subTest(notice=notice):
+                record = {"url": "https://www.instagram.com/reels/SAMPLE/",
+                          "username": "creator", "title": notice}
+                row = build_collected_record(record)
+                self.assertEqual(row["title"], "")
+                row = build_collected_record(record, {"caption": "실제 릴스 캡션 #코디"})
+                self.assertEqual(row["title"], "실제 릴스 캡션")
+                self.assertIn("#코디", row["hashtags"])
+        row = build_collected_record(
+            {"url": "https://www.instagram.com/reels/SAMPLE/", "title": "이 코디 좋아합니다"},
+        )
+        self.assertEqual(row["title"], "이 코디 좋아합니다")
+
+    def test_web_repost_and_share_counts_preserve_exact_zero(self):
+        metadata = reels_browser.metadata_from_media({
+            "code": "SAMPLE", "media_type": 2, "media_repost_count": 3, "media_share_count": 0, "reshare_count": 47,
+        })
+        metadata = reels_browser.merge_reel_metadata(metadata, {"shareCount": None})
+        row = reels_browser.build_collected_record({"url": "https://www.instagram.com/reels/SAMPLE/"}, metadata)
+        self.assertEqual(row["repost_count"], 3)
+        self.assertEqual(row["share_count"], 0)
+
+    def test_web_count_fields_are_collected_from_matching_reel_json(self):
+        metadata = {}
+        reels_browser.collect_reel_metadata({"items": [
+            {"code": "SAMPLE", "media_type": 2, "comment_count": 15, "media_repost_count": 8, "reshare_count": 47},
+            {"code": "OTHER", "media_type": 2, "comment_count": 99, "media_repost_count": 99, "reshare_count": 99},
+        ]}, metadata)
+        row = reels_browser.build_collected_record(
+            {"url": "https://www.instagram.com/reels/SAMPLE/"}, metadata["SAMPLE"],
+        )
+        self.assertEqual((row["comment_count"], row["repost_count"], row["share_count"]), (15, 8, 47))
+
     def test_failed_android_worker_restarts_after_persisted_cooldown_only(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = reels_browser._android_metric_queue_paths(directory)
@@ -1803,6 +1845,41 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows[0]["like_count"], "123")
             self.assertEqual(rows[0]["share_count"], "321")
 
+    async def test_web_mode_saves_verified_reel_with_missing_counts_without_android(self):
+        with tempfile.TemporaryDirectory() as directory:
+            options = parse_args(["--collector-mode", "web", "--background", "--data-dir", directory, "--max-items", "1"])
+            options.no_login = True
+            url = "https://www.instagram.com/reels/CODE/"
+            page = SimpleNamespace(url="https://www.instagram.com/reels/", wait_for_timeout=AsyncMock(),
+                                   keyboard=SimpleNamespace(press=AsyncMock()))
+            with (
+                patch.object(reels_browser, "locate_browser_executable", return_value=Path("fake-browser")),
+                patch.object(reels_browser, "rate_limit_state_for_context", return_value=reels_browser.InstagramRateLimitState()),
+                patch.object(reels_browser, "create_collection_page", new=AsyncMock(return_value=page)),
+                patch.object(reels_browser, "expand_visible_caption", new=AsyncMock()),
+                patch.object(reels_browser, "extract_visible_reel", new=AsyncMock(return_value={
+                    "url": url, "shortcode": "CODE", "username": "creator", "title": "caption",
+                })),
+                patch.object(reels_browser, "resolve_page_first_reel_metadata", new=AsyncMock(return_value=({
+                    "userId": "123", "username": "creator", "likeCount": 7, "shareCount": 0, "repostCount": 2,
+                }, False))) as resolve,
+                patch.object(reels_browser, "enqueue_android_metric_job") as enqueue,
+                patch.object(reels_browser, "start_android_metric_worker") as start_worker,
+                patch.object(reels_browser, "safe_close", new=AsyncMock()),
+            ):
+                code = await reels_browser._run_collector_once(
+                    options, register_signal_handler=False, shared_context=object(),
+                    shared_playwright_runtime=SimpleNamespace(chromium=object()), enable_stop_input=False,
+                )
+            self.assertEqual(code, 0)
+            self.assertFalse(resolve.await_args.kwargs["require_complete_metrics"])
+            enqueue.assert_not_called()
+            start_worker.assert_not_called()
+            _, rows = read_csv_objects(Path(directory) / ".collector" / "reels_history_active.csv")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual([rows[0][field] for field in ("like_count", "share_count", "repost_count", "comment_count", "saved_count")],
+                             ["7", "0", "2", "", ""])
+
     async def test_no_login_collector_finalizes_without_follower_enricher(self):
         with tempfile.TemporaryDirectory() as directory:
             options = parse_args(["--collector-mode", "web", "--background", "--data-dir", directory, "--max-items", "1"])
@@ -2634,8 +2711,11 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
             _shortcode: str,
             _metadata: dict[str, dict[str, object]],
             timeout_milliseconds: int,
+            *,
+            required_counts: tuple[str, ...],
         ) -> dict[str, object]:
             observed_timeouts.append(timeout_milliseconds)
+            self.assertEqual(required_counts, ("shareCount", "repostCount"))
             return {"userId": "123", "username": "joe120531"}
 
         async def profile_fallback(*_arguments: object) -> dict[str, object]:
@@ -2656,11 +2736,28 @@ class CollectorAsyncTests(unittest.IsolatedAsyncioTestCase):
                 timeout=0.5,
             )
 
-        self.assertEqual(observed_timeouts, [750])
+        self.assertEqual(observed_timeouts, [3_000])
         self.assertTrue(used_passive_response)
         self.assertEqual(metadata["userId"], "123")
         self.assertIsNone(metadata["likeCount"])
         self.assertIsNone(metadata["commentCount"])
+
+    async def test_hybrid_waits_for_late_share_and_repost_for_the_target(self) -> None:
+        metadata = {"target": {"userId": "123"}, "other": {"shareCount": 99, "repostCount": 99}}
+        updates = iter(({"shareCount": 0}, {"repostCount": 14}))
+
+        async def on_poll(_delay: float) -> None:
+            metadata["target"].update(next(updates))
+
+        with (
+            patch.object(reels_browser, "collect_embedded_reel_metadata", AsyncMock()),
+            patch.object(reels_browser.asyncio, "sleep", side_effect=on_poll) as sleep,
+        ):
+            result, _ = await reels_browser.resolve_page_first_reel_metadata(
+                object(), {"shortcode": "target"}, metadata, require_complete_metrics=False,
+            )
+        self.assertEqual(sleep.await_count, 2)
+        self.assertEqual((result["shareCount"], result["repostCount"]), (0, 14))
 
     async def test_incomplete_passive_metadata_opens_the_reel_through_its_creator_profile_for_another_minute(self) -> None:
         class Locator:

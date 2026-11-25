@@ -1,6 +1,13 @@
 """Gemini Reel 분석에 사용하는 프롬프트."""
 
 
+from typing import Literal, get_args
+
+
+HookType = Literal["텍스트 훅", "동작 훅", "비포·애프터", "상품 선노출", "상황·공감", "호기심·반전", "기타"]
+HOOK_TYPES = get_args(HookType)
+
+
 ANALYSIS_PROMPT = """
 이 Instagram Reel 영상을 분석하세요.
 
@@ -54,6 +61,10 @@ ANALYSIS_PROMPT = """
    겹침과 가림 상태를 기록하세요. 실측 크기를 추정하지 마세요.
 3. 플랫레이 장면은 상의/하의/신발/소품의 상대적 배치와 간격, 배경색, 그림자 방향까지 설명하세요.
    정지된 상품 배치를 사람이 착용하거나 손으로 움직이는 장면으로 해석하지 마세요.
+4. product.first_exposure에 영상 속 상품이 처음 식별 가능한 시각(start_second)과 해당 화면 근거(visual_evidence)를 기록하세요.
+   실제 착용·시연·손에 든 상태·상품 단독 화면을 포함합니다. 음성이나 자막으로만 언급된 시점, 식별할 수 없는 배경 물체, 별도로 제공된 커버 이미지는 제외하세요.
+   첫 프레임에서 식별되면 0을 기록하세요. 장면 중간에 등장하면 장면 시작이 아닌 상품이 처음 식별되는 시각을 기록하세요.
+   상품이 없거나 시각을 확인할 수 없으면 first_exposure는 null입니다. 근거에는 식별 가능한 상품과 화면에서 보이는 특징을 적으세요.
 
 [장면별 피사체 방향과 카메라 시점]
 1. 각 장면의 subject_orientations에 인물/캐릭터별 subject_id와 방향을 기록하세요.
@@ -196,14 +207,16 @@ ANALYSIS_PROMPT = """
 Optional 필드에 해당 사항이 없으면 null, 목록에 항목이 없으면 [], boolean은 false를 사용하세요.
 - summary: 영상 전체의 대상, 행동, 배경, 전개를 한 문단으로 요약한 문자열
 - korean: 원본 캡션/해시태그 또는 확인된 계정 국가 메타데이터에 따라 제공된 true/false/null
-- hook: description(0~3초의 시각·텍스트·행동 훅), strength(strong | medium | weak)
+- hook: description(0~3초의 시각·텍스트·행동 훅), strength(strong | medium | weak),
+  hook_type(텍스트 훅 | 동작 훅 | 비포·애프터 | 상품 선노출 | 상황·공감 | 호기심·반전 | 기타 중 주된 방식 하나, 관찰 근거가 없으면 null)
 - body_structure: 3초 이후 장면의 시간순 전개와 훅 대비 변화(인물 유무, 구도, 배경)를 설명한 문자열
 - camera: main_composition(대표 구도), angles(관찰된 앵글 문자열 목록), movements(관찰된 카메라 이동 문자열 목록)
 - editing: style(대표 편집 방식), cut_speed(fast | medium | slow), transitions(실제로 관찰된 전환 기법 목록)
 - subtitle: exists(텍스트 오버레이 존재 여부), position(대표 화면 위치 또는 null), style(글자 형태·색·배경·효과 또는 null)
 - subjects: people_count(영상 전체에서 구별되는 실제 인물 수), main_subject(인물/캐릭터별 이름표, 외형, 의상),
   people(각 실제 인물의 subject_id, gender_presentation)
-- product: exists(상품 노출 여부), description(상품별 이름표, 종류, 외형, 재질, 패턴, 부속품 또는 null)
+- product: exists(상품 노출 여부), description(상품별 이름표, 종류, 외형, 재질, 패턴, 부속품 또는 null),
+  first_exposure(start_second, visual_evidence 또는 null)
 - scene_details: 0초부터 종료까지 빈틈없이 이어지는 장면 목록. 각 항목은 scene_number, start_second, end_second,
   section(hook | body), visual_description, worn_outfits(각 착용자의 subject_id, gender_presentation, clothing_items),
   subject_orientations(각 인물의 subject_id, facing, body_direction, head_direction,

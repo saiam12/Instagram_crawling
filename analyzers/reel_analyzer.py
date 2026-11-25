@@ -37,7 +37,7 @@ from google.genai import types
 from pool import GeminiKeyPool, KeyPoolExhaustedError, create_pool
 from pool.local import SUPPORTED_FLASH_MODELS
 from input_sources import normalize_reel_url, read_reel_urls_from_xlsx
-from prompts import ANALYSIS_PROMPT
+from prompts import ANALYSIS_PROMPT, HookType
 from scene_directions import BodyDirection, CameraViewpoint, GazeDirection, ConfidenceLevel, AimTarget, coarse_facing
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -191,6 +191,7 @@ def get_instagram_video(reel_url: str) -> dict:
 class Hook(BaseModel):
     description: str = Field(description="첫 3초에 사용된 Hook에 대한 설명")
     strength: str = Field(description="strong | medium | weak")
+    hook_type: Optional[HookType] = Field(default=None, description="첫 3초에서 관찰한 주된 훅 유형. 확인 불가 시 null")
 
 
 class Camera(BaseModel):
@@ -230,9 +231,21 @@ class Subjects(BaseModel):
     people: List[SubjectPerson] = Field(description="등장하는 실제 인물을 이름표별로 한 번씩 기록")
 
 
+class ProductExposure(BaseModel):
+    start_second: float = Field(ge=0, allow_inf_nan=False, description="영상에서 상품이 처음 식별되는 시각(초). 첫 프레임에 보이면 0")
+    visual_evidence: str = Field(min_length=1, description="처음 노출된 상품과 해당 시각의 화면 근거")
+
+
 class Product(BaseModel):
     exists: bool
     description: Optional[str] = None
+    first_exposure: Optional[ProductExposure] = Field(default=None, description="첫 화면 노출 시점과 근거. 노출이 없거나 시점 확인 불가 시 null")
+
+    @model_validator(mode="after")
+    def validate_exposure(self):
+        if not self.exists and self.first_exposure is not None:
+            raise ValueError("상품이 없으면 첫 노출은 null이어야 합니다")
+        return self
 
 
 class SceneWornOutfit(BaseModel):

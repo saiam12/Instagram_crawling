@@ -92,6 +92,247 @@ class FakeDriver:
 
 
 class AndroidReelMetricTests(unittest.TestCase):
+    def test_verified_caption_fills_absent_counts_and_likes_panel_supplies_views(self):
+        preview = REEL_XML.replace('text="32"', 'text=""').replace('text="138"', 'text=""')
+        preview = preview.replace('text="11.3K"', 'text=""').replace('text="4"', 'text=""')
+        preview = preview.replace("</hierarchy>", """
+          <node resource-id="com.instagram.android:id/like_count" bounds="[0,100][100,200]" />
+          <node resource-id="com.instagram.android:id/clips_caption_component">
+            <node text="겨울 코디를 소개합니다 #패션" clickable="true" bounds="[0,800][100,900]" />
+          </node>
+        </hierarchy>""")
+        url = "https://www.instagram.com/reels/CODE123/"
+        driver = FakeDriver([preview])
+        enricher = AndroidReelMetricsEnricher(driver=driver)
+        result = enricher.enrich(url, expected_username="creator", expected_caption="겨울 코디를 소개합니다")
+        self.assertEqual({k: result.metrics[k] for k in ("comment_count", "repost_count", "share_count", "saved_count")},
+                         {"comment_count": 0, "repost_count": 0, "share_count": 0, "saved_count": 0})
+        self.assertEqual(driver.tapped_bounds, [])
+        driver.xml = [preview, LIKES_PANEL_XML]
+        views = enricher.collect_profile_view_count(url, "creator", expected_caption="겨울 코디를 소개합니다")
+        self.assertEqual(views.metrics, {"view_count": 624267})
+        self.assertEqual(views.observed_caption, "겨울 코디를 소개합니다")
+        self.assertEqual(driver.tapped_bounds, ["[0,100][100,200]"])
+
+    def test_instagram_anr_restarts_only_after_one_minute_and_reopens_same_reel(self):
+        dialog = """<hierarchy>
+          <node text="Instagram isn't responding" resource-id="android:id/alertTitle" />
+          <node text="Close app" resource-id="android:id/aerr_close" bounds="[0,0][100,100]" />
+          <node text="Wait" resource-id="android:id/aerr_wait" bounds="[0,100][100,200]" />
+        </hierarchy>"""
+        verified = REEL_XML.replace("</hierarchy>", """
+          <node resource-id="com.instagram.android:id/clips_caption_component">
+            <node text="겨울 코디를 소개합니다 #패션" />
+          </node>
+        </hierarchy>""")
+        url = "https://www.instagram.com/reels/CODE123/"
+        for persists in (True, False):
+            with self.subTest(persists=persists):
+                driver = FakeDriver([dialog, verified])
+                now = [0.0]
+                restarts = []
+                driver.focused_instagram_anr = lambda: "window" if persists or now[0] < 11 else ""
+                driver.restart_unresponsive_instagram = lambda: restarts.append(now[0])
+                with patch("src.reels.android_reel_metrics.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("src.reels.android_reel_metrics.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)):
+                    result = AndroidReelMetricsEnricher(driver=driver).enrich(
+                        url, expected_username="creator", expected_caption="겨울 코디를 소개합니다",
+                    )
+                self.assertEqual(restarts, [61.0] if persists else [])
+                self.assertEqual(driver.opened_urls, [url, url] if persists else [url])
+                self.assertEqual(result.metrics["saved_count"], 4)
+
+    def test_matching_author_and_caption_verify_without_copying_link(self):
+        caption = "겨울 바지 고민 끝… 요거 하나면 " + "가" * 320
+        title = caption[:300] + "..."
+        xml = REEL_XML.replace('text="138"', 'text=""').replace("</hierarchy>", f"""
+          <node resource-id="com.instagram.android:id/clips_caption_component">
+            <node content-desc="겨울 바지 고민 끝… …" clickable="true" bounds="[0,800][100,900]" />
+          </node>
+        </hierarchy>""")
+        url = "https://www.instagram.com/reels/CODE123/"
+        driver = FakeDriver([xml])
+        def read_words():
+            self.assertEqual(driver.xml, [xml])
+            return [
+                {"text": "138", "x": 10, "right": 40, "y": 510, "bottom": 530},
+            ]
+        driver.read_screen_ocr = read_words
+        from src.reels.collection_diagnostics import CollectorDiagnostics
+
+        with tempfile.TemporaryDirectory() as data_dir, patch.object(
+            driver, "copy_current_reel_url", return_value="",
+        ) as copy_url:
+            diagnostics = CollectorDiagnostics(data_dir, run_mode="background", component="android")
+            enricher = AndroidReelMetricsEnricher(driver=driver, diagnostics=diagnostics)
+            result = enricher.enrich(
+                url, expected_username="creator", expected_caption=title,
+            )
+            driver.xml = [xml]
+            mismatch = enricher.enrich(
+                url, expected_username="creator", expected_caption="다른 영상",
+            )
+            author_events = [
+                event for line in diagnostics.events_path.read_text(encoding="utf-8").splitlines()
+                if (event := json.loads(line))["event"] == "REEL_IDENTITY_AUTHOR_VERIFIED"
+            ]
+        self.assertEqual(len(author_events), 1)
+        self.assertEqual(author_events[0]["current_url"], url)
+        self.assertEqual(author_events[0]["reason"], "CAPTION_MISMATCH_AUTHOR_ACCEPTED")
+        self.assertEqual(author_events[0]["expected_username"], "creator")
+        copy_url.assert_not_called()
+        self.assertEqual(driver.tapped_bounds, [])
+        self.assertEqual(mismatch.status, "collected")
+        self.assertTrue(mismatch.identity_author_only)
+        self.assertEqual(mismatch.metrics["saved_count"], 4)
+        self.assertTrue(android_result_matches_reel(vars(mismatch), {"url": url, "username": "creator", "title": "다른 영상"}))
+        self.assertEqual(result.metrics["repost_count"], 138)
+        self.assertEqual(result.metrics["saved_count"], 4)
+        row = {"url": url, "username": "creator", "title": title}
+        self.assertTrue(android_result_matches_reel(vars(result), row))
+        self.assertFalse(android_result_matches_reel(vars(result), {**row, "username": "other"}))
+        self.assertEqual(result.observed_caption, "겨울 바지 고민 끝… …")
+        self.assertTrue(android_result_matches_reel(vars(result), {**row, "title": caption + " 새 영상"}))
+        self.assertFalse(android_result_matches_reel(vars(result), {**row, "title": "다른 영상 " + caption}))
+
+    def test_see_more_only_uses_matching_author_when_web_title_exists(self):
+        url = "https://www.instagram.com/reels/CODE123/"
+        xml = REEL_XML.replace("</hierarchy>", """
+          <node resource-id="com.instagram.android:id/clips_caption_component">
+            <node text="See more" />
+          </node>
+        </hierarchy>""")
+        driver = FakeDriver([xml])
+        row = {"url": url, "username": "creator", "title": "Saved web title"}
+        result = AndroidReelMetricsEnricher(driver=driver).enrich(
+            url, expected_username=row["username"], expected_caption=row["title"],
+        )
+        self.assertEqual(result.metrics["saved_count"], 4)
+        self.assertTrue(android_result_matches_reel(vars(result), row))
+        self.assertFalse(android_result_matches_reel(vars(result), {**row, "username": "other"}))
+        self.assertEqual(driver.tapped_bounds, [])
+
+    def test_missing_title_uses_hashtags_or_empty_caption_with_matching_author(self):
+        url = "https://www.instagram.com/reels/CODE123/"
+        tagged = REEL_XML.replace("</hierarchy>", """
+          <node resource-id="com.instagram.android:id/clips_caption_component">
+            <node text="#Winter #코디" />
+          </node>
+        </hierarchy>""")
+        for xml, hashtags in ((tagged, "#코디 #winter"), (REEL_XML, "")):
+            with self.subTest(hashtags=hashtags):
+                result = AndroidReelMetricsEnricher(driver=FakeDriver([xml])).enrich(
+                    url, expected_username="creator", expected_hashtags=hashtags,
+                )
+                self.assertEqual(result.metrics["saved_count"], 4)
+                row = {"url": url, "username": "creator", "title": "", "hashtags": hashtags}
+                self.assertTrue(android_result_matches_reel(vars(result), row))
+                self.assertFalse(android_result_matches_reel(vars(result), {**row, "username": "other"}))
+                self.assertEqual(android_result_matches_reel(vars(result), {**row, "hashtags": "#different"}), not hashtags)
+        for hashtags in ("#different", ""):
+            result = AndroidReelMetricsEnricher(driver=FakeDriver([tagged])).enrich(
+                url, expected_username="creator", expected_hashtags=hashtags,
+            )
+            self.assertEqual(result.metrics["saved_count"], 4)
+            self.assertTrue(result.identity_author_only)
+
+        driver = FakeDriver([tagged.replace("#코디", "#코디…")])
+        result = AndroidReelMetricsEnricher(driver=driver).enrich(
+            url, expected_username="other", expected_hashtags="#different",
+        )
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(driver.tapped_bounds, [])
+
+    def test_hashtag_only_preview_verifies_with_web_title_and_partial_last_tag(self):
+        from src.reels.android_metric_worker import _android_job_identity
+
+        row = {"url": "https://www.instagram.com/reels/CODE123/", "username": "creator",
+               "title": "다른 제목", "hashtags": "#겨울 #가나다라"}
+        identity = _android_job_identity(Path("."), row)
+        self.assertEqual(identity, {"expected_caption": row["title"], "expected_hashtags": row["hashtags"]})
+        for preview, verified in (
+            ("#겨울 #가나다…", True),
+            ("#겨울 #가나다...", True),
+            ("#겨울 #가나다..", True),
+            ("#겨울 #가나다라", True),
+            ("#겨울", True),
+            ("#겨울 #가나다", True),
+            ("#다른태그 #가나다…", False),
+            ("#겨울 #라마바…", False),
+            ("다른 본문 #겨울", False),
+        ):
+            with self.subTest(preview=preview):
+                xml = REEL_XML.replace("</hierarchy>", f"""
+                  <node resource-id="com.instagram.android:id/clips_caption_component">
+                    <node text="{preview}" clickable="true" bounds="[0,800][100,900]" />
+                  </node>
+                </hierarchy>""")
+                driver = FakeDriver([xml])
+                result = AndroidReelMetricsEnricher(driver=driver).enrich(
+                    row["url"], expected_username=row["username"], **identity,
+                )
+                self.assertEqual(result.status == "collected", verified)
+                self.assertEqual(android_result_matches_reel(vars(result), row), verified)
+                self.assertFalse(android_result_matches_reel(vars(result), {**row, "username": "other"}))
+                self.assertEqual(driver.tapped_bounds, [])
+
+    def test_caption_preview_with_hashtag_is_verified_or_skipped_without_taps(self):
+        preview = REEL_XML.replace("</hierarchy>", """
+          <node resource-id="com.instagram.android:id/comment_button" bounds="[0,800][100,900]" />
+          <node resource-id="com.instagram.android:id/clips_caption_component">
+            <node content-desc="오늘 입은 겨울 코디 #데일리룩" clickable="true" bounds="[0,900][100,1000]" />
+          </node>
+        </hierarchy>""")
+        driver = FakeDriver([preview])
+        enricher = AndroidReelMetricsEnricher(driver=driver)
+        result = enricher.enrich(
+            "https://www.instagram.com/reels/CODE123/",
+            expected_username="creator", expected_caption="오늘 입은 겨울 코디",
+        )
+        driver.xml = [preview.replace("#데일리룩", "#데일리룩 …")]
+        truncated = enricher.enrich(
+            "https://www.instagram.com/reels/CODE123/",
+            expected_username="creator", expected_caption="오늘 입은 겨울 코디",
+        )
+        self.assertEqual(driver.tapped_bounds, [])
+        self.assertEqual(truncated.metrics["saved_count"], 4)
+        self.assertEqual(result.metrics["saved_count"], 4)
+        driver.xml = [preview.replace("#데일리룩", "#데일리룩 …"), """<hierarchy>
+          <node text="creator said 오늘 입은 겨울 코디 #데일리룩" />
+          <node resource-id="com.instagram.android:id/layout_comment_thread_edittext_multiline" />
+        </hierarchy>"""]
+        driver.read_screen_ocr = lambda: [
+            {"text": "..", "x": 72, "right": 84, "y": 950, "bottom": 956},
+            {"text": "…", "x": 72, "right": 84, "y": 750, "bottom": 756},
+        ]
+        expanded = enricher.enrich(
+            "https://www.instagram.com/reels/CODE123/",
+            expected_username="creator", expected_hashtags="#데일리룩",
+        )
+        self.assertEqual(driver.tapped_bounds, ["[72,950][84,956]"])
+        self.assertEqual(expanded.metrics["saved_count"], 4)
+
+    def test_ocr_fills_missing_count_only_inside_verified_metric_region(self):
+        xml = REEL_XML.replace('text="11.3K"', 'text=""').replace(
+            'text="138"', 'text=""')
+        driver = FakeDriver([xml])
+        driver.read_screen_ocr = lambda: [
+            {"text": "1,234", "x": 10, "right": 55, "y": 410, "bottom": 430},
+            {"text": "9.2K", "x": 10, "right": 55, "y": 510, "bottom": 530},
+            {"text": "99", "x": 10, "right": 55, "y": 610, "bottom": 630},
+        ]
+        url = "https://www.instagram.com/reels/CODE123/"
+        result = AndroidReelMetricsEnricher(driver=driver).enrich(url, expected_username="creator")
+        self.assertEqual(result.metrics["share_count"], 1234)
+        self.assertNotIn("repost_count", result.metrics)
+        self.assertEqual(result.metrics["saved_count"], 4)
+
+        driver.copy_current_reel_url = lambda: "https://www.instagram.com/reels/OTHER/"
+        with patch.object(driver, "read_screen_ocr", wraps=driver.read_screen_ocr) as ocr:
+            result = AndroidReelMetricsEnricher(driver=driver).enrich(url, expected_username="creator")
+        ocr.assert_not_called()
+        self.assertEqual(result.status, "unavailable")
+
     def test_collaboration_author_is_accepted_only_with_matching_permalink(self):
         xml = REEL_XML.replace('text="creator"', 'text="creator and co.author"')
         for username in ("creator", "co.author"):
@@ -113,11 +354,49 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(result.status, "unavailable")
         self.assertEqual(result.metrics, {})
 
+    def test_series_reel_resolves_author_from_profile_or_media_nodes(self):
+        url = "https://www.instagram.com/reels/Dfds7OPPLBc/"
+        caption = "꾸안꾸 색감맛집 🍂🩵 @laaube_kr 상의 -도버 니트 세트"
+        for subtitle in ('content-desc="From youngseo.h"', 'content-desc="Honey Veil · Table For One"'):
+            with self.subTest(subtitle=subtitle):
+                xml = REEL_XML.replace(
+                    '<node text="creator" resource-id="com.instagram.android:id/clips_author_username" bounds="[0,0][100,100]" />',
+                    f"""
+                    <node content-desc="Reel by youngseo.h. Double tap to play or pause." resource-id="com.instagram.android:id/clips_media_component" />
+                    <node text="Watch this series" content-desc="Watch this series" />
+                    <node resource-id="com.instagram.android:id/clips_author_info_component">
+                      <node content-desc="Profile picture of youngseo.h" resource-id="com.instagram.android:id/clips_author_profile_pic" />
+                      <node text="My outfit" content-desc="My outfit" resource-id="com.instagram.android:id/clips_author_username" bounds="[0,0][100,100]" />
+                      <node {subtitle} />
+                    </node>
+                    <node resource-id="com.instagram.android:id/clips_caption_component">
+                      <node content-desc="꾸안꾸 색감맛집 🍂🩵 …" />
+                    </node>
+                    """,
+                )
+                enricher = AndroidReelMetricsEnricher(driver=FakeDriver([xml]), ui_delay_seconds=0.01)
+                result = enricher.enrich(url, expected_username="youngseo.h", expected_caption=caption)
+                self.assertEqual(result.status, "collected")
+                self.assertEqual(result.observed_username, "youngseo.h")
+                self.assertEqual(result.metrics["saved_count"], 4)
+                self.assertTrue(android_result_matches_reel(vars(result), {
+                    "url": url, "username": "youngseo.h", "title": caption,
+                }))
+                now = [0.0]
+                with patch("src.reels.android_reel_metrics.time.monotonic", side_effect=lambda: now[0]), \
+                     patch("src.reels.android_reel_metrics.time.sleep", side_effect=lambda delay: now.__setitem__(0, now[0] + delay)):
+                    mismatch = AndroidReelMetricsEnricher(driver=FakeDriver([xml]), ui_delay_seconds=0.5).enrich(
+                        url, expected_username="other.user", expected_caption=caption,
+                    )
+                self.assertEqual(mismatch.status, "unavailable")
+
     def test_caption_save_price_does_not_create_duplicate_metric(self):
         xml = REEL_XML.replace('</hierarchy>',
-            '<node content-desc="(광고) 29,990원 코디 저장 꾹 꾹" /></hierarchy>')
+            '<node resource-id="com.instagram.android:id/clips_caption_component">'
+            '<node content-desc="(광고) 29,990원 코디 저장 꾹 꾹 #패션" /></node></hierarchy>')
         result = AndroidReelMetricsEnricher(driver=FakeDriver([xml])).enrich(
-            "https://www.instagram.com/reels/CODE123/", recollection=True)
+            "https://www.instagram.com/reels/CODE123/", recollection=True,
+            expected_username="creator", expected_caption="(광고) 29,990원 코디 저장 꾹 꾹")
         self.assertEqual(result.status, "collected")
         self.assertEqual(result.metrics["saved_count"], 4)
         xml = xml.replace('  <node text="4" resource-id="com.instagram.android:id/save_count" bounds="[0,600][100,700]" />', '')
@@ -254,7 +533,8 @@ class AndroidReelMetricTests(unittest.TestCase):
             "https://www.instagram.com/reels/test/"
         )
         self.assertTrue(result.like_count_private)
-        self.assertEqual(merge_android_metrics({"like_count": 3}, result)["like_count"], "X")
+        self.assertEqual(merge_android_metrics({"like_count": ""}, result)["like_count"], "X")
+        self.assertEqual(merge_android_metrics({"like_count": 3}, result)["like_count"], 3)
 
     def test_public_three_likes_is_preserved(self) -> None:
         xml = '<hierarchy><node text="3" resource-id="clips_like_count" content-desc="Like number is 3. View likes" /></hierarchy>'
@@ -1464,16 +1744,17 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(merged["share_count"], 10)
         self.assertEqual(merged["audio_name"], "browser audio")
 
-    def test_android_overwrites_its_counts_but_preserves_web_only_counts(self) -> None:
+    def test_web_likes_and_comments_take_priority_in_recollection(self) -> None:
         merged = merge_android_metrics(
             {"view_count": 1_200, "like_count": 100, "comment_count": 123, "repost_count": 9,
              "share_count": "", "saved_count": "", "follower_count": 500},
             AndroidMetricResult(metrics={"view_count": 1_234, "like_count": 50, "comment_count": 125,
-                                         "repost_count": 0, "share_count": 19, "saved_count": 4}),
+                                         "repost_count": 0, "share_count": 19, "saved_count": 4},
+                                recollection=True),
         )
 
         self.assertEqual(merged["view_count"], 1_200)
-        self.assertEqual(merged["like_count"], 50)
+        self.assertEqual(merged["like_count"], 100)
         self.assertEqual(merged["comment_count"], 123)
         self.assertEqual(merged["repost_count"], 0)
         self.assertEqual(merged["share_count"], 19)
@@ -1503,16 +1784,18 @@ class AndroidReelMetricTests(unittest.TestCase):
         self.assertEqual(merged["comment_count"], 32)
         self.assertEqual(merged["repost_count"], 138)
 
-    def test_author_hidden_like_count_is_saved_as_x(self) -> None:
+    def test_web_counts_preserved_when_android_reports_hidden_or_disabled(self) -> None:
         merged = merge_android_metrics(
-            {"like_count": 999, "view_count": 39_240},
+            {"like_count": "999", "comment_count": "0", "view_count": 39_240},
             AndroidMetricResult(
                 metrics={"view_count": 39_240},
                 like_count_private=True,
+                comment_count_disabled=True,
             ),
         )
 
-        self.assertEqual(merged["like_count"], "X")
+        self.assertEqual(merged["like_count"], "999")
+        self.assertEqual(merged["comment_count"], "0")
         self.assertEqual(merged["view_count"], 39_240)
 
     def test_low_like_reel_does_not_invent_missing_comment_count(self) -> None:

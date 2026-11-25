@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 from xml.etree import ElementTree
 from .android_metric_queue import REEL_HISTORY_DIRECTORY, _android_metric_queue_paths
-from .android_reel_metrics import ANDROID_COLLECTION_FIELDS, AndroidMetricResult, merge_android_metrics
+from .android_reel_metrics import ANDROID_COLLECTION_FIELDS, WEB_PREFERRED_COUNT_FIELDS, AndroidMetricResult, has_web_count, merge_android_metrics
 from .collection_settings import (
     ANDROID_METRIC_FIELDS,
     COUNT_HISTORY_METRIC_FIELDS,
@@ -684,7 +684,7 @@ class LongReelStore:
                         fields.add("comment_count")
                     if android_result.like_count_private is True:
                         fields.add("like_count")
-                    self.android_overrides.setdefault(key, set()).update(fields)
+                    self.android_overrides.setdefault(key, set()).update(fields - set(WEB_PREFERRED_COUNT_FIELDS))
                 if record.get("android_mismatch"):
                     row["android_mismatch"] = record["android_mismatch"]
                 self.rows = enrich_reel_collection_rows(self.rows)
@@ -771,7 +771,10 @@ def _merge_external_android_metrics(
         ):
             row.update(classification_fields(external))
             changed += 1
-        if exact_visible_reel_count(str(row.get("view_count", ""))) is None:
+        if exact_visible_reel_count(str(row.get("view_count", ""))) is None or (
+            external.get("view_count_source") == "instagram_android_profile"
+            and row.get("view_count_source") != "instagram_android_profile"
+        ):
             view = exact_visible_reel_count(str(external.get("view_count", "")))
             if view is not None and apply_observed_view_count(
                 local_rows, row, view, str(external.get("view_count_source") or "legacy_external"),
@@ -788,7 +791,7 @@ def _merge_external_android_metrics(
             value = external.get(field, "")
             if value in (None, "") or str(row.get(field, "")) == str(value):
                 continue
-            if field == "comment_count" and str(row.get(field, "") or "").strip():
+            if field in WEB_PREFERRED_COUNT_FIELDS and has_web_count(row.get(field)):
                 continue
             elif field not in {*ANDROID_COLLECTION_FIELDS, "comment_count"}:
                 continue

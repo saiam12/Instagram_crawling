@@ -1,0 +1,1535 @@
+<!doctype html>
+<html lang="ko" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Collector Monitor · 통합 데이터 대시보드</title>
+  <style>
+/*__STYLES_CSS__*/
+/*__VISUALIZE_CSS__*/
+/*__ANALYSIS_CSS__*/
+/*__RECOMMEND_CSS__*/
+
+/* Extra layout fine-tuning for standalone SPA view switching */
+.view-panel {
+  display: block;
+}
+.view-panel[hidden] {
+  display: none !important;
+}
+.nav-link {
+  cursor: pointer;
+}
+.nav-link[aria-current="page"] {
+  background: #2a455b;
+  color: #fff;
+  font-weight: 600;
+}
+[data-theme="dark"] .nav-link[aria-current="page"] {
+  background: #263e52;
+  color: #fff;
+}
+.brand small {
+  display: block;
+  font-size: 9px;
+  color: #a5bbcb;
+  letter-spacing: 1.5px;
+  margin-top: 4px;
+}
+.overview-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+@media (max-width: 900px) {
+  .overview-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.plan-scene-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 14px;
+  font-size: 13px;
+}
+.plan-scene-table th, .plan-scene-table td {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  text-align: left;
+}
+.plan-scene-table th {
+  background: var(--background);
+  font-weight: 600;
+  color: var(--muted);
+}
+.pill-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.pill-primary { background: var(--soft-blue); color: var(--android); }
+.pill-success { background: var(--soft-teal); color: var(--primary); }
+.pill-warning { background: #453722; color: var(--warning); }
+.pill-format { background: #1e3a5f; color: #60a5fa; }
+.pill-blend { background: #3b2d54; color: #c084fc; }
+
+/* Precise row alignment for video guide storyboard scripts */
+.rec-scenes > li {
+  counter-increment: scene;
+  display: grid !important;
+  grid-template-columns: 32px minmax(0, 1fr) !important;
+  gap: 12px !important;
+  padding: 16px 0 !important;
+  border-bottom: 1px solid var(--line) !important;
+  align-items: start !important;
+}
+.rec-scenes > li::before {
+  content: counter(scene, decimal-leading-zero) !important;
+  color: var(--primary) !important;
+  font: 700 13px var(--mono, monospace) !important;
+  padding-top: 3px !important;
+}
+  </style>
+</head>
+<body class="visualization-page analysis-page recommend-page">
+  <a class="skip-link" href="#main">본문으로 이동</a>
+  
+  <!-- Sidebar (Left Fixed) -->
+  <aside class="sidebar">
+    <a class="brand" href="#visualize" aria-label="Collector Monitor 처음으로">
+      <span class="brand-mark" aria-hidden="true">▥</span>
+      <div>
+        <span>COLLECTOR</span>
+        <small>REPORT DASHBOARD</small>
+      </div>
+    </a>
+    <nav aria-label="주 메뉴">
+      <div class="nav-group" role="group" aria-labelledby="nav-collection">
+        <p id="nav-collection" class="nav-group-label">수집 관리</p>
+        <a href="#overview" class="nav-link" id="nav-overview" data-target="view-overview">
+          <span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg></span>
+          수집 현황
+        </a>
+      </div>
+      <div class="nav-group" role="group" aria-labelledby="nav-insights">
+        <p id="nav-insights" class="nav-group-label">데이터 활용</p>
+        <a href="#visualize" class="nav-link" id="nav-visualize" data-target="view-visualize" aria-current="page">
+          <span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M4 4v16h17M8 16v-5m5 5V7m5 9V4"/></svg></span>
+          수집 시각화
+        </a>
+        <a href="#analysis" class="nav-link" id="nav-analysis" data-target="view-analysis">
+          <span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 3v18M15 9v12M9 15h12"/></svg></span>
+          분석 시각화
+        </a>
+        <a href="#recommend" class="nav-link" id="nav-recommend" data-target="view-recommend">
+          <span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8Z"/></svg></span>
+          영상 기획 추천
+        </a>
+        <a href="#insights" class="nav-link" id="nav-insights-tab" data-target="view-insights">
+          <span aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" focusable="false"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span>
+          릴스 인사이트
+        </a>
+      </div>
+    </nav>
+    <div class="sidebar-bottom">
+      <span class="local-dot" aria-hidden="true"></span>로컬 대시보드
+      <small>패션 릴스 3,811건 완료<br>15,244행 전량 수집됨</small>
+    </div>
+  </aside>
+
+  <!-- Main Workspace -->
+  <main id="main">
+    <!-- Header -->
+    <header class="page-header">
+      <div>
+        <h1 id="page-title">수집 데이터 시각화</h1>
+        <p id="page-desc">수집 파일을 선택해 회차·시간·조회수와 반응 지표를 시각화합니다.</p>
+      </div>
+      <div class="header-tools">
+        <span class="badge info" id="page-badge">패션 릴스 3,811건 (15,244행)</span>
+        <button id="theme-toggle" class="button secondary" type="button" aria-pressed="true">라이트모드</button>
+      </div>
+    </header>
+
+    <!-- ============================================== -->
+    <!-- VIEW 1: 수집 현황 (Overview)                    -->
+    <!-- ============================================== -->
+    <div id="view-overview" class="view-panel" hidden>
+      <section class="overview-stats">
+        <article class="stat">
+          <span>전체 고유 릴스</span>
+          <strong>3,811건</strong>
+          <small>신규 탐색 및 4회차 전량 수집</small>
+        </article>
+        <article class="stat">
+          <span>누적 수집 스냅샷</span>
+          <strong>15,244행</strong>
+          <small>3,811개 × 4회차 100% 완료</small>
+        </article>
+        <article class="stat">
+          <span>수집 상태</span>
+          <strong style="color: var(--success);">완료 (Completed)</strong>
+          <small>잔여 작업 0건 · 정상 종료</small>
+        </article>
+        <article class="stat">
+          <span>AI 심층 분석</span>
+          <strong>283건</strong>
+          <small>마케팅 구조화 및 스토리보드</small>
+        </article>
+      </section>
+
+      <section class="panel" style="padding: 24px; margin-bottom: 24px;">
+        <div class="section-heading" style="margin-bottom: 16px;">
+          <div>
+            <h2>수집 캠페인 상세 정보</h2>
+            <p style="font-size: 12px; color: var(--muted); margin-top: 4px;">96시간 패션 릴스 하이브리드 수집 배치 결과</p>
+          </div>
+          <span class="badge good">전체 스냅샷 100% 도달</span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; font-size: 13px;">
+          <div style="background: var(--background); padding: 14px 18px; border-radius: 8px; border: 1px solid var(--line);">
+            <strong style="color: var(--primary);">수집 모드</strong>
+            <p style="margin-top: 4px; color: var(--ink);">하이브리드 (Web 탐색 + Android 메트릭 후속 수집)</p>
+          </div>
+          <div style="background: var(--background); padding: 14px 18px; border-radius: 8px; border: 1px solid var(--line);">
+            <strong style="color: var(--primary);">스냅샷 구성</strong>
+            <p style="margin-top: 4px; color: var(--ink);">1회차(최초), 2회차(+4h), 3회차(+8h), 4회차(+12h)</p>
+          </div>
+          <div style="background: var(--background); padding: 14px 18px; border-radius: 8px; border: 1px solid var(--line);">
+            <strong style="color: var(--primary);">안드로이드 메트릭 대기 큐</strong>
+            <p style="margin-top: 4px; color: var(--ink);">0건 대기 (전량 매칭 및 수집 완료)</p>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ============================================== -->
+    <!-- VIEW 2: 수집 데이터 시각화 (Collection Viz)     -->
+    <!-- ============================================== -->
+    <div id="view-visualize" class="view-panel">
+      <!-- File Info Notice -->
+      <section class="panel file-panel" style="margin-bottom: 18px;">
+        <div class="section-heading">
+          <div>
+            <h2>수집 데이터 소스</h2>
+            <p>collectors/data/collector/reels.csv · 15,244행</p>
+          </div>
+        </div>
+        <div class="file-feedback">
+          <p id="file-status">패션 릴스 3,811건의 1~4차 스냅샷(총 15,244행) 데이터가 내장되어 있습니다.</p>
+        </div>
+      </section>
+
+      <div id="visual-results">
+        <p id="korean-note" class="visual-note">한국·외국·미확인(-)을 구분합니다.</p>
+        <div class="visual-tabs" role="tablist" aria-label="수집 시각화 보기">
+          <button id="metrics-tab" type="button" role="tab" aria-selected="true" aria-controls="metrics-panel">지표 비교</button>
+          <button id="trends-tab" type="button" role="tab" aria-selected="false" aria-controls="trends-panel" tabindex="-1">수집 추이</button>
+        </div>
+        <div class="visual-selection-row">
+          <article id="selection-count-card" class="stat" aria-label="선택한 데이터 요약">
+            <span>선택된 수집 기록</span>
+            <strong id="visual-count">—</strong>
+            <small id="visual-unique">—</small>
+          </article>
+          <section class="panel visual-toolbar" aria-label="시각화 필터">
+            <div class="field">
+              <label for="sheet-select">시트</label>
+              <select id="sheet-select">
+                <option value="fashion_active">reels - 15,244건</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="visual-round">수집 회차</label>
+              <select id="visual-round">
+                <option value="all" selected>전체 회차</option>
+                <option value="1">1회차</option>
+                <option value="2">2회차</option>
+                <option value="3">3회차</option>
+                <option value="4">4회차</option>
+              </select>
+            </div>
+            <div class="field">
+              <div class="category-label-row">
+                <label for="visual-korean">릴스 구분</label>
+                <label class="korean-highlight-toggle" for="highlight-korean">
+                  <input id="highlight-korean" type="checkbox">한국 강조
+                </label>
+              </div>
+              <select id="visual-korean" aria-describedby="korean-note">
+                <option value="true" selected>한국</option>
+                <option value="all">전체</option>
+                <option value="false">외국</option>
+                <option value="unknown">미확인 (-)</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="visual-scope">지표 집계 기준</label>
+              <select id="visual-scope">
+                <option value="latest" selected>릴스별 최신 기록</option>
+                <option value="all">모든 수집 기록</option>
+              </select>
+            </div>
+            <div class="field publisher-search-field">
+              <label for="publisher-search">user 검색</label>
+              <div class="publisher-search-control">
+                <input id="publisher-search" type="search" placeholder="@user 아이디" maxlength="100" autocomplete="off">
+                <button id="clear-publisher-search" type="button" aria-label="user 검색 지우기" hidden>×</button>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- Metrics Panel (Scatter Plots) -->
+        <section id="metrics-panel" role="tabpanel" aria-labelledby="metrics-tab">
+          <div class="chart-layout-controls field">
+            <label for="chart-columns">한 행의 그래프 수</label>
+            <select id="chart-columns">
+              <option value="2">2개</option>
+              <option value="3" selected>3개</option>
+              <option value="4">4개</option>
+            </select>
+          </div>
+          <div id="comparison-grid" class="visual-charts comparison-grid" aria-label="지표 비교 그래프">
+            <!-- Dynamic Chart Panels -->
+            <section class="panel visual-chart-panel axis-chart-panel" aria-labelledby="axis-chart-title">
+              <h2 id="axis-chart-title">그래프 추가</h2>
+              <p class="visual-note">X·Y축을 선택하면 그래프가 추가됩니다.</p>
+              <div class="axis-controls">
+                <div class="field"><label for="chart-x">X축</label><select id="chart-x"><option value="">지표 선택</option></select></div>
+                <div class="field"><label for="chart-y">Y축</label><select id="chart-y"><option value="">지표 선택</option></select></div>
+              </div>
+              <p id="axis-chart" role="status" aria-live="polite">X·Y축을 모두 선택하세요.</p>
+            </section>
+          </div>
+
+          <!-- Table of collection records -->
+          <section class="panel visual-table-panel" style="margin-top: 24px;">
+            <div class="section-heading" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px;">
+              <div><h2>수집 기록 목록</h2></div>
+              <span id="vis-table-count" style="font-size:12px; color:var(--muted);">0건</span>
+            </div>
+            <div class="visual-table-scroll" tabindex="0" role="region" aria-label="시각화에 사용한 수집 기록">
+              <table class="collection-records">
+                <thead>
+                  <tr>
+                    <th scope="col">릴스 / 작성자</th>
+                    <th scope="col">수집 시각 · 한국 시간</th>
+                    <th scope="col">회차</th>
+                    <th scope="col" class="numeric">조회수</th>
+                    <th scope="col" class="numeric">좋아요</th>
+                    <th scope="col" class="numeric">댓글</th>
+                    <th scope="col" class="numeric">공유</th>
+                    <th scope="col" class="numeric">재게시</th>
+                    <th scope="col" class="numeric">저장</th>
+                    <th scope="col" class="numeric">팔로워</th>
+                  </tr>
+                </thead>
+                <tbody id="visual-rows"></tbody>
+              </table>
+            </div>
+            <div style="display: flex; justify-content: center; align-items: center; gap: 12px; padding: 14px;">
+              <button id="vis-prev" class="button secondary compact">이전</button>
+              <span id="vis-page-info" style="font-size: 12px; color: var(--muted);">1 / 1</span>
+              <button id="vis-next" class="button secondary compact">다음</button>
+            </div>
+          </section>
+        </section>
+
+        <!-- Trends Panel -->
+        <section id="trends-panel" role="tabpanel" aria-labelledby="trends-tab" hidden>
+          <div class="visual-charts">
+            <section class="panel visual-chart-panel">
+              <div class="visual-chart-heading">
+                <h2>회차별 수집 기록</h2>
+                <p>선택한 회차의 모든 기록 · 단위: 건</p>
+              </div>
+              <div id="round-chart" class="visual-chart" style="padding: 16px 0;"></div>
+            </section>
+            <section class="panel visual-chart-panel">
+              <div class="visual-chart-heading">
+                <h2>시간대별 수집량</h2>
+                <label for="time-bucket" class="sr-only">시간 집계 간격</label>
+                <select id="time-bucket"><option value="hour">1시간</option><option value="day" selected>1일</option></select>
+              </div>
+              <p id="timeline-note" class="visual-note">한국 시간 · 모든 기록 기준</p>
+              <div id="time-chart" class="visual-chart" style="padding: 16px 0;"></div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <!-- ============================================== -->
+    <!-- VIEW 3: 분석 데이터 시각화 (Analysis Viz)       -->
+    <!-- ============================================== -->
+    <div id="view-analysis" class="view-panel" hidden>
+      <section class="panel analysis-source" aria-label="분석 자료">
+        <div>
+          <strong>참고 분석 파일</strong>
+          <p>collectors/data/collector/reel_analysis.json (283건 분석 완료)</p>
+          <p id="source-status" role="status" aria-live="polite">283건의 마케팅·구조화 심층 분석 데이터셋이 준비되어 있습니다.</p>
+        </div>
+      </section>
+
+      <section class="panel analysis-filters" aria-label="분석 필터">
+        <div class="field">
+          <label for="analysis-search">분석 내용 검색</label>
+          <input id="analysis-search" type="search" maxlength="200" placeholder="릴스 ID · 요약 · 소구점">
+        </div>
+        <div class="field">
+          <label for="analysis-type">콘텐츠 유형</label>
+          <select id="analysis-type"><option value="*">전체 유형</option></select>
+        </div>
+        <div class="field">
+          <label for="analysis-gender">추천 타겟 성별</label>
+          <select id="analysis-gender"><option value="*">전체 성별</option></select>
+        </div>
+        <div class="field">
+          <label for="analysis-korean">릴스 구분</label>
+          <select id="analysis-korean">
+            <option value="all">전체</option>
+            <option value="true">한국</option>
+            <option value="false">외국</option>
+            <option value="unknown">미확인 (-)</option>
+          </select>
+        </div>
+        <button id="reset-analysis" class="button secondary" type="button">필터 초기화</button>
+      </section>
+      <p id="analysis-korean-note" class="visual-note analysis-korean-note">한국·외국·미확인(-)을 구분합니다.</p>
+
+      <div class="analysis-selection">
+        <p id="analysis-selection-text">전체 분석 결과가 표시됩니다.</p>
+        <button id="clear-drill" class="button secondary compact" type="button" hidden>차트 선택 해제</button>
+      </div>
+
+      <!-- Analysis Summary Stats -->
+      <section class="visual-summary" aria-label="분석 요약">
+        <article class="stat"><span>선택된 분석 릴스</span><strong id="analysis-count">—</strong><small id="analysis-total">—</small></article>
+        <article class="stat"><span>분석 장면 총합</span><strong id="scene-count">—</strong><small>선택한 릴스의 장면 레코드 합계</small></article>
+        <article class="stat"><span>장면 기준 길이 중앙값</span><strong id="analysis-duration">—</strong><small id="duration-coverage">실제 영상 길이의 근사값</small></article>
+        <article class="stat"><span>소구점이 분석된 릴스</span><strong id="appeal-count">—</strong><small>소구점 레코드가 있는 릴스 수</small></article>
+      </section>
+      <p class="visual-note analysis-caution">AI 분석 결과이며 실제 시청자 통계가 아닙니다. 타겟·소구점은 중복 집계됩니다.</p>
+
+      <!-- Analysis Bar Charts Grid -->
+      <div class="analysis-charts">
+        <section class="panel analysis-chart">
+          <h2>콘텐츠 유형</h2>
+          <p>분석에 기록된 분류 · 상위 10개</p>
+          <div id="chart-content" class="analysis-bars"></div>
+        </section>
+        <section class="panel analysis-chart">
+          <h2>추천 타겟 연령</h2>
+          <p>복수 선택 · 20~30대 분류는 하나로 유지</p>
+          <div id="chart-ages" class="analysis-bars"></div>
+        </section>
+        <section class="panel analysis-chart">
+          <h2>추천 타겟 성별</h2>
+          <p>분석자가 추천한 타겟 · 실제 시청자 아님</p>
+          <div id="chart-genders" class="analysis-bars"></div>
+        </section>
+        <section class="panel analysis-chart">
+          <h2>Hook 강도</h2>
+          <p>분석의 strong / medium / weak 분류</p>
+          <div id="chart-hook" class="analysis-bars"></div>
+        </section>
+        <section class="panel analysis-chart" style="grid-column: 1 / -1;">
+          <h2>핵심 소구 유형</h2>
+          <p>복수 선택 · 릴스당 중복 제거 · 상위 10개</p>
+          <div id="chart-appeals" class="analysis-bars"></div>
+        </section>
+      </div>
+
+      <!-- Analysis Table -->
+      <section class="panel visual-table-panel" style="margin-top: 24px;">
+        <div class="section-heading" style="padding: 16px 20px; display: flex; justify-content: space-between; align-items: center;">
+          <div><h2>분석 릴스 상세 목록</h2></div>
+          <span id="analysis-range" style="font-size: 12px; color: var(--muted);">0건</span>
+        </div>
+        <div class="visual-table-scroll" tabindex="0" role="region">
+          <table class="collection-records">
+            <thead>
+              <tr>
+                <th scope="col">릴스 식별자 / 요약</th>
+                <th scope="col">분석 시각</th>
+                <th scope="col">콘텐츠 유형</th>
+                <th scope="col">Hook 강도</th>
+                <th scope="col" class="numeric">조회수</th>
+                <th scope="col" class="numeric">좋아요</th>
+                <th scope="col" style="text-align: center;">상세</th>
+              </tr>
+            </thead>
+            <tbody id="analysis-table-rows"></tbody>
+          </table>
+        </div>
+        <div class="analysis-pager">
+          <div class="analysis-page-controls" style="grid-column: 2;">
+            <button id="analysis-prev" class="button secondary compact" type="button">이전</button>
+            <span id="analysis-page">1 / 1</span>
+            <button id="analysis-next" class="button secondary compact" type="button">다음</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- ============================================== -->
+    <!-- VIEW 4: 영상 기획 추천 (Recommendation)        -->
+    <!-- ============================================== -->
+    <div id="view-recommend" class="view-panel" hidden>
+      <div class="visual-tabs" role="tablist" style="margin-bottom: 20px;">
+        <button id="rec-cached-tab" type="button" role="tab" aria-selected="true">★ 로컬 캐시 추천 (20대 남성 아우터 6종 기획안)</button>
+        <button id="rec-library-tab" type="button" role="tab" aria-selected="false">기획안 라이브러리 (30종) & 실시간 검색</button>
+      </div>
+
+      <!--__CACHED_RECOMMENDATION_PANEL__-->
+
+      <div id="rec-library-panel" hidden>
+        <div class="rec-cache">
+          <p id="cache-status" role="status" aria-live="polite">283건 고성과 패션 릴스 코퍼스 기반 실시간 BM25 랭킹 검색</p>
+        </div>
+        <div class="rec-layout">
+          <div class="rec-input-column">
+            <section class="panel rec-brief" aria-labelledby="brief-heading">
+              <div class="rec-heading">
+                <div><h2 id="brief-heading">어떤 영상을 만들까요?</h2></div>
+                <button id="example" class="button secondary compact" type="button">예시 입력</button>
+              </div>
+              <form id="brief-form" novalidate onsubmit="return false;">
+                <div class="rec-field">
+                  <label for="dataset">참고할 데이터셋</label>
+                  <select id="dataset">
+                    <option value="fashion">패션 릴스 (reel_analysis.json · 283건)</option>
+                  </select>
+                  <small id="dataset-path" class="rec-help">collectors/data/collector/reel_analysis.json</small>
+                </div>
+                <div class="rec-field">
+                  <label for="reference-country">참고 사례 구분</label>
+                  <select id="reference-country">
+                    <option value="all">전체</option>
+                    <option value="true">한국</option>
+                    <option value="false">외국</option>
+                    <option value="unknown">미확인</option>
+                  </select>
+                </div>
+                <div class="rec-field">
+                  <label for="follower_count">내 계정 팔로워 수 <span>선택</span></label>
+                  <input id="follower_count" name="follower_count" inputmode="numeric" placeholder="예: 10,000" autocomplete="off">
+                  <small class="rec-help">입력하면 내용이 유사한 후보 중 계정 규모가 가까운 사례를 우선합니다.</small>
+                </div>
+                <div class="rec-field">
+                  <label for="product">제품</label>
+                  <input id="product" name="product" placeholder="예: 핸드메이드 울 롱코트" required>
+                </div>
+                <div class="rec-field">
+                  <label for="target">타겟</label>
+                  <input id="target" name="target" placeholder="예: 20~30대 여성 출근룩" required>
+                </div>
+                <div class="rec-field">
+                  <label for="purpose">목적</label>
+                  <input id="purpose" name="purpose" placeholder="예: 초겨울 룩북 코디 제안 및 구매 유도" required>
+                </div>
+                <div class="rec-field">
+                  <label for="selling_point">핵심 소구점 <span>선택</span></label>
+                  <input id="selling_point" name="selling_point" placeholder="예: 가볍고 따뜻한 이중 울 소재, 3가지 믹스매치">
+                </div>
+                <div class="rec-field">
+                  <label for="production_constraints">제작 조건 <span>선택</span></label>
+                  <input id="production_constraints" name="production_constraints" placeholder="예: 전신 거울 셀카, 1인 연출, 빠른 컷 전환">
+                </div>
+                <button id="search" class="button primary" type="button">유사 사례 찾기</button>
+              </form>
+              <p class="rec-feedback">검색 시 입력 조건과 283건 분석 코퍼스를 BM25로 실시간 대조하여 벤치마크 사례를 선출합니다.</p>
+            </section>
+
+            <section class="panel rec-references" aria-labelledby="reference-heading">
+              <div class="rec-heading">
+                <h2 id="reference-heading">참고 사례</h2>
+                <span id="reference-count" class="badge info">검색 전</span>
+              </div>
+              <p id="source-note" class="rec-help">지정된 분석 JSON의 레코드만 참고합니다.</p>
+              <div id="references">
+                <p class="rec-empty-small">조건을 입력하면 유사한 릴스를 여기에 표시합니다.</p>
+              </div>
+            </section>
+          </div>
+
+          <section class="panel rec-output" aria-labelledby="plan-heading">
+            <div class="rec-heading">
+              <div><h2 id="plan-heading">가이드 영상 · 대본</h2></div>
+              <span id="plan-state" class="badge info">기획안 30종 탑재됨</span>
+            </div>
+            <div id="provider-status" class="rec-provider">검증된 프로덕션 숏폼 영상 기획안 라이브러리</div>
+            <div id="brief-summary" class="rec-brief-summary" hidden></div>
+            <div class="rec-generate-area">
+              <div class="field" style="flex: 1; margin: 0;">
+                <select id="plan-select" style="width:100%; min-height:43px; font-weight:600;"></select>
+              </div>
+              <button id="copy-plan-btn" class="button primary" type="button">대본·기획안 복사</button>
+            </div>
+            <article id="plan" style="margin-top: 20px;"></article>
+            <p class="rec-footnote">통합 순위는 의미·단어 검색 순위를 결합한 결과입니다. 코사인 유사도는 성공 확률이나 예상 성과가 아닙니다.</p>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================== -->
+    <!-- VIEW 5: 릴스 인사이트 (Insights)                -->
+    <!-- ============================================== -->
+    <div id="view-insights" class="view-panel" hidden>
+      <section class="panel" style="padding: 24px; margin-bottom: 24px;">
+        <h2 style="font-size: 18px; margin-bottom: 8px;">275개 패션 릴스 종합 연출·행동 패턴 분석</h2>
+        <p style="color: var(--muted); font-size: 13px; line-height: 1.8; margin-bottom: 20px;">
+          수집된 패션 릴스들은 <strong>전신 착장 구도(73.5%)</strong>와 <strong>신속한 착장 전환 편집(35.3%)</strong>을 주요 구조로 공유하며,
+          상단 텍스트 자막, POV 연출, 거울 셀카 등을 조합하여 시청 지속 시간을 극대화하는 특징을 보입니다.
+        </p>
+
+        <div class="analysis-charts">
+          <section class="panel analysis-chart">
+            <h2>Hook 비율</h2>
+            <p>시청자 이탈 방지 첫 1~3초 연출 분류</p>
+            <div id="insight-hook-bars" class="analysis-bars"></div>
+          </section>
+          <section class="panel analysis-chart">
+            <h2>Scene 공통 패턴</h2>
+            <p>주요 카메라 앵글 및 화면 구도</p>
+            <div id="insight-scene-bars" class="analysis-bars"></div>
+          </section>
+          <section class="panel analysis-chart" style="grid-column: 1 / -1;">
+            <h2>Movement 공통 패턴</h2>
+            <p>크리에이터 모션 및 제품 시연 방식</p>
+            <div id="insight-movement-bars" class="analysis-bars"></div>
+          </section>
+        </div>
+      </section>
+
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">
+        <div class="panel" style="padding: 18px;">
+          <h3 style="color: var(--primary); font-size: 14px; margin-bottom: 8px;">1. 첫 1~2초 텍스트 훅 + 전신 착장</h3>
+          <p style="font-size: 12px; color: var(--muted); line-height: 1.7;">
+            32.4%의 고반응 영상이 상단 자막에 타겟 페르소나('20대 출근룩', '체형 커버 코디')를 명시하고 단정한 전신 룩으로 시작하여 이탈율을 효과적으로 방어합니다.
+          </p>
+        </div>
+        <div class="panel" style="padding: 18px;">
+          <h3 style="color: var(--android); font-size: 14px; margin-bottom: 8px;">2. 1초 비트 매칭 컷 전환 (Fast Tempo)</h3>
+          <p style="font-size: 12px; color: var(--muted); line-height: 1.7;">
+            단순 제품 나열 대신 배경음악 비트에 맞추어 신발, 가방, 아우터를 순차 착장하는 하드 컷 편집이 저장 및 공유 지표를 비약적으로 높입니다.
+          </p>
+        </div>
+        <div class="panel" style="padding: 18px;">
+          <h3 style="color: var(--warning); font-size: 14px; margin-bottom: 8px;">3. 소재 클로즈업 질감 시연</h3>
+          <p style="font-size: 12px; color: var(--muted); line-height: 1.7;">
+            중간 씬(3~5초 구간)에서 카메라 가까이 원단의 촉감, 지퍼 마감, 신축성을 손으로 당겨 보여주는 조작 장면(48.7%)이 구매 신뢰도를 결정짓습니다.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Analysis Detail Modal Dialog (Native dialog matching analysis.html) -->
+    <dialog id="analysis-dialog" class="panel">
+      <div class="analysis-dialog-header">
+        <h2 id="analysis-dialog-title">릴스 분석 상세</h2>
+        <button id="close-analysis-dialog" class="button secondary compact" type="button">닫기</button>
+      </div>
+      <div id="analysis-detail"></div>
+    </dialog>
+  </main>
+
+  <!-- Embedded Datasets -->
+  <script>
+    window.__REELS_RAW__ = "__REELS_DATA__";
+    window.__ANALYSIS_RAW__ = "__ANALYSIS_DATA__";
+    window.__PLANS_RAW__ = "__PLANS_DATA__";
+    window.__INSIGHTS_RAW__ = "__INSIGHTS_DATA__";
+    window.__CACHED_VIDEOS__ = "__CACHED_VIDEOS__";
+  </script>
+
+  <!-- Theme Script matching theme.js -->
+  <script>
+"use strict";
+(() => {
+  let dark = true;
+  try {
+    const saved = localStorage.getItem("collector-monitor-theme");
+    if (saved === "dark" || saved === "light") dark = saved === "dark";
+  } catch {}
+  const apply = () => {
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    const button = document.getElementById("theme-toggle");
+    if (button) {
+      button.textContent = dark ? "라이트모드" : "다크모드";
+      button.setAttribute("aria-pressed", String(dark));
+    }
+  };
+  apply();
+  document.addEventListener("DOMContentLoaded", () => {
+    apply();
+    const button = document.getElementById("theme-toggle");
+    if (button) {
+      button.addEventListener("click", () => {
+        dark = !dark;
+        apply();
+        try { localStorage.setItem("collector-monitor-theme", dark ? "dark" : "light"); } catch {}
+      });
+    }
+  });
+})();
+  </script>
+
+  <script>
+    if (!window.crypto) window.crypto = {};
+    if (!window.crypto.randomUUID) {
+      window.crypto.randomUUID = () => 'uuid-' + Math.random().toString(36).slice(2, 11) + '-' + Date.now();
+    }
+  </script>
+
+  <!-- Korean Classification Module (Verbatim from korean-filter.js) -->
+  <script>
+/*__KOREAN_FILTER_JS__*/
+  </script>
+
+  <!-- Scatter Module (Verbatim from scatter.js) -->
+  <script>
+/*__SCATTER_JS__*/
+  </script>
+
+  <!-- Chart Board Module (Verbatim from chart-board.js) -->
+  <script>
+/*__CHART_BOARD_JS__*/
+  </script>
+
+  <!-- Main Application Logic -->
+  <script>
+"use strict";
+(() => {
+  const $ = id => document.getElementById(id);
+  const number = new Intl.NumberFormat("ko-KR", {maximumFractionDigits: 1});
+  const compact = new Intl.NumberFormat("ko-KR", {notation: "compact", maximumFractionDigits: 1});
+  const dateFmt = new Intl.DateTimeFormat("ko-KR", {timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false});
+
+  // 1. Unpack Raw Data
+  const rawReels = window.__REELS_RAW__; // [round, time, shortcode, user, korean, view, like, comment, share, repost, saved, follower, duration]
+  const rawAnalysis = window.__ANALYSIS_RAW__;
+  const rawPlans = window.__PLANS_RAW__;
+  const rawInsights = window.__INSIGHTS_RAW__;
+
+  const REEL_FIELDS = ["collection_number", "collected_at", "shortcode", "username", "korean", "view_count", "like_count", "comment_count", "share_count", "repost_count", "saved_count", "follower_count", "video_duration_seconds"];
+  const collectionRows = rawReels.map(r => {
+    const row = {};
+    REEL_FIELDS.forEach((f, idx) => row[f] = r[idx]);
+    row.url = `https://www.instagram.com/reels/${row.shortcode}/`;
+    row.reel_id = row.shortcode;
+    return row;
+  });
+
+  // 2. Navigation SPA Tabs
+  const navLinks = document.querySelectorAll(".nav-link[data-target]");
+  const viewPanels = document.querySelectorAll(".view-panel");
+  const pageTitle = $("page-title");
+  const pageDesc = $("page-desc");
+  const pageBadge = $("page-badge");
+
+  const viewMeta = {
+    "view-overview": {
+      title: "수집 현황",
+      desc: "캠페인 수집 진행 경과, 스냅샷 완결 여부 및 데이터셋 요약 정보입니다.",
+      badge: "수집 완료 (Completed)"
+    },
+    "view-visualize": {
+      title: "수집 데이터 시각화",
+      desc: "수집 파일을 선택해 회차·시간·조회수와 반응 지표를 시각화합니다.",
+      badge: "패션 릴스 3,811건 (15,244행)"
+    },
+    "view-analysis": {
+      title: "분석 데이터 시각화",
+      desc: "콘텐츠 유형·추천 타겟·Hook·소구점·장면 길이를 집계합니다.",
+      badge: "AI 심층 분석 283건 완료"
+    },
+    "view-recommend": {
+      title: "영상 기획 추천",
+      desc: "브리프 조건을 입력해 유사 고성과 사례를 선출하고, 검증된 영상 기획안을 확인합니다.",
+      badge: "기획안 라이브러리 30종"
+    },
+    "view-insights": {
+      title: "릴스 인사이트 종합",
+      desc: "275개 패션 릴스 전체 분석에서 추출한 Hook·Scene·Movement 공통 패턴입니다.",
+      badge: "종합 연출 리포트"
+    }
+  };
+
+  function switchView(targetId) {
+    viewPanels.forEach(p => p.hidden = p.id !== targetId);
+    navLinks.forEach(link => {
+      const isTarget = link.dataset.target === targetId;
+      link.classList.toggle("active", isTarget);
+      if (isTarget) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+    if (viewMeta[targetId]) {
+      pageTitle.textContent = viewMeta[targetId].title;
+      pageDesc.textContent = viewMeta[targetId].desc;
+      pageBadge.textContent = viewMeta[targetId].badge;
+    }
+    if (targetId === "view-visualize") renderVisualization();
+    if (targetId === "view-analysis") renderAnalysis();
+    if (targetId === "view-recommend") renderRecommend();
+    if (targetId === "view-insights") renderInsights();
+  }
+
+  navLinks.forEach(link => {
+    link.addEventListener("click", e => {
+      e.preventDefault();
+      switchView(link.dataset.target);
+    });
+  });
+
+  // ========================================================
+  // VIEW 2: Collection Visualization Setup
+  // ========================================================
+  const metrics = {
+    view_count: "조회수",
+    like_count: "좋아요",
+    comment_count: "댓글",
+    share_count: "공유",
+    repost_count: "재게시",
+    saved_count: "저장",
+    follower_count: "팔로워"
+  };
+  const chartLabels = {...metrics, video_duration_seconds: "영상 길이(초)"};
+
+  const visState = {
+    charts: [
+      {id: "views-like_count", x: "view_count", y: "like_count"},
+      {id: "followers-view_count", x: "follower_count", y: "view_count"},
+      {id: "followers-like_count", x: "follower_count", y: "like_count"},
+      {id: "followers-comment_count", x: "follower_count", y: "comment_count"},
+      {id: "followers-share_count", x: "follower_count", y: "share_count"},
+      {id: "followers-saved_count", x: "follower_count", y: "saved_count"},
+      {id: "views-comment_count", x: "view_count", y: "comment_count"},
+      {id: "views-share_count", x: "view_count", y: "share_count"},
+      {id: "views-saved_count", x: "view_count", y: "saved_count"},
+      {id: "duration-view_count", x: "video_duration_seconds", y: "view_count"}
+    ],
+    columns: 3,
+    chartHeight: 420,
+    chartWidth: null
+  };
+
+  const STORAGE_KEY = "collector-monitor-workspace";
+  function saveWorkspace() {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(board.snapshot()));
+    } catch {}
+  }
+
+  const board = window.CollectorChartBoard({
+    state: visState,
+    chartLabels,
+    render: () => renderVisualization(),
+    saveWorkspace,
+    draw: (host, rows, x, y, height) => window.CollectorScatter(
+      host, rows, x, y, chartLabels[x], chartLabels[y],
+      row => (row.username ? `@${row.username}` : (row.reel_id || row.shortcode || "릴스")),
+      $("highlight-korean").checked,
+      $("publisher-search").value,
+      height
+    )
+  });
+
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) board.restore(JSON.parse(saved));
+  } catch {}
+
+  let visPage = 1;
+  const visPageSize = 20;
+
+  function getVisFilteredRows() {
+    const roundVal = $("visual-round").value;
+    const korVal = $("visual-korean").value;
+    const scopeVal = $("visual-scope").value;
+    const userQuery = $("publisher-search").value.trim().replace(/^@/, "").toLowerCase();
+
+    let source = collectionRows;
+    if (scopeVal === "latest") {
+      const map = new Map();
+      for (const r of collectionRows) {
+        const cur = map.get(r.shortcode);
+        if (!cur || r.collection_number > cur.collection_number) map.set(r.shortcode, r);
+      }
+      source = Array.from(map.values());
+    }
+
+    return source.filter(r => {
+      if (roundVal !== "all" && String(r.collection_number) !== roundVal) return false;
+      if (!window.CollectorKorean.matches(r, korVal)) return false;
+      if (userQuery && !(r.username || "").toLowerCase().includes(userQuery)) return false;
+      return true;
+    });
+  }
+
+  function renderVisualization() {
+    const filtered = getVisFilteredRows();
+
+    // Summary Card
+    const uniqueCount = new Set(filtered.map(r => r.shortcode)).size;
+    $("visual-count").textContent = number.format(filtered.length);
+    $("visual-unique").textContent = `URL 기준 릴스 ${number.format(uniqueCount)}개`;
+
+    // Charts
+    board.render(filtered);
+
+    // Table
+    $("vis-table-count").textContent = `총 ${number.format(filtered.length)}건 중 ${(visPage - 1) * visPageSize + 1}–${Math.min(visPage * visPageSize, filtered.length)}건`;
+    const tbody = $("visual-rows");
+    tbody.innerHTML = "";
+    const totalPages = Math.ceil(filtered.length / visPageSize) || 1;
+    if (visPage > totalPages) visPage = totalPages;
+    $("vis-page-info").textContent = `${visPage} / ${totalPages}`;
+    $("vis-prev").disabled = visPage === 1;
+    $("vis-next").disabled = visPage === totalPages;
+
+    const fmtMetric = val => {
+      if (val === 'X' || val === 'x') {
+        return '<span class="pill-badge pill-warning" style="background:#453722; color:var(--warning); font-weight:700;">비공개(X)</span>';
+      }
+      return val !== null && val !== undefined ? number.format(val) : "—";
+    };
+
+    const pageRows = filtered.slice((visPage - 1) * visPageSize, visPage * visPageSize);
+    pageRows.forEach(r => {
+      const tr = document.createElement("tr");
+      const korBadge = r.korean === true ? '<span class="pill-badge pill-success">한국</span>' : (r.korean === false ? '<span class="pill-badge pill-primary">외국</span>' : '<span class="pill-badge">-</span>');
+      tr.innerHTML = `
+        <td class="record-identity">
+          <a href="${r.url}" target="_blank" style="font-weight:600; text-decoration:none;">${r.shortcode}</a>
+          <small style="color:var(--muted); display:block;">@${r.username || 'unknown'} · ${korBadge}</small>
+        </td>
+        <td class="record-date">${r.collected_at ? r.collected_at.replace("T", " ") : "—"}</td>
+        <td class="record-round">${r.collection_number}회차</td>
+        <td class="numeric">${fmtMetric(r.view_count)}</td>
+        <td class="numeric">${fmtMetric(r.like_count)}</td>
+        <td class="numeric">${fmtMetric(r.comment_count)}</td>
+        <td class="numeric">${fmtMetric(r.share_count)}</td>
+        <td class="numeric">${fmtMetric(r.repost_count)}</td>
+        <td class="numeric">${fmtMetric(r.saved_count)}</td>
+        <td class="numeric">${fmtMetric(r.follower_count)}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+  }
+
+  // Filter Listeners
+  ["visual-round", "visual-korean", "visual-scope", "highlight-korean"].forEach(id => {
+    $(id).addEventListener("change", () => { visPage = 1; renderVisualization(); });
+  });
+  $("publisher-search").addEventListener("input", () => {
+    $("clear-publisher-search").hidden = !$("publisher-search").value;
+    visPage = 1;
+    renderVisualization();
+  });
+  $("clear-publisher-search").addEventListener("click", () => {
+    $("publisher-search").value = "";
+    $("clear-publisher-search").hidden = true;
+    visPage = 1;
+    renderVisualization();
+    $("publisher-search").focus();
+  });
+  $("vis-prev").addEventListener("click", () => { if (visPage > 1) { visPage--; renderVisualization(); } });
+  $("vis-next").addEventListener("click", () => { visPage++; renderVisualization(); });
+
+  let resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (!viewPanels[1].hidden) renderVisualization();
+    }, 150);
+  });
+
+  // Visualize Sub-Tabs (Metrics vs Trends)
+  $("metrics-tab").addEventListener("click", () => {
+    $("metrics-tab").setAttribute("aria-selected", "true");
+    $("trends-tab").setAttribute("aria-selected", "false");
+    $("metrics-panel").hidden = false;
+    $("trends-panel").hidden = true;
+  });
+  $("trends-tab").addEventListener("click", () => {
+    $("trends-tab").setAttribute("aria-selected", "true");
+    $("metrics-tab").setAttribute("aria-selected", "false");
+    $("trends-panel").hidden = false;
+    $("metrics-panel").hidden = true;
+    renderTrends();
+  });
+
+  function renderTrends() {
+    // Round counts
+    const roundCounts = {1:0, 2:0, 3:0, 4:0};
+    collectionRows.forEach(r => { if (roundCounts[r.collection_number] !== undefined) roundCounts[r.collection_number]++; });
+    const roundChart = $("round-chart");
+    roundChart.innerHTML = "";
+    Object.entries(roundCounts).forEach(([rnd, count]) => {
+      const row = document.createElement("div");
+      row.className = "analysis-bar";
+      row.innerHTML = `
+        <div class="analysis-bar-label"><span>${rnd}회차 수집 기록</span><strong>${number.format(count)}건 (100%)</strong></div>
+        <div class="analysis-track"><span class="analysis-fill" style="width:100%;"></span></div>
+      `;
+      roundChart.appendChild(row);
+    });
+
+    // Time buckets
+    const timeBucket = $("time-bucket").value;
+    const timeCounts = {};
+    collectionRows.forEach(r => {
+      if (!r.collected_at) return;
+      const key = timeBucket === "day" ? r.collected_at.slice(0, 10) : r.collected_at.slice(0, 13) + "시";
+      timeCounts[key] = (timeCounts[key] || 0) + 1;
+    });
+    const timeChart = $("time-chart");
+    timeChart.innerHTML = "";
+    const sortedTimes = Object.entries(timeCounts).sort();
+    const maxCount = Math.max(...Object.values(timeCounts), 1);
+    sortedTimes.forEach(([timeKey, cnt]) => {
+      const row = document.createElement("div");
+      row.className = "analysis-bar";
+      const pct = (cnt / maxCount * 100).toFixed(1);
+      row.innerHTML = `
+        <div class="analysis-bar-label"><span>${timeKey}</span><strong>${number.format(cnt)}건</strong></div>
+        <div class="analysis-track"><span class="analysis-fill" style="width:${pct}%; background:var(--android);"></span></div>
+      `;
+      timeChart.appendChild(row);
+    });
+  }
+  $("time-bucket").addEventListener("change", renderTrends);
+
+  // ========================================================
+  // VIEW 3: Analysis Visualization Setup
+  // ========================================================
+  let anaPage = 1;
+  const anaPageSize = 10;
+  let anaActiveFacet = null; // {field, value}
+
+  // Populate analysis type dropdown
+  const anaTypes = [...new Set(rawAnalysis.map(a => a.content_type).filter(Boolean))].sort();
+  anaTypes.forEach(t => {
+    const opt = document.createElement("option"); opt.value = t; opt.textContent = t;
+    $("analysis-type").appendChild(opt);
+  });
+  const anaGenders = [...new Set(rawAnalysis.flatMap(a => a.genders || []).filter(Boolean))].sort();
+  anaGenders.forEach(g => {
+    const opt = document.createElement("option"); opt.value = g; opt.textContent = g === "female" ? "여성" : (g === "male" ? "남성" : g);
+    $("analysis-gender").appendChild(opt);
+  });
+
+  function getFilteredAnalysis() {
+    const q = $("analysis-search").value.trim().toLowerCase();
+    const tVal = $("analysis-type").value;
+    const gVal = $("analysis-gender").value;
+    const kVal = $("analysis-korean").value;
+
+    return rawAnalysis.filter(a => {
+      if (!window.CollectorKorean.matches(a, kVal)) return false;
+      if (tVal !== "*" && a.content_type !== tVal) return false;
+      if (gVal !== "*" && !(a.genders || []).includes(gVal)) return false;
+      if (anaActiveFacet) {
+        const val = a[anaActiveFacet.field];
+        if (Array.isArray(val)) {
+          if (!val.includes(anaActiveFacet.value)) return false;
+        } else if (val !== anaActiveFacet.value) return false;
+      }
+      if (q) {
+        const searchCorpus = [a.reel_id, a.summary, a.hook, a.body, ...(a.appeals || [])].join(" ").toLowerCase();
+        if (!searchCorpus.includes(q)) return false;
+      }
+      return true;
+    });
+  }
+
+  function renderAnalysisBars(containerId, field, countMap, limit = 10) {
+    const container = $(containerId);
+    container.innerHTML = "";
+    const sorted = Object.entries(countMap).sort((a,b) => b[1] - a[1]).slice(0, limit);
+    const maxVal = sorted.length ? sorted[0][1] : 1;
+
+    sorted.forEach(([label, cnt]) => {
+      const isSelected = anaActiveFacet && anaActiveFacet.field === field && anaActiveFacet.value === label;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "analysis-bar";
+      btn.setAttribute("aria-pressed", String(isSelected));
+      const pct = (cnt / maxVal * 100).toFixed(1);
+      btn.innerHTML = `
+        <div class="analysis-bar-label"><span>${label}</span><strong>${number.format(cnt)}건</strong></div>
+        <div class="analysis-track"><span class="analysis-fill" style="width:${pct}%;"></span></div>
+      `;
+      btn.addEventListener("click", () => {
+        if (isSelected) {
+          anaActiveFacet = null;
+          $("clear-drill").hidden = true;
+          $("analysis-selection-text").textContent = "전체 분석 결과가 표시됩니다.";
+        } else {
+          anaActiveFacet = {field, value: label};
+          $("clear-drill").hidden = false;
+          $("analysis-selection-text").textContent = `선택 필터: ${label} (${cnt}건)`;
+        }
+        anaPage = 1;
+        renderAnalysis();
+      });
+      container.appendChild(btn);
+    });
+  }
+
+  function renderAnalysis() {
+    const filtered = getFilteredAnalysis();
+
+    // Summary stats
+    $("analysis-count").textContent = `${number.format(filtered.length)}건`;
+    $("analysis-total").textContent = `전체 ${rawAnalysis.length}건 중`;
+    const totalScenes = filtered.reduce((acc, a) => acc + (a.scene_count || (a.scenes ? a.scenes.length : 0)), 0);
+    $("scene-count").textContent = `${number.format(totalScenes)}개`;
+
+    const durations = filtered.map(a => a.duration || a.video_duration_seconds).filter(d => Number.isFinite(d) && d > 0).sort((a,b)=>a-b);
+    const medianDur = durations.length ? durations[Math.floor(durations.length / 2)].toFixed(1) : "—";
+    $("analysis-duration").textContent = `${medianDur}초`;
+
+    const appealCount = filtered.filter(a => a.points && a.points.length > 0).length;
+    $("appeal-count").textContent = `${number.format(appealCount)}건`;
+
+    // Charts
+    const cMap = {}, aMap = {}, gMap = {}, hMap = {}, apMap = {};
+    filtered.forEach(a => {
+      if (a.content_type) cMap[a.content_type] = (cMap[a.content_type] || 0) + 1;
+      (a.ages || []).forEach(age => aMap[age] = (aMap[age] || 0) + 1);
+      (a.genders || []).forEach(g => gMap[g] = (gMap[g] || 0) + 1);
+      if (a.hook_strength) hMap[a.hook_strength] = (hMap[a.hook_strength] || 0) + 1;
+      (a.appeals || []).forEach(ap => apMap[ap] = (apMap[ap] || 0) + 1);
+    });
+
+    renderAnalysisBars("chart-content", "content_type", cMap, 10);
+    renderAnalysisBars("chart-ages", "ages", aMap, 6);
+    renderAnalysisBars("chart-genders", "genders", gMap, 4);
+    renderAnalysisBars("chart-hook", "hook_strength", hMap, 4);
+    renderAnalysisBars("chart-appeals", "appeals", apMap, 10);
+
+    // Table
+    const tbody = $("analysis-table-rows");
+    tbody.innerHTML = "";
+    const totalPages = Math.ceil(filtered.length / anaPageSize) || 1;
+    if (anaPage > totalPages) anaPage = totalPages;
+    $("analysis-range").textContent = `${(anaPage - 1) * anaPageSize + 1}–${Math.min(anaPage * anaPageSize, filtered.length)} / ${number.format(filtered.length)}건`;
+    $("analysis-page").textContent = `${anaPage} / ${totalPages}`;
+    $("analysis-prev").disabled = anaPage === 1;
+    $("analysis-next").disabled = anaPage === totalPages;
+
+    const pageItems = filtered.slice((anaPage - 1) * anaPageSize, anaPage * anaPageSize);
+    pageItems.forEach(item => {
+      const tr = document.createElement("tr");
+      const korLabel = window.CollectorKorean.label(item);
+      const hookPill = item.hook_strength === 'strong' ? '<span class="pill-badge pill-success">강함</span>' : (item.hook_strength === 'medium' ? '<span class="pill-badge pill-warning">보통</span>' : '<span class="pill-badge">약함</span>');
+      tr.innerHTML = `
+        <td>
+          <a href="${item.url}" target="_blank" style="font-weight:600; text-decoration:none;">${item.reel_id}</a>
+          <p class="analysis-summary-text">${item.summary || '—'}</p>
+          <small class="analysis-meta">${korLabel} · @${item.username || 'unknown'} · 장면 ${item.scene_count || 0}개</small>
+        </td>
+        <td class="record-date">${item.analyzed_at ? item.analyzed_at.slice(0, 10) : "—"}</td>
+        <td>${item.content_type || "—"}</td>
+        <td>${hookPill}</td>
+        <td class="numeric">${item.view_count ? compact.format(item.view_count) : "—"}</td>
+        <td class="numeric">${item.like_count ? compact.format(item.like_count) : "—"}</td>
+        <td style="text-align:center;">
+          <button class="button secondary compact open-analysis-btn" data-id="${item.reel_id}">상세</button>
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    document.querySelectorAll(".open-analysis-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const target = rawAnalysis.find(a => a.reel_id === btn.dataset.id);
+        if (target) openAnalysisDialog(target);
+      });
+    });
+  }
+
+  $("analysis-search").addEventListener("input", () => { anaPage = 1; renderAnalysis(); });
+  $("analysis-type").addEventListener("change", () => { anaPage = 1; renderAnalysis(); });
+  $("analysis-gender").addEventListener("change", () => { anaPage = 1; renderAnalysis(); });
+  $("analysis-korean").addEventListener("change", () => { anaPage = 1; renderAnalysis(); });
+  $("reset-analysis").addEventListener("click", () => {
+    $("analysis-search").value = "";
+    $("analysis-type").value = "*";
+    $("analysis-gender").value = "*";
+    $("analysis-korean").value = "all";
+    anaActiveFacet = null;
+    $("clear-drill").hidden = true;
+    $("analysis-selection-text").textContent = "전체 분석 결과가 표시됩니다.";
+    anaPage = 1;
+    renderAnalysis();
+  });
+  $("clear-drill").addEventListener("click", () => {
+    anaActiveFacet = null;
+    $("clear-drill").hidden = true;
+    $("analysis-selection-text").textContent = "전체 분석 결과가 표시됩니다.";
+    anaPage = 1;
+    renderAnalysis();
+  });
+  $("analysis-prev").addEventListener("click", () => { if (anaPage > 1) { anaPage--; renderAnalysis(); } });
+  $("analysis-next").addEventListener("click", () => { anaPage++; renderAnalysis(); });
+
+  // Dialog modal
+  const analysisDialog = $("analysis-dialog");
+  $("close-analysis-dialog").addEventListener("click", () => analysisDialog.close());
+
+  function openAnalysisDialog(item) {
+    $("analysis-dialog-title").textContent = `릴스 상세 분석 · ${item.reel_id}`;
+    const detail = $("analysis-detail");
+    detail.innerHTML = `
+      <section>
+        <h3>분석 요약</h3>
+        <p>${item.summary || '요약 없음'}</p>
+      </section>
+      <section>
+        <h3>Hook 연출 상세 (${item.hook_strength || '보통'})</h3>
+        <p>${item.hook || '상세 없음'}</p>
+      </section>
+      <section>
+        <h3>바디 전개 구조</h3>
+        <p>${item.body || '상세 없음'}</p>
+      </section>
+      ${item.points && item.points.length ? `
+        <section>
+          <h3>핵심 소구점 (Selling Points)</h3>
+          <ul>${item.points.map(p => `<li><strong>[${p.type || '소구'}]</strong> ${p.point} ${p.evidence ? `<em>(${p.evidence})</em>` : ''}</li>`).join('')}</ul>
+        </section>
+      ` : ''}
+      ${item.scenes && item.scenes.length ? `
+        <section>
+          <h3>장면별 연출 스토리보드 (${item.scenes.length}개 장면)</h3>
+          <table class="plan-scene-table">
+            <thead><tr><th style="width:80px;">시간</th><th>장면 연출 및 시각 설명</th></tr></thead>
+            <tbody>
+              ${item.scenes.map(s => `<tr><td style="white-space:nowrap;">${s.start || 0}s ~ ${s.end || 0}s</td><td>${s.description || '—'}</td></tr>`).join('')}
+            </tbody>
+          </table>
+        </section>
+      ` : ''}
+      <section style="margin-top:20px; display:flex; justify-content:space-between; align-items:center;">
+        <span style="font-size:12px; color:var(--muted);">조회수: ${number.format(item.view_count || 0)} · 좋아요: ${number.format(item.like_count || 0)}</span>
+        <a href="${item.url}" target="_blank" class="button primary">인스타그램 원본 열기</a>
+      </section>
+    `;
+    analysisDialog.showModal();
+  }
+
+  // ========================================================
+  // VIEW 4: Video Planning Recommendation Setup
+  // ========================================================
+  const ALIASES = [
+    ["화장품", "뷰티", "메이크업", "스킨케어", "cosmetic", "beauty", "makeup", "skincare"],
+    ["패션", "옷", "의류", "코디", "fashion", "outfit", "lookbook", "코트", "아우터"],
+    ["여성", "여자", "여성용", "female", "women"],
+    ["남성", "남자", "남성용", "male", "men"],
+    ["감성", "감성적", "차분", "따뜻", "cozy", "emotional", "warm", "calm"],
+    ["신제품", "출시", "런칭", "인지", "신상", "launch", "awareness"],
+    ["구매", "판매", "전환", "구매유도", "purchase", "conversion"]
+  ];
+
+  function tokenize(str) {
+    if (!str) return [];
+    return str.toLowerCase().match(/[\w가-힣]+/g) || [];
+  }
+
+  function runBM25Search(brief) {
+    const rawQuery = [brief.product, brief.target, brief.purpose, brief.selling_point].filter(Boolean).join(" ");
+    const queryTokens = new Set(tokenize(rawQuery));
+
+    ALIASES.forEach(group => {
+      if (group.some(term => rawQuery.toLowerCase().includes(term))) {
+        group.forEach(t => queryTokens.add(t));
+      }
+    });
+
+    const docs = rawAnalysis.filter(a => {
+      if (brief.country === "true" && a.korean !== true) return false;
+      if (brief.country === "false" && a.korean !== false) return false;
+      return true;
+    });
+
+    if (!docs.length) return [];
+
+    const docCounters = docs.map(d => {
+      const docText = [
+        d.summary, d.hook, d.body, d.content_type,
+        ...(d.appeals || []), ...(d.ages || []), ...(d.genders || [])
+      ].join(" ");
+      const counts = {};
+      tokenize(docText).forEach(t => counts[t] = (counts[t] || 0) + 1);
+      return counts;
+    });
+
+    const docFreq = {};
+    queryTokens.forEach(t => {
+      docFreq[t] = docCounters.filter(c => c[t]).length;
+    });
+
+    const avgLen = docCounters.reduce((a, c) => a + Object.values(c).reduce((x, y) => x + y, 0), 0) / docs.length || 1;
+
+    const scored = docs.map((doc, i) => {
+      const counter = docCounters[i];
+      const length = Object.values(counter).reduce((x, y) => x + y, 0);
+      let score = 0;
+      const matched = [];
+
+      queryTokens.forEach(t => {
+        if (counter[t]) {
+          matched.push(t);
+          const tf = counter[t];
+          const df = docFreq[t] || 0;
+          const idf = Math.log(1 + (docs.length - df + 0.5) / (df + 0.5));
+          score += idf * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * (length / avgLen)));
+        }
+      });
+
+      if (brief.follower_count && doc.follower_count) {
+        const ratio = Math.min(brief.follower_count, doc.follower_count) / Math.max(brief.follower_count, doc.follower_count);
+        score *= (0.8 + 0.2 * ratio);
+      }
+
+      return { doc, score: Math.round(score * 100) / 100, matched };
+    });
+
+    return scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score).slice(0, 6);
+  }
+
+  $("search").addEventListener("click", () => {
+    const brief = {
+      product: $("product").value.trim(),
+      target: $("target").value.trim(),
+      purpose: $("purpose").value.trim(),
+      selling_point: $("selling_point").value.trim(),
+      constraints: $("production_constraints").value.trim(),
+      follower_count: parseInt($("follower_count").value) || null,
+      country: $("reference-country").value
+    };
+
+    if (!brief.product || !brief.target || !brief.purpose) {
+      alert("제품, 타겟, 목적을 입력해주세요.");
+      return;
+    }
+
+    const results = runBM25Search(brief);
+    $("reference-count").textContent = `${results.length}개 선출`;
+    const refContainer = $("references");
+    refContainer.innerHTML = "";
+
+    if (!results.length) {
+      refContainer.innerHTML = `<p class="rec-empty-small">일치하는 추천 사례를 찾지 못했습니다. 검색어를 더 넓혀보세요.</p>`;
+      return;
+    }
+
+    results.forEach((res, idx) => {
+      const div = document.createElement("div");
+      div.className = "rec-reference";
+      const badgeId = `R${idx + 1}`;
+      div.innerHTML = `
+        <div class="rec-reference-top">
+          <span class="rec-ref-id">${badgeId}</span>
+          <a href="${res.doc.url}" target="_blank">@${res.doc.username || res.doc.reel_id}</a>
+          <span class="badge info" style="margin-left:auto;">일치도: ${res.score}점</span>
+        </div>
+        <p>${res.doc.summary || ''}</p>
+        <details>
+          <summary>Hook · 소구점 · 지표 상세</summary>
+          <pre>Hook (${res.doc.hook_strength || '보통'}): ${res.doc.hook || '상세 없음'}
+소구점: ${(res.doc.appeals || []).join(', ')}
+조회수: ${compact.format(res.doc.view_count || 0)} · 좋아요: ${compact.format(res.doc.like_count || 0)}</pre>
+        </details>
+        <small>일치 키워드: ${res.matched.map(m => `#${m}`).join(' ')}</small>
+      `;
+      refContainer.appendChild(div);
+    });
+
+    // Brief summary in output panel
+    const bSum = $("brief-summary");
+    bSum.hidden = false;
+    bSum.innerHTML = `<strong>브리프:</strong> ${brief.product} · ${brief.target} · ${brief.purpose} ${brief.follower_count ? `· 내 팔로워 ${number.format(brief.follower_count)}` : ''}`;
+  });
+
+  $("example").addEventListener("click", () => {
+    $("product").value = "핸드메이드 캐시미어 울 하프 코트";
+    $("target").value = "20~30대 여성 출근룩 및 감성 데이트룩";
+    $("purpose").value = "초겨울 룩북 코디 3가지 제안 및 구매 전환";
+    $("selling_point").value = "가볍고 부드러운 이중 울 소재, 슬랙스·원피스 모두 어울리는 핏";
+    $("production_constraints").value = "전신 거울 셀카, 1인 촬영, 빠른 컷 전환";
+    $("follower_count").value = "15000";
+    $("reference-country").value = "true";
+    $("search").click();
+  });
+
+  // Populate Video Plans Selector
+  const planSelect = $("plan-select");
+  rawPlans.forEach((plan, i) => {
+    const opt = document.createElement("option");
+    opt.value = i;
+    opt.textContent = `[기획안 ${i + 1}] ${plan.title || '영상 기획안'} (${plan.duration_seconds || 15}초)`;
+    planSelect.appendChild(opt);
+  });
+
+  function renderActivePlan(plan) {
+    if (!plan) return;
+    const planArticle = $("plan");
+    planArticle.innerHTML = `
+      <h3 class="rec-concept">${plan.title || '영상 기획안'}</h3>
+      <div class="rec-plan-section">
+        <h3>기획 핵심 차별화 포인트 (Features)</h3>
+        <ul>${(plan.features || []).map(f => `<li>${f}</li>`).join('')}</ul>
+      </div>
+      <div class="rec-plan-section">
+        <h3>장면별 연출 가이드 & 대본 (Storyboard · ${plan.duration_seconds || 15}초)</h3>
+        <table class="plan-scene-table">
+          <thead>
+            <tr>
+              <th style="width:70px;">시간</th>
+              <th style="width:110px;">샷 / 카메라</th>
+              <th>액션 & 연출 가이드</th>
+              <th>대사 / 내레이션</th>
+              <th style="width:140px;">자막 (Caption)</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${(plan.scenes || []).map((s, idx) => `
+              <tr>
+                <td style="font-weight:600; white-space:nowrap;">${s.start_second}s~${s.end_second}s</td>
+                <td>
+                  <span class="pill-badge pill-primary">${s.shot || '샷'}</span><br>
+                  <small style="color:var(--muted);">${s.camera || (s.framing ? s.framing.shot_size : '')}</small>
+                </td>
+                <td style="line-height:1.5;">${s.action || '—'}</td>
+                <td style="color:var(--warning); font-style:italic;">"${s.dialogue || '—'}"</td>
+                <td style="font-weight:600; color:var(--primary);">${s.caption || '—'}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  planSelect.addEventListener("change", () => {
+    const idx = parseInt(planSelect.value);
+    renderActivePlan(rawPlans[idx]);
+  });
+  if (rawPlans.length) renderActivePlan(rawPlans[0]);
+
+  $("copy-plan-btn").addEventListener("click", () => {
+    const idx = parseInt(planSelect.value);
+    const plan = rawPlans[idx];
+    if (!plan) return;
+
+    let text = `[영상 기획안] ${plan.title}\n길이: ${plan.duration_seconds}초\n\n[차별화 포인트]\n`;
+    (plan.features || []).forEach(f => text += `- ${f}\n`);
+    text += `\n[장면별 연출 및 대본]\n`;
+    (plan.scenes || []).forEach((s, i) => {
+      text += `씬 ${i+1} (${s.start_second}s~${s.end_second}s) [${s.shot || '샷'}]\n- 연출: ${s.action || ''}\n- 대본: ${s.dialogue || ''}\n- 자막: ${s.caption || ''}\n\n`;
+    });
+
+    navigator.clipboard.writeText(text).then(() => {
+      alert("기획안과 대본 텍스트가 클립보드에 복사되었습니다!");
+    }).catch(() => {
+      prompt("아래 텍스트를 복사하세요:", text);
+    });
+  });
+
+  // Cached vs Library Sub-Tabs
+  $("rec-cached-tab").addEventListener("click", () => {
+    $("rec-cached-tab").setAttribute("aria-selected", "true");
+    $("rec-library-tab").setAttribute("aria-selected", "false");
+    $("rec-cached-panel").hidden = false;
+    $("rec-library-panel").hidden = true;
+  });
+  $("rec-library-tab").addEventListener("click", () => {
+    $("rec-library-tab").setAttribute("aria-selected", "true");
+    $("rec-cached-tab").setAttribute("aria-selected", "false");
+    $("rec-library-panel").hidden = false;
+    $("rec-cached-panel").hidden = true;
+  });
+
+  window.scrollCachedVideo = function(idx) {
+    const card = $("dash-guide-video-" + idx);
+    if (card) {
+      card.open = true;
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  };
+
+  const cachedVids = window.__CACHED_VIDEOS__ || [];
+  if ($("copy-cached-scripts-btn")) {
+    $("copy-cached-scripts-btn").addEventListener("click", () => {
+      let fullText = "=== [Collector Monitor] 20대 남성 아우터 영상 기획 대본집 ===\n\n";
+      cachedVids.forEach(v => {
+        fullText += `[영상 ${v.index}] ${v.title} (${v.duration_seconds}초)\n`;
+        (v.scenes || []).forEach((s, i) => {
+          fullText += `  #${i+1} (${s.start_second}~${s.end_second}초) [${s.shot || ''} / ${s.camera || ''}]\n`;
+          fullText += `    - 연출: ${s.action || ''}\n`;
+          fullText += `    - 대본: ${s.dialogue || ''}\n`;
+          fullText += `    - 자막: ${s.caption || ''}\n`;
+        });
+        fullText += "\n";
+      });
+      navigator.clipboard.writeText(fullText).then(() => alert("전체 6종 영상 대본이 클립보드에 복사되었습니다!"));
+    });
+  }
+
+  if ($("download-cached-json-btn")) {
+    $("download-cached-json-btn").addEventListener("click", () => {
+      const blob = new Blob([JSON.stringify(cachedVids, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "cached_video_recommendations.json";
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+  }
+
+  // ========================================================
+  // VIEW 5: Reel Insights Setup
+  // ========================================================
+  function renderInsights() {
+    const hookData = {"텍스트 훅": 89, "동작 훅": 63, "상품 선노출": 47, "상황·공감": 45, "호기심·반전": 25, "비포·애프터": 6};
+    const sceneData = {"전신 착장": 202, "제품 클로즈업": 134, "거울 셀카": 74, "토킹헤드": 35, "플랫레이": 27, "POV": 18};
+    const movementData = {"정적 포즈": 196, "손동작": 171, "착장 전환": 97, "걷기": 94, "카메라 이동": 72, "제품 조작": 67};
+
+    function drawGauge(containerId, data) {
+      const c = $(containerId);
+      c.innerHTML = "";
+      const max = Math.max(...Object.values(data));
+      Object.entries(data).forEach(([lbl, val]) => {
+        const pct = (val / max * 100).toFixed(1);
+        const div = document.createElement("div");
+        div.className = "analysis-bar";
+        div.innerHTML = `
+          <div class="analysis-bar-label"><span>${lbl}</span><strong>${val}건 (${pct}%)</strong></div>
+          <div class="analysis-track"><span class="analysis-fill" style="width:${pct}%;"></span></div>
+        `;
+        c.appendChild(div);
+      });
+    }
+
+    drawGauge("insight-hook-bars", hookData);
+    drawGauge("insight-scene-bars", sceneData);
+    drawGauge("insight-movement-bars", movementData);
+  }
+
+  // Initial Boot
+  switchView("view-visualize");
+
+})();
+  </script>
+</body>
+</html>

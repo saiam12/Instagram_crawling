@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -30,6 +31,7 @@ sys.path.insert(0, str(COLLECTORS))
 from visualization_data import MAX_UPLOAD_BYTES, read_visualization_file
 from recommendations import DATASET_FILE, Recommendations
 from analysis_data import read_analysis
+from cohort_comparison import SOURCE as COHORT_SOURCE, comparison_snapshot
 
 VISUALIZATION_SLOTS = threading.BoundedSemaphore(1)
 RECOMMENDATION_SEARCH_SLOTS = threading.BoundedSemaphore(1)
@@ -371,7 +373,7 @@ class Handler(BaseHTTPRequestHandler):
                         if not chunk: break
                         self.wfile.write(chunk); remaining -= len(chunk)
             elif parsed.path == "/api/analysis":
-                self.send(read_analysis(DATASET_FILE))
+                self.send(comparison_snapshot(BASE.parents[1] / COHORT_SOURCE) if query.get("comparison") == ["1"] else read_analysis(DATASET_FILE))
             elif parsed.path == "/api/recommendation/job":
                 query = parse_qs(parsed.query)
                 self.send(self.server.monitor.recommendations.job(query.get("id", [""])[0]))
@@ -407,11 +409,33 @@ class Handler(BaseHTTPRequestHandler):
                         rows = [row for row in rows if matches_round(row)]
                     if text:
                         rows = [row for row in rows if text in " ".join(str(row.get(key, "")) for key in ("username", "title", "hashtags", "url")).casefold()]
+                    date_from = query.get("date_from", [""])[0]
+                    date_to = query.get("date_to", [""])[0]
+                    if date_from or date_to:
+                        try:
+                            start = timestamp(f"{date.fromisoformat(date_from)}T00:00:00+09:00") if date_from else None
+                            end = timestamp(f"{date.fromisoformat(date_to)}T00:00:00+09:00") + 86400 if date_to else None
+                        except ValueError:
+                            raise ValueError("수집 날짜를 확인하세요.") from None
+                        if start is not None and end is not None and start >= end:
+                            raise ValueError("종료일은 시작일과 같거나 이후여야 합니다.")
+                        rows = [row for row in rows if (collected := timestamp(row.get("collected_at")))
+                                and (start is None or start <= collected)
+                                and (end is None or collected < end)]
+                    metric_fields = ("view_count", "like_count", "comment_count", "share_count", "repost_count", "saved_count")
+                    missing_counts = {field: sum(row.get(field) in (None, "") for row in rows) for field in metric_fields}
                     if category in {"available", "missing"}:
                         rows = [row for row in rows if bool(row["android_available"]) == (category == "available")]
+                    elif category in {"metrics-available", "metrics-missing"}:
+                        rows = [row for row in rows if all(row.get(field) not in (None, "") for field in metric_fields) == (category == "metrics-available")]
+                    elif category.startswith("missing-"):
+                        selected_fields = category[8:].split(",")
+                        if not selected_fields or any(field not in metric_fields for field in selected_fields):
+                            raise ValueError("누락 지표를 확인하세요.")
+                        rows = [row for row in rows if all(row.get(field) in (None, "") for field in selected_fields)]
                     pages = max(1, math.ceil(len(rows) / size))
                     page = min(pages, int(number(query.get("page", [1])[0], "페이지", 1, 1000000)))
-                    self.send({"items": rows[(page - 1) * size:page * size], "total": len(rows), "page": page, "pages": pages, "warning": selected["warning"]})
+                    self.send({"items": rows[(page - 1) * size:page * size], "total": len(rows), "page": page, "pages": pages, "missing_counts": missing_counts, "warning": selected["warning"]})
             elif parsed.path in {"/", "/index.html", "/app.js", "/theme.js", "/styles.css", "/visualize.html", "/visualize.js", "/visualize.css", "/recommend.html", "/recommend.js", "/recommend.css", "/analysis.html", "/analysis.js", "/analysis.css", "/workspace-cache.js", "/korean-filter.js", "/scatter.js", "/chart-board.js"}:
                 name = parsed.path.lstrip("/") or "index.html"
                 body = (BASE / "web" / name).read_bytes()

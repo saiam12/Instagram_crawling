@@ -69,6 +69,11 @@ browser_profile/
 /temp/
 /unused/
 /.superpowers/
+/collectors/scratch/
+
+# Generated standalone HTML snapshots
+/instagram_monitoring_dashboard.html
+/video_recommendation_cached.html
 
 # Legacy generated directories: keep restored old data out of Git
 /collectors/unused/

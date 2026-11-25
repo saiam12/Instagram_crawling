@@ -16,6 +16,7 @@ from android_health import AndroidHealth
 from classification import matches_korean
 from src.reels.korean_classification import apply_korean_overrides
 from src.reels.android_reel_metrics import android_result_matches_reel
+from src.reels.reel_store import open_csv_snapshot
 
 BASE = Path(__file__).resolve().parents[1]
 COLLECTORS = BASE.parent
@@ -296,7 +297,7 @@ class Snapshot:
         records = {}
         try:
             if history.exists():
-                with history.open(encoding="utf-8-sig", newline="") as stream:
+                with open_csv_snapshot(history, wait_seconds=3) as stream:
                     for row in csv.DictReader(stream):
                         if row.get("url") and timestamp(row.get("collected_at")) and None not in row and all(v is not None for v in row.values()):
                             records[(row["url"], row["collected_at"])] = row
@@ -450,6 +451,11 @@ class Snapshot:
         current = time.time()
         bucket_start = int(current // 300) * 300
         chart_times = [bucket_start - index * 300 for index in range(11, -1, -1)]
+        session_start = timestamp(scheduler.get("started_at"))
+        session_end = timestamp(scheduler.get("ends_at")) or current
+        session_new_count = len({row["url"] for row in rows
+                                 if str(row.get("collection_number")).strip() == "1"
+                                 and session_start <= timestamp(row.get("collected_at")) <= session_end}) if session_start else None
         round_counts = Counter()
         for row in rows:
             value = str(row.get("collection_number") or "").strip()
@@ -462,6 +468,7 @@ class Snapshot:
                 "refresh": refresh_summary(path) if dataset.get('source') == 'refresh' else None,
                 "rows": rows, "warning": warning, "logs": logs, "chart_times": chart_times,
                 "summary": {"unique": len({r.get('url') for r in rows}), "snapshots": len(rows),
+                            "session_new_count": session_new_count,
                             "rounds": [{"round": number or None, "count": round_counts[number]}
                                        for number in sorted(round_counts, key=lambda number: (number == 0, number))],
                             "last_hour": sum(timestamp(r.get("collected_at")) >= current - 3600 for r in rows),

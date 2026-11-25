@@ -64,7 +64,7 @@ class IndependentRecollectionTests(unittest.IsolatedAsyncioTestCase):
                 runtime = SimpleNamespace(page=page, browser=SimpleNamespace(close=AsyncMock()))
                 context = MagicMock()
                 # View-helper retries have their own suite; isolate metric-job ordering here.
-                with patch.object(browser, "create_collection_page", AsyncMock(return_value=page)), \
+                with patch.object(browser, "create_collection_page", AsyncMock(return_value=page)) as create_page, \
                      patch.object(browser, "create_background_follower_runtime", AsyncMock(return_value=runtime)), \
                      patch.object(browser, "request_web_follower_count", AsyncMock(side_effect=profile_lookup)), \
                      patch.object(browser, "read_profile_reel_view_counts", AsyncMock(return_value={})), \
@@ -77,6 +77,7 @@ class IndependentRecollectionTests(unittest.IsolatedAsyncioTestCase):
                         options, register_signal_handler=False, shared_context=context,
                         shared_playwright_runtime=SimpleNamespace(chromium=object()), enable_stop_input=False), 15)
                 self.assertEqual(result, 0)
+                create_page.assert_not_awaited()
                 launch.assert_called_once()
                 detail.assert_not_awaited()
                 _, rows = browser.read_csv_objects(csv_path)

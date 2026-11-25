@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 import shutil
 from pathlib import Path
@@ -47,10 +49,12 @@ def load_playwright() -> Callable[[], Any]:
     return async_playwright
 
 
-async def safe_close(value: Any) -> None:
+async def safe_close(value: Any, *, timeout: float = 10.0) -> None:
     if value is None:
         return
     try:
-        await value.close()
+        coro = value.close()
+        if asyncio.iscoroutine(coro) or inspect.isawaitable(coro):
+            await asyncio.wait_for(coro, timeout=timeout)
     except Exception:
         pass

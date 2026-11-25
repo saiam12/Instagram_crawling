@@ -38,6 +38,7 @@ PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 # 로컬 풀의 기본 추정치. model_limits.json이 있으면 해당 값을 사용합니다.
 DEFAULT_LIMITS = {
+    "gemini-3.5-flash-lite": {"rpm": 5, "rpd": 500},
     "gemini-3.6-flash": {"rpm": 5, "rpd": 20},
     "gemini-3.8-flash": {"rpm": 5, "rpd": 20},
 }

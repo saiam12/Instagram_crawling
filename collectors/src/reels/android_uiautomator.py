@@ -262,13 +262,6 @@ class PersistentAndroidUiDriver(AdbAndroidUiDriver):
             self.reset_ui_automation()
             raise AndroidMetricsError(f'UIAutomator returned an empty or unreadable screen. Persistent session: {error}') from error
 
-    def copy_current_reel_url(self):
-        self._reuse_xml_once = self._last_xml or None
-        try:
-            return super().copy_current_reel_url()
-        finally:
-            self._reuse_xml_once = None
-
     def _invalidate_snapshot(self):
         self._last_xml = ''
         self._reuse_xml_once = None

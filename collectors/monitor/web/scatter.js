@@ -38,8 +38,9 @@ window.CollectorScatter = (host, rows, xKey, yKey, xLabel, yLabel, identity, hig
   const plotHeight = height - top - 65;
   let maxX = Math.max(1, minX), maxY = Math.max(1, minY);
   for (const row of points) { maxX = Math.max(maxX, row[xKey]); maxY = Math.max(maxY, row[yKey]); }
-  const linearX = xKey === "duration" || xKey === "video_duration_seconds";
-  const linearY = yKey === "duration" || yKey === "video_duration_seconds";
+  const timeAxes = ["duration", "video_duration_seconds", "first_product_exposure_seconds", "first_appeal_seconds"];
+  const linearX = timeAxes.includes(xKey);
+  const linearY = timeAxes.includes(yKey);
   const transformX = value => linearX ? value : Math.log10(1 + value);
   const transformY = value => linearY ? value : Math.log10(1 + value);
   maxX = transformX(maxX) * 1.05; maxY = transformY(maxY) * 1.05;

@@ -45,6 +45,24 @@ class AndroidIdentityTests(unittest.TestCase):
 
 
 class ViewObservationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_locked_reel_history_does_not_abort_profile_view_lookup(self):
+        row = {"url": "https://www.instagram.com/reels/TARGET/", "collected_at": "2026-10-22T00:00:00Z",
+               "username": "creator", "view_count": ""}
+        flush = AsyncMock(side_effect=[PermissionError("CSV locked"), PermissionError("CSV locked")])
+        store = SimpleNamespace(rows=[row], lock=asyncio.Lock(), dirty=False, flush=flush)
+        enricher = browser.ProfileReelViewEnricher(store)
+        enricher.track(row)
+        profile = {"status": "success", "followerCount": 1234}
+        with patch.object(browser, "read_profile_account_country", AsyncMock(return_value="")), patch.object(
+            browser, "read_profile_reel_view_counts", AsyncMock(return_value={"TARGET": 100})
+        ):
+            await enricher(object(), {"username": "creator"}, profile)
+        self.assertEqual(profile["status"], "success")
+        self.assertEqual(row["follower_count"], 1234)
+        self.assertEqual(row["view_count"], 100)
+        self.assertTrue(store.dirty)
+        self.assertEqual(flush.await_count, 2)
+
     async def test_later_snapshot_prevents_retroactive_profile_fill(self):
         first = {'url':'https://www.instagram.com/reels/TARGET/', 'collected_at':'2026-10-22T00:00:00Z', 'username':'creator', 'view_count':''}
         second = {**first, 'collected_at':'2026-10-22T04:00:00Z'}
@@ -70,18 +88,22 @@ class ViewObservationTests(unittest.IsolatedAsyncioTestCase):
 
     def test_completed_jobs_require_observed_identity_and_reject_late_old_views(self):
         from src.reels.reel_store import write_csv_records
-        for verified, kind in ((False, ''), (True, ''), (True, 'profile_view_count')):
+        for verified, kind in ((False, ''), (True, ''), (True, 'profile_view_count'), ('preview', '')):
             with self.subTest(verified=verified, kind=kind), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 paths = browser._android_metric_queue_paths(root)
                 paths['completed'].mkdir(parents=True)
                 first = {'url':'https://www.instagram.com/reels/TARGET/', 'collected_at':'2026-10-22T00:00:00Z', 'username':'creator', 'view_count':'', 'share_count':''}
                 second = {**first, 'collected_at':'2026-10-22T04:00:00Z'}
+                first['title'] = second['title'] = 'Winter outfit with a long caption'
+                other_reel = {**first, 'url':'https://www.instagram.com/reels/OTHER/'}
                 history = root/'.collector/reels_history_active.csv'
-                write_csv_records(history, [first,second], list(first))
+                write_csv_records(history, [first,second,other_reel], list(first))
                 job = {'target':{'url':first['url'], 'collected_at':first['collected_at']}, 'completed_at':'2026-10-22T08:00:00Z',
                        'kind':kind, 'status':'collected', 'metrics': {'view_count':100} if kind else {'share_count':50}}
-                if verified:
+                if verified == 'preview':
+                    job.update(observed_caption='Winter outfit …', observed_username='creator')
+                elif verified:
                     job.update(observed_reel_url=first['url'], observed_username='creator')
                 (paths['completed']/'job.json').write_text(json.dumps(job),encoding='utf-8')
                 outcome = browser.apply_completed_android_metric_jobs(root, export_outputs=False)
@@ -89,5 +111,6 @@ class ViewObservationTests(unittest.IsolatedAsyncioTestCase):
                 _, rows = browser.read_csv_objects(history)
                 self.assertEqual(rows[0]['view_count'], '')
                 self.assertEqual(rows[0]['share_count'], '50' if verified and not kind else '')
+                self.assertEqual(rows[2]['share_count'], '')
                 if not verified:
                     self.assertTrue((paths['root']/'identity_unverified/job.json').exists())

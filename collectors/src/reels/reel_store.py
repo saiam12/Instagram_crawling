@@ -3,15 +3,31 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .reel_records import CSV_FIELDS, REEL_METRIC_CHANGE_FIELDS, parse_snapshot_field
+from .collection_settings import REEL_HISTORY_FILENAME
+
+
+@contextmanager
+def open_csv_snapshot(path: Path, *, wait_seconds: float = 30.0):
+    """Read active history from a snapshot without holding the writer lock."""
+    if os.name != "nt" or path.name != REEL_HISTORY_FILENAME or path.parent.name != ".collector":
+        with path.open("r", newline="", encoding="utf-8-sig") as stream:
+            yield stream
+        return
+    with path.open("r", newline="", encoding="utf-8-sig") as file:
+        contents = file.read()
+    with io.StringIO(contents, newline="") as stream:
+        yield stream
 
 
 def replace_file_with_retry(source: Path, destination: Path, attempts: int = 8) -> None:

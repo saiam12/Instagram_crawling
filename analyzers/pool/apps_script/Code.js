@@ -2,12 +2,13 @@
 // API 키는 동기화 요청에서만 받아 스크립트 속성에 저장한다. 시트 셀에는 기록하지 않는다.
 const SHEET_ID = '1g9sq7tuoiz-WE1OZNbN48M_KA0FY7MXgssE1_ev_-O8';
 const FIRST_ROW = 6;
-const LOG_WIDTH = 17;
+const LOG_WIDTH = 14;
+const REQUEST_HEADERS = ['요청 ID', '사용자', '키 별칭', '모델', '집계일(KST)', '요청 시각(KST)', '완료/갱신 시각(KST)', '처리 상태', '입력 토큰', '출력 토큰', '총 토큰', '오류 코드', '제한 종류', '후보 선택 전 잔여량'];
 const BUSY = new Set(['후보 예약', '사용중']);
 const COUNTED = new Set(['사용중', '성공', '실패', '결과 미확인']);
 const RESERVATION_LEASE_MS = 10 * 60 * 1000;
-const POOL_MODELS = new Set(['gemini-3.6-flash', 'gemini-3.8-flash', 'antigravity-preview-09-2026', 'gemini-embedding-2']);
-const POOL_DAILY_LIMITS = {'gemini-3.6-flash': 20, 'gemini-3.8-flash': 20, 'gemini-embedding-2': 1000, 'antigravity-preview-09-2026': 100};
+const POOL_MODELS = new Set(['gemini-3.5-flash-lite', 'gemini-3.6-flash', 'gemini-3.8-flash', 'antigravity-preview-09-2026', 'gemini-embedding-2']);
+const POOL_DAILY_LIMITS = {'gemini-3.5-flash-lite': 500, 'gemini-3.6-flash': 20, 'gemini-3.8-flash': 20, 'gemini-embedding-2': 1000, 'antigravity-preview-09-2026': 100};
 const DISABLED_MODELS = new Set(['gemini-3.5-flash', 'gemini-3.7-flash']);
 const SETTINGS_HEADERS = ['키 별칭', '담당자', '모델', 'RPM 한도', 'RPD 한도',
   '사용 여부', '비고', '초기 집계일', '초기 사용량'];
@@ -17,6 +18,55 @@ function dayAt(now) {
 }
 function timeAt(now) {
   return Utilities.formatDate(new Date(now), 'Asia/Seoul', 'HH:mm:ss');
+}
+function timestampMillis(value) {
+  return value instanceof Date ? value.getTime() : (Date.parse(value) || 0);
+}
+function formatRequestTimes(book, sheet) {
+  book.setSpreadsheetTimeZone('Asia/Seoul');
+  const count = sheet.getLastRow() - FIRST_ROW + 1;
+  if (count > 0) {
+    const range = sheet.getRange(FIRST_ROW, 6, count, 2);
+    const values = range.getValues().map(row => row.map(value =>
+      typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value))
+        ? new Date(value) : value));
+    range.setValues(values);
+  }
+  sheet.getRange('F6:G').setNumberFormat('HH:mm:ss');
+  sheet.getRange('F5:G5').setValues([['요청 시각(KST)', '완료/갱신 시각(KST)']]);
+}
+function retryNote(existing, retryAt) {
+  const text = String(existing || '').split('\n').filter(line => !line.startsWith('KEY_POOL_RETRY_AT:')).join('\n');
+  return text + (retryAt ? (text ? '\n' : '') + 'KEY_POOL_RETRY_AT:' + retryAt : '');
+}
+function migrateRequestSchema(sheet) {
+  const headers = () => sheet.getRange(5, 1, 1, Math.min(17, sheet.getMaxColumns())).getDisplayValues()[0];
+  const find = prefix => headers().findIndex(value => String(value).startsWith(prefix)) + 1;
+  if (find('모델') !== 4 && find('프로젝트 별칭') === 0) throw new Error('요청 기록 열 구성을 확인하세요.');
+  let changed = false;
+  const projectColumn = find('프로젝트 별칭');
+  if (projectColumn) { sheet.deleteColumn(projectColumn); changed = true; }
+  const dayColumn = find('집계일');
+  if (!dayColumn) throw new Error('집계일 열이 없습니다.');
+  if (dayColumn !== 5) { sheet.moveColumns(sheet.getRange(1, dayColumn, sheet.getMaxRows(), 1), 5); changed = true; }
+  const retryColumn = find('재시도 가능');
+  if (retryColumn) {
+    const count = sheet.getLastRow() - FIRST_ROW + 1;
+    if (count > 0) {
+      const deadlines = sheet.getRange(FIRST_ROW, retryColumn, count, 1).getValues();
+      const limitRange = sheet.getRange(FIRST_ROW, find('제한 종류'), count, 1);
+      limitRange.setNotes(limitRange.getNotes().map((row, i) => [retryNote(row[0], deadlines[i][0])]));
+    }
+    sheet.deleteColumn(retryColumn); changed = true;
+  }
+  const countColumn = find('후보 선택 전 요청 수');
+  if (countColumn) { sheet.deleteColumn(countColumn); changed = true; }
+  if (changed) {
+    sheet.getRange(5, 1, 1, LOG_WIDTH).setValues([REQUEST_HEADERS]);
+    sheet.getRange('E6:E').setNumberFormat('yyyy-mm-dd');
+    SpreadsheetApp.flush();
+  }
+  return changed;
 }
 function groupKey(project, model) { return JSON.stringify([project, model]); }
 function clean(value) {
@@ -29,10 +79,12 @@ function readRows(sheet, width) {
   if (count <= 0) return [];
   const range = sheet.getRange(FIRST_ROW, 1, count, width);
   const rows = range.getValues();
-  // 요청 기록의 집계일은 시트 시간대에서 보이는 날짜 문자열을 기준으로 삼는다.
-  if (width >= 15) {
-    const displayed = range.getDisplayValues();
-    rows.forEach((row, i) => { if (row[14] instanceof Date) row[14] = displayed[i][14]; });
+  if (width === LOG_WIDTH) {
+    const displayed = range.getDisplayValues(), notes = range.getNotes();
+    rows.forEach((row, i) => {
+      if (row[4] instanceof Date) row[4] = displayed[i][4];
+      row.retryAt = (notes[i][12].match(/KEY_POOL_RETRY_AT:([^\n]+)/) || [])[1] || '';
+    });
   }
   return rows;
 }
@@ -58,7 +110,7 @@ function settingsFrom(rows) {
     if (r[5] !== '사용') return;
     const [label, , model, rpm, rpd] = r, project = label;
     if (DISABLED_MODELS.has(model)) return;
-    if (!POOL_MODELS.has(model)) throw new Error('3.6/3.8 Flash 및 Antigravity 가이드만 사용 가능합니다. 3.5/3.7 및 Lite는 제외하세요.');
+    if (!POOL_MODELS.has(model)) throw new Error('3.5 Flash Lite, 3.6/3.8 Flash, Antigravity 가이드 및 Embedding 2만 사용 가능합니다.');
     if (![label, model].every(v => typeof v === 'string' && v.trim()) ||
         !Number.isInteger(rpm) || rpm < 0 || !Number.isInteger(rpd) || rpd < 0)
       throw new Error('사용 설정 행에는 별칭/모델과 정수 RPM/RPD를 입력하세요.');
@@ -77,20 +129,20 @@ function settingsFrom(rows) {
 }
 function statsFor(c, logs, now) {
   const day = dayAt(now);
-  const rows = logs.filter(r => r[2] === c.project && r[4] === c.model);
+  const rows = logs.filter(r => r[2] === c.project && r[3] === c.model);
   const active = rows.filter(r => BUSY.has(r[7]) &&
-    (Date.parse(r[6]) || Date.parse(r[5]) || 0) > now - RESERVATION_LEASE_MS);
+    (timestampMillis(r[6]) || timestampMillis(r[5])) > now - RESERVATION_LEASE_MS);
   // Sheets가 YYYY-MM-DD 문자열을 Date로 자동 변환해도 같은 한국 날짜로 집계한다.
-  const today = rows.filter(r => (r[14] instanceof Date ? dayAt(r[14]) : String(r[14])) === day);
+  const today = rows.filter(r => (r[4] instanceof Date ? dayAt(r[4]) : String(r[4])) === day);
   return {
     count: today.filter(r => COUNTED.has(r[7])).length + (c.baselineDay === day ? c.baseline : 0),
     // 날짜가 바뀌어도 실제 진행 중인 분석은 계속 사용중이다.
     busy: active.length > 0,
     users: [...new Set(active.map(r => String(r[1] || '')).filter(Boolean))],
     daily: today.some(r => r[12] === '일일'),
-    retry: Math.max(0, ...rows.map(r => Date.parse(r[13]) || 0)),
-    lastUsed: Math.max(0, ...rows.filter(r => COUNTED.has(r[7])).map(r => Date.parse(r[5]) || 0)),
-    rpm: rows.filter(r => COUNTED.has(r[7]) && Date.parse(r[5]) > now - 60000).length,
+    retry: Math.max(0, ...rows.map(r => timestampMillis(r.retryAt))),
+    lastUsed: Math.max(0, ...rows.filter(r => COUNTED.has(r[7])).map(r => timestampMillis(r[5]))),
+    rpm: rows.filter(r => COUNTED.has(r[7]) && timestampMillis(r[5]) > now - 60000).length,
   };
 }
 function sampleCandidates(config, logs, offered, now, random) {
@@ -109,8 +161,8 @@ function sampleCandidates(config, logs, offered, now, random) {
 }
 function selectRows(rows) {
   // 잔여량이 많은 후보를 고르고, 동률이면 높은 Flash 모델을 쓴다.
-  const modelVersion = row => Number(String(row[4]).match(/^gemini-(\d+(?:\.\d+)?)-flash$/)?.[1] || 0);
-  const remaining = row => row[16] === '' || row[16] == null ? -Number(row[15]) : Number(row[16]);
+  const modelVersion = row => Number(String(row[3]).match(/^gemini-(\d+(?:\.\d+)?)-flash$/)?.[1] || 0);
+  const remaining = row => Number(row[13]);
   const winner = rows.reduce((a, b) => remaining(a) > remaining(b) ||
     (remaining(a) === remaining(b) && modelVersion(a) >= modelVersion(b)) ? a : b);
   rows.forEach(r => { r[7] = r === winner ? '사용중' : '선택 해제'; });
@@ -121,8 +173,8 @@ function replyFrom(rows) {
   if (!winner) throw new Error('이미 종료된 예약입니다. 새 요청 ID가 필요합니다.');
   return {
     ok: true,
-    selected: {request_id: winner[0], key_label: winner[3], model: winner[4], project: winner[2]},
-    sampled: rows.map(r => ({key_label: r[3], model: r[4], day_count: r[15], remaining: r[16]})),
+    selected: {request_id: winner[0], key_label: winner[2], model: winner[3], project: winner[2]},
+    sampled: rows.map(r => ({key_label: r[2], model: r[3], remaining: r[13]})),
   };
 }
 function acquire(sheet, config, logs, body, now) {
@@ -150,9 +202,9 @@ function acquire(sheet, config, logs, body, now) {
     return {ok: true, selected: null, terminal,
       reason: '사용 가능한 조합 없음: 별칭/모델 설정, 일일 한도, 사용중 예약 및 대기 시간을 확인하세요.'};
   }
-  const iso = new Date(now).toISOString();
-  const rows = sample.map((c, i) => [body.request_id + ':' + i, clean(body.user), c.project,
-    c.key_label, c.model, iso, iso, '후보 예약', '', '', '', '', '', '', dayAt(now), c.day_count, c.remaining]);
+  const requestedAt = new Date(now);
+  const rows = sample.map((c, i) => [body.request_id + ':' + i, clean(body.user),
+    c.key_label, c.model, dayAt(now), requestedAt, requestedAt, '후보 예약', '', '', '', '', '', c.remaining]);
   const range = sheet.getRange(FIRST_ROW + logs.length, 1, rows.length, LOG_WIDTH);
   range.setValues(rows); // 두 후보를 한 번의 쓰기로 함께 예약
   SpreadsheetApp.flush();
@@ -168,7 +220,7 @@ function finish(sheet, logs, body, now) {
   if (['성공', '실패', '결과 미확인'].includes(row[7])) return {ok: true};
   if (row[7] !== '사용중') throw new Error('선택된 예약만 종료할 수 있습니다.');
   if (!['성공', '실패', '결과 미확인'].includes(body.status)) throw new Error('처리 상태가 올바르지 않습니다.');
-  row[7] = body.status; row[6] = new Date(now).toISOString();
+  row[7] = body.status; row[6] = new Date(now);
   ['input_tokens', 'output_tokens', 'total_tokens'].forEach((name, i) => {
     const n = body[name];
     if (n != null && (!Number.isInteger(n) || n < 0)) throw new Error('토큰 수가 올바르지 않습니다.');
@@ -176,8 +228,9 @@ function finish(sheet, logs, body, now) {
   });
   row[11] = Number.isInteger(body.error_code) ? body.error_code : '';
   row[12] = ['일일', '일시'].includes(body.limit) ? body.limit : '없음';
-  row[13] = row[12] === '일시' ? new Date(now + Math.max(1, Math.min(86400, Number(body.retry_seconds) || 60)) * 1000).toISOString() : '';
+  row.retryAt = row[12] === '일시' ? new Date(now + Math.max(1, Math.min(86400, Number(body.retry_seconds) || 60)) * 1000).toISOString() : '';
   sheet.getRange(FIRST_ROW + index, 1, 1, LOG_WIDTH).setValues([row]);
+  sheet.getRange(FIRST_ROW + index, 13).setNote(retryNote(sheet.getRange(FIRST_ROW + index, 13).getNote(), row.retryAt));
   SpreadsheetApp.flush();
   return {ok: true};
 }
@@ -186,7 +239,7 @@ function heartbeat(sheet, logs, body, now) {
   if (index < 0) throw new Error('heartbeat 요청 ID 또는 예약 소유자를 확인하세요.');
   const row = logs[index];
   if (!BUSY.has(row[7])) return {ok: true};
-  row[6] = new Date(now).toISOString();
+  row[6] = new Date(now);
   sheet.getRange(FIRST_ROW + index, 1, 1, LOG_WIDTH).setValues([row]);
   SpreadsheetApp.flush();
   return {ok: true};
@@ -244,7 +297,7 @@ function mergeSharedKeys(stored, submitted, user, now) {
   return {keys: [...byLabel.values()], vault_added, vault_updated, owner_renamed};
 }
 function arrangePoolRows(rows, modelColumn, labelColumn, width) {
-  const group = row => row[modelColumn] === 'antigravity-preview-09-2026' ? 1 : row[modelColumn] === 'gemini-embedding-2' ? 2 : /^gemini-3\.[68]-flash$/.test(row[modelColumn]) ? 0 : 3;
+  const group = row => /^gemini-3\.[68]-flash$/.test(row[modelColumn]) ? 0 : row[modelColumn] === 'gemini-3.5-flash-lite' ? 1 : row[modelColumn] === 'antigravity-preview-09-2026' ? 2 : row[modelColumn] === 'gemini-embedding-2' ? 3 : 4;
   const sorted = rows.filter(row => row.some(value => value !== '')).slice().sort((a,b) =>
     group(a)-group(b) || String(a[labelColumn]).localeCompare(String(b[labelColumn]),'en',{numeric:true}) || String(a[modelColumn]).localeCompare(String(b[modelColumn])));
   const result = [];
@@ -302,20 +355,6 @@ function syncSettings(sheet, rows, sharedKeys) {
   SpreadsheetApp.flush();
   return {ok: true, added, updated, enabled, stopped};
 }
-function syncLogProjects(sheet, rows, sharedKeys) {
-  const labels = new Set(sharedKeys.map(item => item.key_label));
-  let updated = 0;
-  rows.forEach(row => {
-    const label = String(row[3] || '');
-    if (labels.has(label) && row[2] !== label) {
-      row[2] = label;
-      updated++;
-    }
-  });
-  if (updated) sheet.getRange(FIRST_ROW, 1, rows.length, LOG_WIDTH).setValues(rows);
-  SpreadsheetApp.flush();
-  return updated;
-}
 function refreshOverview(book, config, logs, now) {
   const sheet = book.getSheetByName('사용 현황');
   if (!sheet) return;
@@ -357,6 +396,7 @@ function doPost(e) {
     const settings = book.getSheetByName('프로젝트 설정'), log = book.getSheetByName('요청 기록');
     if (!settings || !log) throw new Error('설정/요청 기록 탭을 확인하세요.');
     migrateSettingsSchema(settings);
+    migrateRequestSchema(log);
     const logs = readRows(log, LOG_WIDTH), now = Date.now();
     // 설정 오류가 생겨도 이미 진행 중인 예약은 해제할 수 있어야 한다.
     if (body.action === 'finish') result = finish(log, logs, body, now);
@@ -368,7 +408,8 @@ function doPost(e) {
       const merged = mergeSharedKeys(stored, body.keys, body.user, now);
       properties.setProperty('GEMINI_SHARED_KEYS', JSON.stringify(merged.keys));
       result = syncSettings(settings, readRows(settings, 9), merged.keys);
-      result.log_updated = syncLogProjects(log, logs, merged.keys);
+      result.log_updated = 0;
+      formatRequestTimes(book, log);
       result.vault_added = merged.vault_added;
       result.vault_updated = merged.vault_updated;
       result.owner_renamed = merged.owner_renamed;
@@ -384,8 +425,7 @@ function doPost(e) {
     try {
       const config = settingsFrom(readRows(settings, 9));
       result.rows = refreshOverview(book, config, readRows(log, LOG_WIDTH), now);
-      log.getRange('P5').setValue('후보 선택 전 요청 수');
-      log.getRange('Q5').setValue('후보 선택 전 잔여량');
+      log.getRange('N5').setValue('후보 선택 전 잔여량');
     } catch (_) { result.overview_pending = true; }
   } catch (err) {
     result = {ok: false, error: String(err.message)};
@@ -401,12 +441,12 @@ function removeRetiredModelRecords() {
   lock.waitLock(30000);
   try {
     const book = SpreadsheetApp.openById(SHEET_ID), report = {};
-    const targets = [['프로젝트 설정', 9, 2], ['사용 현황', 10, 2], ['요청 기록', LOG_WIDTH, 4]];
+    const targets = [['프로젝트 설정', 9, 2], ['사용 현황', 10, 2], ['요청 기록', LOG_WIDTH, 3]];
     const plans = targets.map(([name, width, modelColumn]) => {
       const sheet = book.getSheetByName(name), rows = readRows(sheet, width);
       const indices = rows.flatMap((row, i) => DISABLED_MODELS.has(row[modelColumn]) ? [i] : []);
       if (name === '요청 기록' && indices.some(i => BUSY.has(rows[i][7]) &&
-          Date.parse(rows[i][6] || rows[i][5]) > Date.now() - RESERVATION_LEASE_MS))
+          timestampMillis(rows[i][6] || rows[i][5]) > Date.now() - RESERVATION_LEASE_MS))
         throw new Error('종료되지 않은 구형 모델 예약이 있습니다. 실행 종료 후 정리하세요.');
       return {name, sheet, indices};
     });
@@ -427,5 +467,5 @@ function removeRetiredModelRecords() {
 // Node의 모의 시트 테스트에서만 사용. Apps Script에서는 실행되지 않는다.
 if (typeof module !== 'undefined') module.exports = {
   dayAt, timeAt, readRows, migrateSettingsSchema, settingsFrom, statsFor, sampleCandidates, selectRows, acquire, finish, heartbeat,
-  mergeSharedKeys, syncSettings, syncLogProjects, refreshOverview, doPost, removeRetiredModelRecords,
+  mergeSharedKeys, syncSettings, refreshOverview, doPost, removeRetiredModelRecords, formatRequestTimes, migrateRequestSchema,
 };

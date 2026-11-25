@@ -9,6 +9,34 @@ from analysis_data import read_analysis
 
 
 class ScatterDataTests(unittest.TestCase):
+    def test_projects_first_exposure_and_earliest_appeal_without_inventing_legacy_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reel_analysis.json"
+            path.write_text(json.dumps([
+                {"reel_id": "MODERN", "analysis": {
+                    "hook": {"hook_type": "상품 선노출"},
+                    "product": {"exists": True, "first_exposure": {
+                        "start_second": 0, "visual_evidence": "첫 프레임의 재킷",
+                    }},
+                    "marketing_analysis": {"selling_points": [
+                        {"start_second": 4}, {"start_second": None}, {"start_second": 1.5},
+                    ]},
+                    "scene_details": [{"layout_type": "product_shot", "on_screen_text": "재킷"}],
+                }},
+                {"reel_id": "LEGACY", "analysis": {"product": {"exists": True}}},
+                {"reel_id": "ABSENT", "analysis": {"product": {"exists": False}}},
+            ]), encoding="utf-8")
+            rows = {row["reel_id"]: row for row in read_analysis(path)["rows"]}
+            modern = rows["MODERN"]
+            self.assertEqual(modern["hook_type"], "상품 선노출")
+            self.assertEqual(modern["first_product_exposure_seconds"], 0)
+            self.assertEqual(modern["first_product_exposure_evidence"], "첫 프레임의 재킷")
+            self.assertEqual(modern["first_appeal_seconds"], 1.5)
+            self.assertEqual(modern["scenes"][0]["features"]["화면 구성"], "product_shot")
+            self.assertIsNone(rows["LEGACY"]["first_product_exposure_seconds"])
+            self.assertIsNone(rows["LEGACY"]["first_appeal_seconds"])
+            self.assertIs(rows["ABSENT"]["product_visible"], False)
+
     def test_content_type_aliases_share_category_without_rewriting_source(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'reel_analysis.json'

@@ -121,9 +121,11 @@ class SheetsPoolTests(unittest.TestCase):
         with patch.dict('os.environ', {'GEMINI_POOL_URL': ''}):
             with self.assertRaises(SheetsPoolError): create_pool()
 
-    def test_lite_rejected(self):
+    def test_3_5_flash_lite_supported_with_500_daily_limit(self):
         with patch.dict('os.environ', {'GEMINI_MODELS': 'gemini-3.5-flash-lite'}):
-            with self.assertRaises(SheetsPoolError): SheetsKeyPool()
+            self.assertEqual(SheetsKeyPool().models, ['gemini-3.5-flash-lite'])
+        from pool.local import DEFAULT_LIMITS
+        self.assertEqual(DEFAULT_LIMITS['gemini-3.5-flash-lite']['rpd'], 500)
 
     def test_3_8_supported(self):
         with patch.dict('os.environ', {'GEMINI_MODELS': 'gemini-3.8-flash'}):

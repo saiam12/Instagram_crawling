@@ -143,6 +143,55 @@ class ProfilePlayCountTests(unittest.IsolatedAsyncioTestCase):
     def store(self, rows):
         return SimpleNamespace(rows=rows, lock=asyncio.Lock(), flush=AsyncMock(), dirty=False)
 
+    async def test_seen_reel_without_views_still_collects_detail_counts(self):
+        row = self.row()
+        store = self.store([row])
+        enricher = browser.ProfileReelViewEnricher(store, recollection_details=True)
+        enricher.track(row)
+
+        async def lookup(*args, **kwargs):
+            kwargs["lookup_report"]["seen_target_shortcodes"] = ["target"]
+            return {}
+
+        with (
+            patch.object(browser, "read_profile_reel_view_counts", side_effect=lookup),
+            patch.object(enricher, "enrich_profile_durations", AsyncMock()),
+            patch.object(enricher, "classify_profile_rows", AsyncMock()),
+            patch.object(enricher, "fill_recollection_detail_counts", AsyncMock()) as detail,
+        ):
+            result = await enricher(object(), {"username": "author", "userId": "1"},
+                                    {"status": "web_unavailable"})
+        self.assertEqual(result, {})
+        self.assertEqual(row["view_count"], "")
+        detail.assert_awaited_once()
+        self.assertEqual(detail.await_args.args[1:], ("author", {
+            (row["url"], row["collected_at"]): "target",
+        }))
+
+    async def test_detail_counts_within_six_second_limit_are_saved(self):
+        row = self.row(like_count=10, comment_count=2, share_count="", repost_count="")
+        store = self.store([row])
+        enricher = browser.ProfileReelViewEnricher(store, recollection_details=True)
+        detail_page = SimpleNamespace(url=row["url"], on=Mock())
+        page = SimpleNamespace(context=SimpleNamespace(new_page=AsyncMock(return_value=detail_page)))
+
+        async def delayed_detail(*args, **kwargs):
+            await asyncio.sleep(0.01)
+            return {"username": "author", "userId": "1", "shareCount": 332, "repostCount": 0}
+
+        with (
+            patch.object(browser.asyncio, "timeout", wraps=asyncio.timeout) as timeout,
+            patch.object(browser, "read_reel_detail_metadata", side_effect=delayed_detail),
+            patch.object(browser, "safe_close", AsyncMock()),
+        ):
+            await enricher.fill_recollection_detail_counts(
+                page, "author", {(row["url"], row["collected_at"]): "target"},
+            )
+        self.assertEqual((row["share_count"], row["repost_count"]), (332, 0))
+        self.assertEqual((row["like_count"], row["comment_count"]), (10, 2))
+        timeout.assert_called_once_with(6)
+        store.flush.assert_awaited_once()
+
     async def test_retry_can_exceed_120_scrolls_without_fixed_half_second_wait(self):
         state = {"scrolls": 0}
         async def scroll(*_args):
@@ -160,8 +209,8 @@ class ProfilePlayCountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts, {"target": 17})
         self.assertEqual(state["scrolls"], 125)
         page.goto.assert_not_awaited()
-        self.assertIn("25%", page.evaluate.await_args_list[0].args[0])
-        self.assertIn("style.zoom = ''", page.evaluate.await_args_list[-1].args[0])
+        self.assertTrue(all("zoom" not in str(call.args[0]) for call in page.evaluate.await_args_list))
+        self.assertTrue(all("zoom" not in str(call.args[0]) for call in page.evaluate.await_args_list))
         self.assertTrue(all(call.args[0] != 500 for call in page.wait_for_timeout.await_args_list))
 
     async def test_retry_waits_for_late_card_after_eight_unchanged_scrolls(self):
@@ -208,7 +257,7 @@ class ProfilePlayCountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts, {"first": 17})
         self.assertEqual(observed, {"first": 17})
         page.remove_listener.assert_called_once()
-        self.assertIn("style.zoom = ''", page.evaluate.await_args_list[-1].args[0])
+        self.assertTrue(all("zoom" not in str(call.args[0]) for call in page.evaluate.await_args_list))
 
     async def test_tail_retry_flag_is_forwarded_to_profile_view_lookup(self):
         row = self.row()
@@ -344,6 +393,33 @@ class ProfilePlayCountTests(unittest.IsolatedAsyncioTestCase):
             })
         self.assertEqual(counts, {"target": 45293})
         self.assertEqual(row["view_count"], 45293)
+
+    async def test_recollection_profile_view_fills_missing_detail_counts_for_found_reel(self):
+        row = self.row(like_count=12, saved_count=9)
+        wrong = self.row("wrong")
+        unseen = self.row("unseen")
+        store = self.store([row, wrong, unseen])
+        enrich = browser.ProfileReelViewEnricher(store, recollection_details=True)
+        for target in store.rows:
+            enrich.track(target)
+        detail = SimpleNamespace(
+            url="https://www.instagram.com/author/p/target/",
+            on=Mock(), close=AsyncMock(),
+        )
+        page = SimpleNamespace(context=SimpleNamespace(new_page=AsyncMock(return_value=detail)))
+        reader = AsyncMock(side_effect=[
+            {"userId": "1", "username": "author", "likeCount": 15, "commentCount": 7, "shareCount": 3, "repostCount": 0},
+            {"userId": "2", "username": "other", "commentCount": 99},
+        ])
+        with patch.object(browser, "read_profile_reel_view_counts", AsyncMock(return_value={"target": 301, "wrong": 22})), patch.object(
+            browser, "read_reel_detail_metadata", reader,
+        ):
+            await enrich(page, {"username": "author", "userId": "1"}, {"status": "web_unavailable"})
+        self.assertEqual([call.args[1] for call in reader.await_args_list], ["target", "wrong"])
+        self.assertEqual([row[key] for key in ("view_count", "like_count", "comment_count", "share_count", "repost_count", "saved_count")],
+                         [301, 12, 7, 3, 0, 9])
+        self.assertNotIn("comment_count", wrong)
+        self.assertEqual(unseen["view_count"], "")
 
     async def test_profile_visit_caches_other_reels_for_later_snapshots(self):
         first = self.row()
@@ -610,3 +686,178 @@ class ProfilePlayCountTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(browser.has_complete_reel_core_data(row))
         self.assertTrue(browser.has_complete_reel_core_data(row, allow_pending_profile_metrics=True))
         self.assertEqual(row["view_count"], "")
+
+    async def test_exhausted_grid_marks_retry_exhausted_and_skips_tail_retry(self):
+        row = self.row(video_duration_seconds=12.5)
+        store = self.store([row])
+        enrich = browser.ProfileReelViewEnricher(store)
+        enrich.track(row)
+
+        async def lookup(*args, **kwargs):
+            kwargs["lookup_report"]["stop_reason"] = "unchanged_grid"
+            return {}
+
+        profile = {"status": "success", "followerCount": 100, "sourceField": "profile_header_text"}
+        with patch.object(browser, "read_profile_reel_view_counts", side_effect=lookup):
+            await enrich(object(), {"username": "author", "userId": "1"}, profile)
+        self.assertTrue(profile.get("profileReelViewRetryExhausted"))
+
+        calls = []
+
+        async def follower_lookup(payload):
+            calls.append(payload)
+            return dict(profile)
+
+        with tempfile.TemporaryDirectory() as directory:
+            follower_enricher = FollowerEnricher(data_dir=directory, lookup_impl=follower_lookup)
+            await follower_enricher.track_user(username="author")
+            await follower_enricher.drain()
+        self.assertEqual(len(calls), 1)
+
+    async def test_profile_enricher_flushes_history_once_per_visit(self):
+        row = self.row(video_duration_seconds="", like_count=10, comment_count="", share_count="", repost_count="")
+        store = self.store([row])
+        enrich = browser.ProfileReelViewEnricher(store, recollection_details=True)
+        enrich.track(row)
+        detail_page = SimpleNamespace(url="https://www.instagram.com/author/p/target/", on=Mock(), close=AsyncMock())
+        page = SimpleNamespace(context=SimpleNamespace(new_page=AsyncMock(return_value=detail_page)))
+        profile = {
+            "status": "success",
+            "userId": "1",
+            "followerCount": 321,
+            "_reel_metadata": {"target": {"userId": "1", "username": "author", "videoDurationSeconds": 14.2}},
+        }
+        with (
+            patch.object(browser, "read_profile_reel_view_counts", AsyncMock(return_value={"target": 777})),
+            patch.object(
+                browser,
+                "read_reel_detail_metadata",
+                AsyncMock(return_value={"userId": "1", "username": "author", "commentCount": 5, "repostCount": 0}),
+            ) as read_detail,
+            patch.object(browser, "read_profile_account_country", AsyncMock(return_value="South Korea")),
+        ):
+            await enrich(page, {"username": "author", "userId": "1"}, profile)
+        self.assertEqual(store.flush.await_count, 2)
+        self.assertEqual(read_detail.await_args.kwargs["required_fields"], ("commentCount",))
+        self.assertEqual(row["follower_count"], 321)
+        self.assertEqual(row["video_duration_seconds"], 14.2)
+        self.assertEqual(row["view_count"], 777)
+        self.assertEqual(row["comment_count"], 5)
+        self.assertEqual(row["account_country"], "South Korea")
+
+    async def test_detail_recollection_recovers_missing_view_count(self):
+        row = self.row(like_count=10, comment_count="", share_count="", repost_count="")
+        store = self.store([row])
+        enrich = browser.ProfileReelViewEnricher(store, recollection_details=True)
+        enrich.track(row)
+        detail_page = SimpleNamespace(url=row["url"], on=Mock(), close=AsyncMock())
+        page = SimpleNamespace(context=SimpleNamespace(new_page=AsyncMock(return_value=detail_page)))
+        with patch.object(
+            browser,
+            "read_reel_detail_metadata",
+            AsyncMock(return_value={
+                "username": "author",
+                "userId": "1",
+                "commentCount": 4,
+                "viewCount": 8901,
+                "viewSourceField": "play_count",
+            }),
+        ):
+            await enrich.fill_recollection_detail_counts(
+                page, "author", {(row["url"], row["collected_at"]): "target"},
+            )
+        self.assertEqual(row["comment_count"], 4)
+        self.assertEqual(row["view_count"], 8901)
+        self.assertEqual(len(enrich.pending), 0)
+
+    async def test_sequential_lookup_counts_profile_visit_duration_toward_interval(self):
+        page = SimpleNamespace(context=object(), is_closed=lambda: False)
+        enrich = browser.ProfileReelViewEnricher(self.store([]))
+        lookup = browser.SequentialWebFollowerLookup(page, interval_seconds=8.0, on_profile=enrich)
+        now = [100.0]
+
+        async def visit(_page, _username, **_kwargs):
+            now[0] += 6.0
+            return {"status": "success", "followerCount": 100}
+
+        with (
+            patch.object(browser.time, "monotonic", side_effect=lambda: now[0]),
+            patch.object(browser, "request_web_follower_count", side_effect=visit),
+            patch.object(browser.asyncio, "sleep", AsyncMock()) as sleep,
+        ):
+            await lookup({"username": "first"})
+            await lookup({"username": "second"})
+        sleep.assert_awaited_once()
+        self.assertAlmostEqual(sleep.await_args.args[0], 2.0)
+
+    async def test_request_web_follower_count_preserves_success_on_post_visit_callback_error_and_deduplicates_country_lookup(self):
+        page = SimpleNamespace(
+            url="https://www.instagram.com/author/reels/",
+            on=Mock(),
+            remove_listener=Mock(),
+            goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+            wait_for_timeout=AsyncMock(),
+            evaluate=AsyncMock(return_value={"profileText": "456 followers"}),
+        )
+
+        async def on_profile(profile):
+            profile["accountCountry"] = ""
+            raise RuntimeError("transient enrichment failure")
+
+        with patch.object(browser, "read_profile_account_country", AsyncMock(return_value="South Korea")) as country_mock:
+            result = await browser.request_web_follower_count(
+                page, "author", reels=True, on_profile=on_profile,
+            )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["followerCount"], 456)
+        self.assertIn("transient enrichment failure", result.get("enrichmentError", ""))
+        country_mock.assert_not_awaited()
+
+    async def test_fill_recollection_detail_counts_tolerates_incomplete_store_rows(self):
+        row = self.row(comment_count="", view_count="")
+        malformed = {"username": "author"}
+        store = self.store([malformed, row])
+        enrich = browser.ProfileReelViewEnricher(store, recollection_details=True)
+        enrich.track(row)
+        detail_page = SimpleNamespace(
+            url="https://www.instagram.com/reel/C1234567890/",
+            on=Mock(),
+            close=AsyncMock(),
+        )
+        page = SimpleNamespace(context=SimpleNamespace(new_page=AsyncMock(return_value=detail_page)))
+        with patch.object(
+            browser, "read_reel_detail_metadata",
+            AsyncMock(return_value={"username": "author", "userId": "1", "commentCount": 7}),
+        ):
+            await enrich.fill_recollection_detail_counts(
+                page, "author", {(row["url"], row["collected_at"]): "target"},
+            )
+        self.assertEqual(row["comment_count"], 7)
+
+    async def test_request_web_follower_count_skips_tail_response_wait_when_durations_complete(self):
+        handlers = {}
+        page = SimpleNamespace(
+            url="https://www.instagram.com/author/reels/",
+            on=Mock(side_effect=lambda event, handler: handlers.update({event: handler})),
+            remove_listener=Mock(),
+            goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+            wait_for_timeout=AsyncMock(),
+            evaluate=AsyncMock(return_value={"profileText": "456 followers"}),
+        )
+
+        async def on_profile(profile):
+            handlers["response"](object())
+            profile["profileReelDurationMissing"] = False
+            profile["accountCountry"] = ""
+
+        tail = AsyncMock()
+        with (
+            patch.object(browser.asyncio, "wait", AsyncMock(return_value=(set(), set()))) as wait_mock,
+            patch.object(browser, "read_profile_account_country", AsyncMock(return_value="")),
+        ):
+            result = await browser.request_web_follower_count(
+                page, "author", reels=True, on_profile=on_profile, on_metadata_complete=tail,
+            )
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(any(call.kwargs.get("timeout") == browser.PROFILE_REEL_VIEW_RESPONSE_GRACE_SECONDS for call in wait_mock.await_args_list))
+        tail.assert_not_awaited()
